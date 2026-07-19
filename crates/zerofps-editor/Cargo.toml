@@ -1,0 +1,20 @@
+[package]
+name = "zerofps-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zerofps-core = { path = "../zerofps-core" }
+zerofps-assets = { path = "../zerofps-assets" }
+zerofps-formats = { path = "../zerofps-formats" }
+zerofps-telemetry = { path = "../zerofps-telemetry" }
+
+[[bin]]
+name = "zerofps-editor"
+path = "src/main.rs"

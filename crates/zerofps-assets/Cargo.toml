@@ -1,0 +1,9 @@
+[package]
+name = "zerofps-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+zerofps-core = { path = "../zerofps-core" }

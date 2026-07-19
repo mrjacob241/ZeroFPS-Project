@@ -1,0 +1,5 @@
+/appdata/
+/target/
+/DOCS.md
+*.zfps-autosave
+.DS_Store
