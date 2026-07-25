@@ -12,7 +12,7 @@ mod vulkan_runtime;
 mod vulkan_viewport;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant},
@@ -28,6 +28,8 @@ use zerofps_core::{
     Transform, Vec3 as CoreVec3,
 };
 use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
+
+use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -343,6 +345,12 @@ enum NodeSettings {
         minimum: f32,
         maximum: f32,
     },
+    Time {
+        scale: f32,
+        modulus: f32,
+        live_update: bool,
+    },
+    Debug,
 }
 
 impl NodeSettings {
@@ -363,6 +371,8 @@ impl NodeSettings {
             Self::Grayscale { .. } => 12,
             Self::ColorEncoder => 13,
             Self::ObjectHandle { .. } => 14,
+            Self::Time { .. } => 15,
+            Self::Debug => 16,
         }
     }
 
@@ -415,6 +425,12 @@ impl NodeSettings {
                 minimum: 0.0,
                 maximum: 1.0,
             },
+            15 => Self::Time {
+                scale: 1.0,
+                modulus: 0.0,
+                live_update: true,
+            },
+            16 => Self::Debug,
             _ => return None,
         })
     }
@@ -424,6 +440,11 @@ struct CompositorNode {
     id: usize,
     settings: NodeSettings,
     position: Vec2,
+}
+
+struct PendingCompositorGraph {
+    graph: Arc<compositor_graph::CompiledGraph>,
+    target: NodeId,
 }
 
 #[derive(Clone, Copy)]
@@ -938,6 +959,7 @@ struct EditorApp {
     compositor_gpu_cache: HashMap<(usize, usize, u32), Arc<vulkan_runtime::GpuImage>>,
     compositor_image_cache: HashMap<String, Arc<TextureAsset>>,
     compositor_source_cache: HashMap<String, Arc<TextureAsset>>,
+    compositor_debug_textures: HashMap<usize, TextureHandle>,
     compositor_apply_due: Option<Instant>,
     compositor_control_started: Option<Instant>,
     compositor_present_revision: Option<(u64, Instant)>,
@@ -947,9 +969,13 @@ struct EditorApp {
     cpu_compositor: compositor_cpu::CpuGraphWorker,
     vulkan_compositor: Option<vulkan_compositor::VulkanGraphWorker>,
     vulkan_compositor_attempted: bool,
+    compositor_next_generation: u64,
     vulkan_latest_generation: u64,
     vulkan_waiting_generation: Option<u64>,
     compositor_pending_target: Option<NodeId>,
+    compositor_graph_queue: VecDeque<PendingCompositorGraph>,
+    compositor_clock_started: Instant,
+    compositor_next_time_tick: Instant,
     advanced: bool,
     show_grid: bool,
     grid_spacing: f32,
@@ -1033,6 +1059,7 @@ impl EditorApp {
             compositor_gpu_cache: HashMap::new(),
             compositor_image_cache: HashMap::new(),
             compositor_source_cache: HashMap::new(),
+            compositor_debug_textures: HashMap::new(),
             compositor_apply_due: None,
             compositor_control_started: None,
             compositor_present_revision: None,
@@ -1043,9 +1070,13 @@ impl EditorApp {
                 .expect("CPU compositor worker should start"),
             vulkan_compositor: None,
             vulkan_compositor_attempted: false,
+            compositor_next_generation: 0,
             vulkan_latest_generation: 0,
             vulkan_waiting_generation: None,
             compositor_pending_target: None,
+            compositor_graph_queue: VecDeque::new(),
+            compositor_clock_started: Instant::now(),
+            compositor_next_time_tick: Instant::now(),
             advanced: false,
             show_grid: true,
             grid_spacing: 1.0,
@@ -2044,6 +2075,25 @@ impl EditorApp {
                         maximum.to_string(),
                     );
                 }
+                NodeSettings::Time {
+                    scale,
+                    modulus,
+                    live_update,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.time_scale"),
+                        scale.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.time_modulus"),
+                        modulus.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.time_live_update"),
+                        live_update.to_string(),
+                    );
+                }
+                NodeSettings::Debug => {}
             }
         }
         for (index, (from_id, from_output, to_id, to_input)) in
@@ -2246,6 +2296,21 @@ impl EditorApp {
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(1.0),
                     },
+                    15 => NodeSettings::Time {
+                        scale: properties
+                            .get(&format!("compositor.node.{id}.time_scale"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                        modulus: properties
+                            .get(&format!("compositor.node.{id}.time_modulus"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.0),
+                        live_update: properties
+                            .get(&format!("compositor.node.{id}.time_live_update"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(true),
+                    },
+                    16 => NodeSettings::Debug,
                     _ => continue,
                 };
                 loaded_nodes.push(CompositorNode {
@@ -2603,18 +2668,13 @@ impl EditorApp {
                 };
                 *object_index = (*object_index).min(objects.len().saturating_sub(1));
                 ui.label("Target object");
-                egui::ComboBox::from_id_salt(("compositor_output_object", node_id))
-                    .selected_text(
-                        objects
-                            .get(*object_index)
-                            .map(String::as_str)
-                            .unwrap_or("No scene objects"),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (index, name) in objects.iter().enumerate() {
-                            changed |= ui.selectable_value(object_index, index, name).changed();
-                        }
-                    });
+                ui.strong(
+                    objects
+                        .get(*object_index)
+                        .map(String::as_str)
+                        .unwrap_or("Object unavailable"),
+                );
+                ui.small("Output nodes are created and assigned by the scene.");
                 let channels = [
                     "Base Color",
                     "Normal",
@@ -2852,6 +2912,91 @@ impl EditorApp {
                     changed = true;
                 }
                 *value = value.clamp(*minimum, *maximum);
+            }
+            15 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Time {
+                    ref mut scale,
+                    ref mut modulus,
+                    ref mut live_update,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                changed |= ui.checkbox(live_update, "Live update").changed();
+                ui.label("Scale factor");
+                changed |= ui.add(egui::DragValue::new(scale).speed(0.01)).changed();
+                ui.label("Modulus");
+                changed |= ui.add(egui::DragValue::new(modulus).speed(0.01)).changed();
+                ui.small("Modulus ≤ 0 disables wrapping.");
+                let value = scaled_modulated_time(
+                    self.compositor_clock_started.elapsed().as_secs_f32(),
+                    *scale,
+                    *modulus,
+                );
+                ui.monospace(format!("Time: {value:.3} s"));
+            }
+            16 => {
+                ui.label("Live input preview");
+                let preview = self
+                    .compositor_input_source(node_id, 0)
+                    .and_then(|(source_id, output)| {
+                        self.compile_compositor_preview(
+                            source_id,
+                            output,
+                            self.compositor_next_generation,
+                            self.compositor_lod_max_dimension.min(1024),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                    .and_then(|graph| {
+                        CpuGraphExecutor
+                            .execute(&graph)
+                            .map_err(|error| error.to_string())
+                    });
+                match preview {
+                    Ok(texture) => {
+                        let display = texture.to_texture_asset_clamped();
+                        let image = ColorImage::from_rgba_unmultiplied(
+                            [display.width as usize, display.height as usize],
+                            &display.pixels,
+                        );
+                        if let Some(handle) = self.compositor_debug_textures.get_mut(&node_id) {
+                            handle.set(image, TextureOptions::LINEAR);
+                        } else {
+                            let handle = ui.ctx().load_texture(
+                                format!("compositor-debug-{node_id}"),
+                                image,
+                                TextureOptions::LINEAR,
+                            );
+                            self.compositor_debug_textures.insert(node_id, handle);
+                        }
+                        if let Some(handle) = self.compositor_debug_textures.get(&node_id) {
+                            let available = ui.available_width().max(1.0);
+                            let aspect = texture.width.max(1) as f32 / texture.height.max(1) as f32;
+                            let size = Vec2::new(available, (available / aspect).min(120.0));
+                            ui.add(egui::Image::new((handle.id(), size)));
+                        }
+                        ui.monospace(format!("{} × {}", texture.width, texture.height));
+                        if texture.pixels.len() >= 4 {
+                            ui.monospace(format!(
+                                "RGBA {:.3}, {:.3}, {:.3}, {:.3}",
+                                texture.pixels[0],
+                                texture.pixels[1],
+                                texture.pixels[2],
+                                texture.pixels[3],
+                            ));
+                        }
+                    }
+                    Err(message) => {
+                        self.compositor_debug_textures.remove(&node_id);
+                        ui.small(message);
+                    }
+                }
             }
             _ => {}
         }
@@ -3783,6 +3928,58 @@ impl EditorApp {
         self.project_dirty = true;
     }
 
+    fn sync_compositor_outputs(&mut self) {
+        let object_count = self.scene.tree.iter().count();
+        let mut seen = BTreeSet::new();
+        let removed_ids: BTreeSet<usize> = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match node.settings {
+                NodeSettings::Output { object_index, .. }
+                    if object_index >= object_count || !seen.insert(object_index) =>
+                {
+                    Some(node.id)
+                }
+                _ => None,
+            })
+            .collect();
+        if !removed_ids.is_empty() {
+            self.compositor_nodes
+                .retain(|node| !removed_ids.contains(&node.id));
+            self.compositor_links.retain(|(from, _, to, _)| {
+                !removed_ids.contains(from) && !removed_ids.contains(to)
+            });
+        }
+
+        for object_index in 0..object_count {
+            if seen.contains(&object_index) {
+                continue;
+            }
+            let id = self.compositor_next_id;
+            self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+            self.compositor_nodes.push(CompositorNode {
+                id,
+                settings: NodeSettings::Output {
+                    object_index,
+                    channel: 0,
+                },
+                position: Vec2::new(360.0, 80.0 + object_index as f32 * 250.0),
+            });
+            seen.insert(object_index);
+        }
+        if !self
+            .compositor_nodes
+            .iter()
+            .any(|node| node.id == self.compositor_selected_node)
+        {
+            self.compositor_selected_node = self
+                .compositor_nodes
+                .first()
+                .map(|node| node.id)
+                .unwrap_or(0);
+        }
+    }
+
     fn invalidate_compositor_from(&mut self, node_id: usize) {
         let mut pending = vec![node_id];
         let mut affected = BTreeSet::new();
@@ -4128,6 +4325,24 @@ impl EditorApp {
                     pixels: vec![channel, channel, channel, 255],
                 }))
             }
+            NodeSettings::Time { scale, modulus, .. } => {
+                let value = scaled_modulated_time(
+                    self.compositor_clock_started.elapsed().as_secs_f32(),
+                    scale,
+                    modulus,
+                );
+                let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Ok(Arc::new(TextureAsset {
+                    name: "compositor-time".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![channel, channel, channel, 255],
+                }))
+            }
+            NodeSettings::Debug => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                self.evaluate_compositor_node(from_id, from_out, visiting)
+            }
         };
         visiting.remove(&(node_id, output));
         if let Ok(texture) = &result {
@@ -4138,59 +4353,62 @@ impl EditorApp {
     }
 
     fn apply_compositor(&mut self) {
-        let Some(output_id) = self
+        let outputs: Vec<(usize, usize)> = self
             .compositor_nodes
             .iter()
-            .find(|node| matches!(node.settings, NodeSettings::Output { .. }))
-            .map(|node| node.id)
-        else {
-            return;
-        };
-
-        self.vulkan_latest_generation = self.vulkan_latest_generation.wrapping_add(1);
-        let generation = self.vulkan_latest_generation;
-        let object_index = self.compositor_nodes.iter().find_map(|node| {
-            (node.id == output_id).then(|| match node.settings {
-                NodeSettings::Output { object_index, .. } => Some(object_index),
+            .filter_map(|node| match node.settings {
+                NodeSettings::Output { object_index, .. } => Some((node.id, object_index)),
                 _ => None,
-            })?
-        });
-        let target = object_index.and_then(|index| self.object_node_id(index));
-        if self.compositor_input_source(output_id, 0).is_err() {
-            if let Some(target) = target {
-                let before = self.compositor_texture_overrides.len();
-                self.compositor_texture_overrides
-                    .retain(|(id, _)| *id != target);
-                if before != self.compositor_texture_overrides.len() {
-                    self.texture_revision = self.texture_revision.wrapping_add(1);
-                }
-            }
+            })
+            .collect();
+        if outputs.is_empty() {
             return;
         }
-        let projected_extent = object_index
-            .and_then(|index| self.projected_object_extent(index))
-            .unwrap_or(1024.0);
-        let lod = select_compositor_lod_for_backend(
-            projected_extent,
-            self.compositor_lod_max_dimension,
-            self.render_device,
-        );
-        if lod != self.compositor_lod_max_dimension {
-            self.compositor_lod_max_dimension = lod;
-        }
-
+        self.compositor_graph_queue.clear();
         let compile_started = Instant::now();
-        let compiled = match self.compile_compositor_graph(output_id, generation, lod) {
-            Ok(compiled) => compiled,
-            Err(message) => {
-                self.logs.push(LogEntry {
+        for (output_id, object_index) in outputs {
+            let target = self.object_node_id(object_index);
+            if self.compositor_input_source(output_id, 0).is_err() {
+                if let Some(target) = target {
+                    let before = self.compositor_texture_overrides.len();
+                    self.compositor_texture_overrides
+                        .retain(|(id, _)| *id != target);
+                    if before != self.compositor_texture_overrides.len() {
+                        self.texture_revision = self.texture_revision.wrapping_add(1);
+                    }
+                }
+                continue;
+            }
+            let Some(target) = target else {
+                continue;
+            };
+            let projected_extent = self.projected_object_extent(object_index).unwrap_or(1024.0);
+            let lod = select_compositor_lod_for_backend(
+                projected_extent,
+                self.compositor_lod_max_dimension,
+                self.render_device,
+            );
+            self.compositor_next_generation = self.compositor_next_generation.wrapping_add(1);
+            let generation = self.compositor_next_generation;
+            match self.compile_compositor_graph(output_id, generation, lod) {
+                Ok(compiled) if compiled.channel == 0 => {
+                    self.compositor_graph_queue
+                        .push_back(PendingCompositorGraph {
+                            graph: Arc::new(compiled.graph),
+                            target,
+                        });
+                }
+                Ok(_) => {}
+                Err(message) => self.logs.push(LogEntry {
                     level: "ERROR",
                     color: Color32::from_rgb(235, 91, 91),
-                    message: format!("Could not compile compositor: {message}"),
-                });
-                return;
+                    message: format!(
+                        "Could not compile compositor output for object {}: {message}",
+                        object_index + 1
+                    ),
+                }),
             }
-        };
+        }
         self.performance
             .graph_compile
             .record(compile_started.elapsed());
@@ -4199,28 +4417,26 @@ impl EditorApp {
                 .control_to_graph_apply
                 .record(started.elapsed());
         }
-        let Some(target) = target.or_else(|| self.object_node_id(compiled.object_index)) else {
-            self.logs.push(LogEntry {
-                level: "ERROR",
-                color: Color32::from_rgb(235, 91, 91),
-                message: "Could not apply compositor: output target is not a model".into(),
-            });
+        if self.vulkan_waiting_generation.is_none() {
+            self.submit_next_compositor_graph();
+        }
+    }
+
+    fn submit_next_compositor_graph(&mut self) {
+        let Some(pending) = self.compositor_graph_queue.pop_front() else {
             return;
         };
-        if compiled.channel != 0 {
-            return;
-        }
-
-        self.compositor_pending_target = Some(target);
+        let generation = pending.graph.generation;
+        self.vulkan_latest_generation = generation;
+        self.compositor_pending_target = Some(pending.target);
         self.vulkan_waiting_generation = Some(generation);
-        let graph = Arc::new(compiled.graph);
         if self.render_device == RenderDevice::Vulkan && self.ensure_vulkan_compositor() {
             self.vulkan_compositor
                 .as_ref()
                 .expect("Vulkan graph worker was initialized")
-                .submit_latest(graph);
+                .submit_latest(pending.graph);
         } else {
-            self.cpu_compositor.submit_latest(graph);
+            self.cpu_compositor.submit_latest(pending.graph);
         }
     }
 
@@ -4234,6 +4450,70 @@ impl EditorApp {
         } else {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
+    }
+
+    fn tick_compositor_time(&mut self, ctx: &egui::Context) {
+        let time_nodes: Vec<usize> = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| {
+                matches!(
+                    node.settings,
+                    NodeSettings::Time {
+                        live_update: true,
+                        ..
+                    }
+                )
+                .then_some(node.id)
+            })
+            .collect();
+        if time_nodes.is_empty() {
+            return;
+        }
+        let mut reachable = BTreeSet::new();
+        let mut pending = time_nodes.clone();
+        while let Some(node) = pending.pop() {
+            if !reachable.insert(node) {
+                continue;
+            }
+            pending.extend(
+                self.compositor_links
+                    .iter()
+                    .filter_map(|&(from, _, to, _)| (from == node).then_some(to)),
+            );
+        }
+        let drives_output = self.compositor_nodes.iter().any(|node| {
+            reachable.contains(&node.id)
+                && matches!(
+                    node.settings,
+                    NodeSettings::Output { .. } | NodeSettings::Debug
+                )
+        });
+        if !drives_output {
+            return;
+        }
+
+        let now = Instant::now();
+        if now >= self.compositor_next_time_tick {
+            let compositor_busy =
+                self.vulkan_waiting_generation.is_some() || !self.compositor_graph_queue.is_empty();
+            if compositor_busy {
+                // Do not continually replace a partially evaluated multi-object
+                // batch. Sample time again as soon as the current batch has
+                // reached every assigned Output node.
+                self.compositor_next_time_tick = now + Duration::from_millis(4);
+            } else {
+                self.compositor_next_time_tick = now + Duration::from_millis(16);
+                for node in time_nodes {
+                    self.invalidate_compositor_from(node);
+                }
+                self.compositor_apply_due = Some(now);
+            }
+        }
+        ctx.request_repaint_after(
+            self.compositor_next_time_tick
+                .saturating_duration_since(Instant::now()),
+        );
     }
 
     fn poll_vulkan_compositor(&mut self, ctx: &egui::Context) {
@@ -4271,6 +4551,7 @@ impl EditorApp {
                 .record(started.elapsed());
         }
         let Some(target) = self.compositor_pending_target.take() else {
+            self.submit_next_compositor_graph();
             return;
         };
         let completed = match result {
@@ -4309,6 +4590,7 @@ impl EditorApp {
                 });
             }
         }
+        self.submit_next_compositor_graph();
         ctx.request_repaint();
     }
 
@@ -4340,6 +4622,13 @@ impl EditorApp {
     }
 
     fn compositing_workspace(&mut self, ctx: &egui::Context) {
+        let debug_nodes: BTreeSet<usize> = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| matches!(node.settings, NodeSettings::Debug).then_some(node.id))
+            .collect();
+        self.compositor_debug_textures
+            .retain(|node, _| debug_nodes.contains(node));
         let previous_links = self.compositor_links.clone();
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(18, 20, 26)))
@@ -4349,7 +4638,7 @@ impl EditorApp {
                     ui.separator();
                     ui.menu_button("Add", |ui| {
                         ui.menu_button("Input", |ui| {
-                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle")] {
+                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time")] {
                                 if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
@@ -4374,8 +4663,16 @@ impl EditorApp {
                                 self.activate_compositor_node(7);
                             }
                         });
+                        ui.menu_button("Utility", |ui| {
+                            if compositor_add_button(ui, true, "Debug Preview") {
+                                self.activate_compositor_node(16);
+                            }
+                        });
                         ui.separator();
-                        ui.add_enabled(false, egui::Button::new("Output (always present)"));
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new("Outputs (one per scene object)"),
+                        );
                     });
                     ui.menu_button("Node", |ui| {
                         let sel = self.compositor_selected_node;
@@ -4447,7 +4744,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 15] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 17] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -4463,10 +4760,12 @@ impl EditorApp {
                     ("Grayscale", "Color", Color32::from_rgb(122, 88, 151)),
                     ("Color Encoder", "Color", Color32::from_rgb(122, 88, 151)),
                     ("Object Handle", "Input", Color32::from_rgb(76, 122, 155)),
+                    ("Time", "Input", Color32::from_rgb(76, 122, 155)),
+                    ("Debug Preview", "Utility", Color32::from_rgb(173, 91, 117)),
                 ];
-                let node_heights_by_kind: [f32; 15] = [
+                let node_heights_by_kind: [f32; 17] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
-                    175.0, 140.0, 140.0, 165.0, 285.0,
+                    175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0,
                 ];
                 let node_width = 230.0;
 
@@ -4684,14 +4983,16 @@ impl EditorApp {
                     }
 
                     // Draw output sockets
-                    if kind == 11 {
-                        for (out_idx, label) in ["R", "G", "B", "A"].iter().enumerate() {
-                            let pos = output_socket(node_rect, kind, out_idx);
-                            painter.circle_filled(pos, 6.0 * scale, Color32::from_rgb(218, 190, 92));
-                            painter.text(pos - Vec2::new(10.0 * scale, 0.0), Align2::RIGHT_CENTER, *label, FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                    for out_idx in 0..compositor_output_count(kind) {
+                        let pos = output_socket(node_rect, kind, out_idx);
+                        painter.circle_filled(
+                            pos,
+                            6.0 * scale,
+                            Color32::from_rgb(218, 190, 92),
+                        );
+                        if kind == 11 {
+                            painter.text(pos - Vec2::new(10.0 * scale, 0.0), Align2::RIGHT_CENTER, ["R", "G", "B", "A"][out_idx], FontId::proportional(10.0 * scale), Color32::from_gray(180));
                         }
-                    } else {
-                        painter.circle_filled(output_socket(node_rect, kind, 0), 6.0 * scale, Color32::from_rgb(218, 190, 92));
                     }
 
                     // Draw node controls UI
@@ -4716,6 +5017,7 @@ impl EditorApp {
                     "Input / Image Asset",
                     "Input / Constant Value",
                     "Input / Object Handle",
+                    "Input / Time",
                     "Color / Remap",
                     "Color / Color Space Convert",
                     "Color / Color Decoder",
@@ -4726,6 +5028,7 @@ impl EditorApp {
                     "Converter / Sharp Threshold",
                     "Converter / Smooth Threshold",
                     "Filter / Image Filter",
+                    "Utility / Debug Preview",
                     "Output / Texture Writer",
                 ].iter().enumerate() {
                     painter.text(palette.left_top() + Vec2::new(12.0, 46.0 + index as f32 * 27.0), Align2::LEFT_TOP, *label, FontId::proportional(12.0), Color32::from_gray(190));
@@ -5056,7 +5359,9 @@ impl eframe::App for EditorApp {
         self.poll_save_as();
         self.poll_load_project();
         self.poll_compositor_image_import();
+        self.sync_compositor_outputs();
         self.poll_vulkan_compositor(ctx);
+        self.tick_compositor_time(ctx);
         self.poll_compositor_apply(ctx);
         self.poll_build(ctx);
         self.shortcuts(ctx);
@@ -5233,7 +5538,11 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
 }
 
 fn compositor_output_count(kind: usize) -> usize {
-    if kind == 11 { 4 } else { 1 }
+    match kind {
+        8 | 16 => 0,
+        11 => 4,
+        _ => 1,
+    }
 }
 
 fn compositor_control_layer(parent: egui::LayerId, node: usize) -> egui::LayerId {
@@ -5264,6 +5573,15 @@ fn select_compositor_lod(projected_extent: f32, current: u32) -> u32 {
         current
     } else {
         desired
+    }
+}
+
+fn scaled_modulated_time(seconds: f32, scale: f32, modulus: f32) -> f32 {
+    let scaled = seconds * scale;
+    if modulus > 0.0 {
+        scaled.rem_euclid(modulus)
+    } else {
+        scaled
     }
 }
 
@@ -8152,6 +8470,14 @@ mod tests {
             select_compositor_lod_for_backend(1.0, 128, RenderDevice::Vulkan),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn compositor_time_scales_and_only_wraps_for_positive_modulus() {
+        assert_eq!(scaled_modulated_time(3.0, 2.0, 0.0), 6.0);
+        assert_eq!(scaled_modulated_time(3.0, 2.0, -4.0), 6.0);
+        assert!((scaled_modulated_time(3.0, 2.0, 2.5) - 1.0).abs() < 1.0e-6);
+        assert!((scaled_modulated_time(0.75, -2.0, 1.0) - 0.5).abs() < 1.0e-6);
     }
 
     #[test]

@@ -5,7 +5,7 @@ This project is born to create a game engine from scratch in Rust, but in the pr
 
 ![ZeroFPS Project editor viewport](panels/clip.gif)
 
-Long term objective of the ZeroFPS Project is to add a dynamic texture modification system based on nodes compositing and a Rust-based scripting language.
+ZeroFPS now includes a Vulkan-powered viewport and node compositor. Texture graphs stay GPU-resident, execute asynchronously, preserve `RGBA32Float` values between nodes, and clamp only when connected to an object color output. The same graph contract has a deterministic CPU implementation and automatic fallback.
 
 ![ZeroFPS Project editor compositing](panels/clip_globe.gif)
 
@@ -17,10 +17,15 @@ Long term objective of the ZeroFPS Project is to add a dynamic texture modificat
 - [x] Render textured meshes using depth buffering, diffuse/toon materials, smooth normals, and perspective/orthographic cameras.
 - [x] Save portable `.zfp` projects containing readable scene settings and copied assets.
 - [x] Author node-based texture graphs and apply color/channel operations to object textures.
+- [x] Render the viewport through Vulkan with GPU-resident color and depth targets.
+- [x] Evaluate complete compositor graphs on the GPU without intermediate CPU readback.
+- [x] Preserve unbounded floating-point texture values between nodes and clamp at color-output boundaries.
+- [x] Keep CPU and Vulkan compositor implementations in parity, with asynchronous workers and CPU fallback.
+- [x] Validate the Vulkan renderer and compositor on NVIDIA RTX hardware.
 - [ ] Complete compositor evaluation and add typed physical fields, normalization, units, and UV/object/world-space mapping.
 - [ ] Simulate heat diffusion, thermal emission, IR reflection, and night-vision sensors.
 - [ ] Support skeletal animation, ragdolls, and modular physics.
-- [ ] Build a real-time NVIDIA-accelerated renderer with replaceable cameras, lights, and post-processing.
+- [ ] Add replaceable cameras, lights, post-processing pipelines, and explicit GPU asset streaming.
 - [ ] Create a concise Rust-based scripting language and compile scripts into games.
 - [ ] Provide an in-app custom HUD creator.
 - [ ] Compile, launch, and debug standalone native Rust games with editor telemetry.

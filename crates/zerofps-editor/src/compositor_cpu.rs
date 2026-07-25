@@ -39,7 +39,10 @@ impl CpuGraphWorker {
                         guard.take().expect("CPU graph request became available")
                     };
                     let started = Instant::now();
-                    let texture = executor.execute(&graph).map_err(|error| error.to_string());
+                    let texture = executor
+                        .execute(&graph)
+                        .map(|image| Arc::new(image.to_texture_asset_clamped()))
+                        .map_err(|error| error.to_string());
                     if sender
                         .send(CpuGraphResult {
                             generation: graph.generation,

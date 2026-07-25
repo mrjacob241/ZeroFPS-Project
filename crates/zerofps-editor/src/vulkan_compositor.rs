@@ -45,6 +45,8 @@ pub struct VulkanCompositor {
     input_cache: RefCell<HashMap<usize, (Arc<TextureAsset>, Arc<wgpu::Buffer>)>>,
     graph_layout: wgpu::BindGroupLayout,
     graph_pipeline: wgpu::ComputePipeline,
+    graph_color_layout: wgpu::BindGroupLayout,
+    graph_color_pipeline: wgpu::ComputePipeline,
     graph_input_cache: RefCell<HashMap<usize, (Arc<TextureAsset>, Arc<GpuImage>)>>,
     graph_dummy: Arc<GpuImage>,
     pub device_name: String,
@@ -278,14 +280,17 @@ impl VulkanCompositor {
             compilation_options: Default::default(),
             cache: None,
         });
-        let (graph_layout, graph_pipeline) = create_graph_pipeline(&device);
-        let graph_dummy = create_rgba8_image(&device, 1, 1, "graph dummy");
+        let (graph_layout, graph_pipeline) =
+            create_graph_pipeline(&device, wgpu::TextureFormat::Rgba32Float);
+        let (graph_color_layout, graph_color_pipeline) =
+            create_graph_pipeline(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let graph_dummy = create_rgba32f_image(&device, 1, 1, "graph dummy");
         queue.write_texture(
             graph_dummy._texture.as_image_copy(),
-            &[0, 0, 0, 255],
+            bytemuck::cast_slice(&[0.0f32, 0.0, 0.0, 1.0]),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4),
+                bytes_per_row: Some(16),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {
@@ -302,6 +307,8 @@ impl VulkanCompositor {
             input_cache: RefCell::new(HashMap::new()),
             graph_layout,
             graph_pipeline,
+            graph_color_layout,
+            graph_color_pipeline,
             graph_input_cache: RefCell::new(HashMap::new()),
             graph_dummy,
             device_name: runtime.device_name.clone(),
@@ -453,7 +460,12 @@ impl GraphExecutor for VulkanCompositor {
                 .fold((1u32, 1u32), |(width, height), image| {
                     (width.max(image.width), height.max(image.height))
                 });
-            let output = create_rgba8_image(&self.device, width, height, "graph intermediate");
+            let color_boundary = matches!(node.operation, GraphOperation::ClampColor);
+            let output = if color_boundary {
+                create_rgba8_image(&self.device, width, height, "graph color output")
+            } else {
+                create_rgba32f_image(&self.device, width, height, "graph float intermediate")
+            };
             let parameters = graph_parameters(&node.operation, connected);
             let parameter_buffer =
                 self.device
@@ -464,7 +476,11 @@ impl GraphExecutor for VulkanCompositor {
                     });
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("graph operation resources"),
-                layout: &self.graph_layout,
+                layout: if color_boundary {
+                    &self.graph_color_layout
+                } else {
+                    &self.graph_layout
+                },
                 entries: &[
                     texture_binding(0, &inputs[0].view),
                     texture_binding(1, &inputs[1].view),
@@ -479,7 +495,11 @@ impl GraphExecutor for VulkanCompositor {
                     label: Some("graph operation"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.graph_pipeline);
+                pass.set_pipeline(if color_boundary {
+                    &self.graph_color_pipeline
+                } else {
+                    &self.graph_pipeline
+                });
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
             }
@@ -502,18 +522,23 @@ impl VulkanCompositor {
         if let Some((_, image)) = self.graph_input_cache.borrow().get(&key) {
             return Arc::clone(image);
         }
-        let image = create_rgba8_image(
+        let image = create_rgba32f_image(
             &self.device,
             texture.width.max(1),
             texture.height.max(1),
             "graph source",
         );
+        let pixels: Vec<f32> = texture
+            .pixels
+            .iter()
+            .map(|value| *value as f32 / 255.0)
+            .collect();
         self.queue.write_texture(
             image._texture.as_image_copy(),
-            &texture.pixels,
+            bytemuck::cast_slice(&pixels),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(texture.width.max(1) * 4),
+                bytes_per_row: Some(texture.width.max(1) * 16),
                 rows_per_image: Some(texture.height.max(1)),
             },
             wgpu::Extent3d {
@@ -531,14 +556,13 @@ impl VulkanCompositor {
     }
 
     fn constant_texture(&self, value: [f32; 4]) -> Arc<GpuImage> {
-        let image = create_rgba8_image(&self.device, 1, 1, "graph constant");
-        let pixel = value.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+        let image = create_rgba32f_image(&self.device, 1, 1, "graph constant");
         self.queue.write_texture(
             image._texture.as_image_copy(),
-            &pixel,
+            bytemuck::cast_slice(&value),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4),
+                bytes_per_row: Some(16),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {
@@ -551,10 +575,19 @@ impl VulkanCompositor {
     }
 }
 
-fn create_graph_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+fn create_graph_pipeline(
+    device: &wgpu::Device,
+    output_format: wgpu::TextureFormat,
+) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+    let shader_source = match output_format {
+        wgpu::TextureFormat::Rgba8Unorm => {
+            include_str!("vulkan_graph.wgsl").replace("rgba32float", "rgba8unorm")
+        }
+        _ => include_str!("vulkan_graph.wgsl").to_owned(),
+    };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("ZeroFPS compositor graph"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("vulkan_graph.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
     });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Vulkan graph bindings"),
@@ -568,7 +601,7 @@ fn create_graph_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: output_format,
                     view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
@@ -663,6 +696,7 @@ fn graph_parameters(operation: &GraphOperation, connected: u32) -> GraphParamete
             result.variant = *mode as u32;
         }
         GraphOperation::JoinChannels => result.operation = 10,
+        GraphOperation::ClampColor => result.operation = 11,
     }
     result
 }
@@ -695,6 +729,39 @@ fn create_rgba8_image(
         _texture: texture,
         view,
         encoded_srgb: true,
+        width,
+        height,
+    })
+}
+
+fn create_rgba32f_image(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Arc<GpuImage> {
+    let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    }));
+    let view = Arc::new(texture.create_view(&Default::default()));
+    Arc::new(GpuImage {
+        _texture: texture,
+        view,
+        encoded_srgb: false,
         width,
         height,
     })
@@ -790,15 +857,37 @@ mod graph_tests {
                 },
                 GraphNode {
                     id: 4,
-                    operation: GraphOperation::ColorSpace { from: 0, to: 1 },
+                    operation: GraphOperation::Math {
+                        operation: 0,
+                        constant: 1.0,
+                    },
                     inputs: [Some(3), None, None, None],
                 },
+                GraphNode {
+                    id: 5,
+                    operation: GraphOperation::Math {
+                        operation: 1,
+                        constant: 1.0,
+                    },
+                    inputs: [Some(4), None, None, None],
+                },
+                GraphNode {
+                    id: 6,
+                    operation: GraphOperation::ColorSpace { from: 0, to: 1 },
+                    inputs: [Some(5), None, None, None],
+                },
+                GraphNode {
+                    id: 7,
+                    operation: GraphOperation::ClampColor,
+                    inputs: [Some(6), None, None, None],
+                },
             ],
-            output: 4,
+            output: 7,
         });
         let expected = CpuGraphExecutor
             .execute(&graph)
-            .expect("CPU graph reference");
+            .expect("CPU graph reference")
+            .to_texture_asset_clamped();
         let worker = VulkanGraphWorker::new().expect("Vulkan graph worker");
         worker.submit_latest(Arc::clone(&graph));
         let deadline = Instant::now() + Duration::from_secs(3);

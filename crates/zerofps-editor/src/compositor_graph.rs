@@ -48,6 +48,7 @@ pub enum GraphOperation {
         mode: usize,
     },
     JoinChannels,
+    ClampColor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -190,18 +191,36 @@ impl std::error::Error for GraphExecutionError {}
 
 /// Deterministic reference executor used by the CPU device and GPU parity tests.
 ///
-/// Images are RGBA8 at graph boundaries. Arithmetic is performed in normalized
-/// floating point and quantized once per node, matching the GPU storage texture
-/// boundary used by the Vulkan executor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloatImage {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<f32>,
+}
+
+impl FloatImage {
+    pub fn to_texture_asset_clamped(&self) -> TextureAsset {
+        TextureAsset {
+            name: self.name.clone(),
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.iter().copied().map(to_u8).collect(),
+        }
+    }
+}
+
+/// Deterministic floating-point reference executor. Quantization occurs only
+/// when a `ClampColor` boundary is converted into a renderable TextureAsset.
 #[derive(Default)]
 pub struct CpuGraphExecutor;
 
 impl GraphExecutor for CpuGraphExecutor {
-    type Image = Arc<TextureAsset>;
+    type Image = Arc<FloatImage>;
     type Error = GraphExecutionError;
 
     fn execute(&mut self, graph: &CompiledGraph) -> Result<Self::Image, Self::Error> {
-        let mut images = HashMap::<GraphNodeId, Arc<TextureAsset>>::new();
+        let mut images = HashMap::<GraphNodeId, Arc<FloatImage>>::new();
         for node in &graph.nodes {
             if images.contains_key(&node.id) {
                 return Err(GraphExecutionError::DuplicateNode(node.id));
@@ -218,9 +237,9 @@ impl GraphExecutor for CpuGraphExecutor {
 fn execute_node(
     graph: &CompiledGraph,
     node: &GraphNode,
-    images: &HashMap<GraphNodeId, Arc<TextureAsset>>,
-) -> Result<TextureAsset, GraphExecutionError> {
-    let required = |index: usize| -> Result<&TextureAsset, GraphExecutionError> {
+    images: &HashMap<GraphNodeId, Arc<FloatImage>>,
+) -> Result<FloatImage, GraphExecutionError> {
+    let required = |index: usize| -> Result<&FloatImage, GraphExecutionError> {
         let dependency = node.inputs[index].ok_or(GraphExecutionError::MissingInput {
             node: node.id,
             input: index,
@@ -233,7 +252,7 @@ fn execute_node(
                 dependency,
             })
     };
-    let optional = |index: usize| -> Result<Option<&TextureAsset>, GraphExecutionError> {
+    let optional = |index: usize| -> Result<Option<&FloatImage>, GraphExecutionError> {
         node.inputs[index]
             .map(|dependency| {
                 images.get(&dependency).map(AsRef::as_ref).ok_or(
@@ -296,13 +315,18 @@ fn execute_node(
             optional(2)?,
             optional(3)?,
         ])),
+        GraphOperation::ClampColor => {
+            Ok(map_rgba(required(0)?, "compositor-color-output", |value| {
+                value.clamp(0.0, 1.0)
+            }))
+        }
     }
 }
 
 fn source_texture(
     graph: &CompiledGraph,
     source_index: usize,
-) -> Result<TextureAsset, GraphExecutionError> {
+) -> Result<FloatImage, GraphExecutionError> {
     match graph
         .sources
         .get(source_index)
@@ -317,25 +341,44 @@ fn source_texture(
                     actual_bytes: texture.pixels.len(),
                 });
             }
-            Ok((**texture).clone())
+            Ok(FloatImage {
+                name: texture.name.clone(),
+                width: texture.width,
+                height: texture.height,
+                pixels: texture
+                    .pixels
+                    .iter()
+                    .map(|value| *value as f32 / 255.0)
+                    .collect(),
+            })
         }
-        GraphSource::Constant(color) => Ok(TextureAsset {
+        GraphSource::Constant(color) => Ok(FloatImage {
             name: "compositor-constant".into(),
             width: 1,
             height: 1,
-            pixels: color.iter().copied().map(to_u8).collect(),
+            pixels: color.to_vec(),
         }),
     }
 }
 
-fn map_rgb(source: &TextureAsset, name: &str, operation: impl Fn(f32) -> f32) -> TextureAsset {
+fn map_rgb(source: &FloatImage, name: &str, operation: impl Fn(f32) -> f32) -> FloatImage {
     let mut result = source.clone();
     result.name = name.into();
     for pixel in result.pixels.chunks_exact_mut(4) {
         for value in &mut pixel[..3] {
-            *value = to_u8(operation(to_float(*value)));
+            *value = operation(*value);
         }
     }
+    result
+}
+
+fn map_rgba(source: &FloatImage, name: &str, operation: impl Fn(f32) -> f32) -> FloatImage {
+    let mut result = source.clone();
+    result.name = name.into();
+    result
+        .pixels
+        .iter_mut()
+        .for_each(|value| *value = operation(*value));
     result
 }
 
@@ -410,13 +453,13 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 }
 
 fn combine(
-    left: &TextureAsset,
-    right: &TextureAsset,
-    alpha_texture: Option<&TextureAsset>,
+    left: &FloatImage,
+    right: &FloatImage,
+    alpha_texture: Option<&FloatImage>,
     mode: usize,
     operation: usize,
     fallback_alpha: f32,
-) -> TextureAsset {
+) -> FloatImage {
     let width = left.width.max(right.width).max(1);
     let height = left.height.max(right.height).max(1);
     image_from_fn("compositor-combine", width, height, |x, y| {
@@ -436,7 +479,7 @@ fn combine(
     })
 }
 
-fn color_space(source: &TextureAsset, from: usize, to: usize) -> TextureAsset {
+fn color_space(source: &FloatImage, from: usize, to: usize) -> FloatImage {
     if from == to {
         let mut result = source.clone();
         result.name = "compositor-color-space".into();
@@ -457,32 +500,32 @@ fn color_space(source: &TextureAsset, from: usize, to: usize) -> TextureAsset {
     })
 }
 
-fn extract_channel(source: &TextureAsset, channel: usize) -> TextureAsset {
+fn extract_channel(source: &FloatImage, channel: usize) -> FloatImage {
     let mut result = source.clone();
     result.name = "compositor-channel".into();
     for pixel in result.pixels.chunks_exact_mut(4) {
         let value = pixel[channel.min(3)];
-        pixel.copy_from_slice(&[value, value, value, 255]);
+        pixel.copy_from_slice(&[value, value, value, 1.0]);
     }
     result
 }
 
-fn grayscale(source: &TextureAsset, mode: usize) -> TextureAsset {
+fn grayscale(source: &FloatImage, mode: usize) -> FloatImage {
     let mut result = source.clone();
     result.name = "compositor-grayscale".into();
     for pixel in result.pixels.chunks_exact_mut(4) {
-        let rgb = [to_float(pixel[0]), to_float(pixel[1]), to_float(pixel[2])];
+        let rgb = [pixel[0], pixel[1], pixel[2]];
         let gray = match mode {
             1 => (rgb[0] + rgb[1] + rgb[2]) / 3.0,
             2 => (rgb[0].max(rgb[1]).max(rgb[2]) + rgb[0].min(rgb[1]).min(rgb[2])) * 0.5,
             _ => 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2],
         };
-        pixel[..3].fill(to_u8(gray));
+        pixel[..3].fill(gray);
     }
     result
 }
 
-fn join_channels(channels: [Option<&TextureAsset>; 4]) -> TextureAsset {
+fn join_channels(channels: [Option<&FloatImage>; 4]) -> FloatImage {
     let width = channels
         .iter()
         .flatten()
@@ -506,7 +549,7 @@ fn join_channels(channels: [Option<&TextureAsset>; 4]) -> TextureAsset {
     })
 }
 
-fn filter_image(source: &TextureAsset, filter: usize, radius: f32) -> TextureAsset {
+fn filter_image(source: &FloatImage, filter: usize, radius: f32) -> FloatImage {
     let radius = radius.round().clamp(0.0, 128.0) as i32;
     if radius == 0 {
         let mut result = source.clone();
@@ -539,7 +582,7 @@ fn filter_image(source: &TextureAsset, filter: usize, radius: f32) -> TextureAss
 }
 
 fn neighborhood_weighted(
-    source: &TextureAsset,
+    source: &FloatImage,
     x: u32,
     y: u32,
     radius: i32,
@@ -565,7 +608,7 @@ fn neighborhood_weighted(
     sum.map(|value| value / total.max(f32::EPSILON))
 }
 
-fn neighborhood_order(source: &TextureAsset, x: u32, y: u32, radius: i32, mode: usize) -> [f32; 4] {
+fn neighborhood_order(source: &FloatImage, x: u32, y: u32, radius: i32, mode: usize) -> [f32; 4] {
     std::array::from_fn(|channel| {
         if channel == 3 {
             return texel(source, x as i32, y as i32)[3];
@@ -577,8 +620,8 @@ fn neighborhood_order(source: &TextureAsset, x: u32, y: u32, radius: i32, mode: 
             }
         }
         match mode {
-            1 => values.into_iter().fold(0.0, f32::max),
-            2 => values.into_iter().fold(1.0, f32::min),
+            1 => values.into_iter().fold(f32::NEG_INFINITY, f32::max),
+            2 => values.into_iter().fold(f32::INFINITY, f32::min),
             _ => {
                 values.sort_by(f32::total_cmp);
                 values[values.len() / 2]
@@ -587,7 +630,7 @@ fn neighborhood_order(source: &TextureAsset, x: u32, y: u32, radius: i32, mode: 
     })
 }
 
-fn sobel(source: &TextureAsset, x: u32, y: u32) -> [f32; 4] {
+fn sobel(source: &FloatImage, x: u32, y: u32) -> [f32; 4] {
     const X: [[f32; 3]; 3] = [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]];
     const Y: [[f32; 3]; 3] = [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]];
     let mut gx = 0.0;
@@ -604,7 +647,7 @@ fn sobel(source: &TextureAsset, x: u32, y: u32) -> [f32; 4] {
             gy += luminance * Y[row][column];
         }
     }
-    let edge = gx.hypot(gy).clamp(0.0, 1.0);
+    let edge = gx.hypot(gy);
     [edge, edge, edge, texel(source, x as i32, y as i32)[3]]
 }
 
@@ -613,14 +656,14 @@ fn image_from_fn(
     width: u32,
     height: u32,
     mut function: impl FnMut(u32, u32) -> [f32; 4],
-) -> TextureAsset {
+) -> FloatImage {
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
     for y in 0..height {
         for x in 0..width {
-            pixels.extend(function(x, y).into_iter().map(to_u8));
+            pixels.extend(function(x, y));
         }
     }
-    TextureAsset {
+    FloatImage {
         name: name.into(),
         width,
         height,
@@ -628,7 +671,7 @@ fn image_from_fn(
     }
 }
 
-fn sample(source: &TextureAsset, x: u32, y: u32, width: u32, height: u32) -> [f32; 4] {
+fn sample(source: &FloatImage, x: u32, y: u32, width: u32, height: u32) -> [f32; 4] {
     if source.width == 0 || source.height == 0 {
         return [0.0; 4];
     }
@@ -639,18 +682,14 @@ fn sample(source: &TextureAsset, x: u32, y: u32, width: u32, height: u32) -> [f3
     texel(source, source_x as i32, source_y as i32)
 }
 
-fn texel(source: &TextureAsset, x: i32, y: i32) -> [f32; 4] {
+fn texel(source: &FloatImage, x: i32, y: i32) -> [f32; 4] {
     if source.width == 0 || source.height == 0 {
         return [0.0; 4];
     }
     let x = x.clamp(0, source.width as i32 - 1) as usize;
     let y = y.clamp(0, source.height as i32 - 1) as usize;
     let offset = (y * source.width as usize + x) * 4;
-    std::array::from_fn(|channel| to_float(source.pixels[offset + channel]))
-}
-
-fn to_float(value: u8) -> f32 {
-    value as f32 / 255.0
+    std::array::from_fn(|channel| source.pixels[offset + channel])
 }
 
 fn to_u8(value: f32) -> u8 {
@@ -675,14 +714,15 @@ mod tests {
         nodes: Vec<GraphNode>,
         output: usize,
     ) -> Arc<TextureAsset> {
-        CpuGraphExecutor
+        let image = CpuGraphExecutor
             .execute(&CompiledGraph {
                 generation: 1,
                 sources,
                 nodes,
                 output,
             })
-            .unwrap()
+            .unwrap();
+        Arc::new(image.to_texture_asset_clamped())
     }
 
     fn node(id: usize, operation: GraphOperation, inputs: &[usize]) -> GraphNode {
@@ -732,9 +772,36 @@ mod tests {
             ],
             1,
         );
-        // Constants are quantized at the RGBA8 source boundary: 0.5 becomes
-        // 128/255, whose exact inverted byte value is 127.
-        assert_eq!(remapped.pixels, [191, 127, 64, 255]);
+        // Constants remain exact floats until the final display conversion.
+        assert_eq!(remapped.pixels, [191, 128, 64, 255]);
+    }
+
+    #[test]
+    fn math_preserves_unbounded_floats_until_color_boundary() {
+        let graph = CompiledGraph {
+            generation: 1,
+            sources: vec![GraphSource::Constant([0.25, -3.0, 3.0, 1.0])],
+            nodes: vec![
+                node(0, GraphOperation::Source(0), &[]),
+                node(
+                    1,
+                    GraphOperation::Math {
+                        operation: 0,
+                        constant: 2.0,
+                    },
+                    &[0],
+                ),
+                node(2, GraphOperation::ClampColor, &[1]),
+            ],
+            output: 1,
+        };
+        let unbounded = CpuGraphExecutor.execute(&graph).unwrap();
+        assert_eq!(unbounded.pixels, [2.25, -1.0, 5.0, 1.0]);
+
+        let bounded = CpuGraphExecutor
+            .execute(&CompiledGraph { output: 2, ..graph })
+            .unwrap();
+        assert_eq!(bounded.pixels, [1.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]

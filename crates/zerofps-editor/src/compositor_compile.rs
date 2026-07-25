@@ -72,7 +72,13 @@ impl EditorApp {
             compiled: BTreeMap::new(),
             visiting: BTreeSet::new(),
         };
-        let graph_output = compiler.compile_socket(source_socket)?;
+        let source_output = compiler.compile_socket(source_socket)?;
+        let graph_output = compiler.nodes.len();
+        compiler.nodes.push(GraphNode {
+            id: graph_output,
+            operation: GraphOperation::ClampColor,
+            inputs: [Some(source_output), None, None, None],
+        });
         Ok(CompiledCompositorOutput {
             graph: CompiledGraph {
                 generation: compiler.generation,
@@ -82,6 +88,33 @@ impl EditorApp {
             },
             object_index,
             channel,
+        })
+    }
+
+    pub(crate) fn compile_compositor_preview(
+        &mut self,
+        node_id: usize,
+        output: usize,
+        generation: u64,
+        lod: u32,
+    ) -> Result<CompiledGraph, GraphCompileError> {
+        let links = self.compositor_links.clone();
+        let mut compiler = Compiler {
+            app: self,
+            links,
+            generation,
+            lod,
+            sources: Vec::new(),
+            nodes: Vec::new(),
+            compiled: BTreeMap::new(),
+            visiting: BTreeSet::new(),
+        };
+        let graph_output = compiler.compile_socket((node_id, output))?;
+        Ok(CompiledGraph {
+            generation: compiler.generation,
+            sources: compiler.sources,
+            nodes: compiler.nodes,
+            output: graph_output,
         })
     }
 }
@@ -104,7 +137,7 @@ impl Compiler<'_> {
             .ok_or(GraphCompileError::MissingNode(socket.0))?;
         let output_count = if matches!(&settings, NodeSettings::ColorDecoder) {
             4
-        } else if matches!(&settings, NodeSettings::Output { .. }) {
+        } else if matches!(&settings, NodeSettings::Output { .. } | NodeSettings::Debug) {
             0
         } else {
             1
@@ -205,6 +238,18 @@ impl Compiler<'_> {
             NodeSettings::ObjectHandle { value, .. } => {
                 self.add_source(GraphSource::Constant([value, value, value, 1.0]))
             }
+            NodeSettings::Time { scale, modulus, .. } => {
+                let value = super::scaled_modulated_time(
+                    self.app.compositor_clock_started.elapsed().as_secs_f32(),
+                    scale,
+                    modulus,
+                );
+                self.add_source(GraphSource::Constant([value, value, value, 1.0]))
+            }
+            // Debug is a sink and therefore has no connectable graph output.
+            // This branch only satisfies exhaustive loading of legacy or
+            // hand-edited project data; socket validation rejects it first.
+            NodeSettings::Debug => self.add_source(GraphSource::Constant([0.0, 0.0, 0.0, 1.0])),
             NodeSettings::Remap { points, mode, .. } => {
                 inputs[0] = Some(self.required_input(socket.0, 0)?);
                 GraphOperation::Remap {
