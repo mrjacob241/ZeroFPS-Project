@@ -1,7 +1,7 @@
 # ⚠️ ZeroFPS-Project ⚠️ (WARNING: Vibe Coded Project)
 ## Rendering at the speed of static images.
 
-This project is born to create a game engine from scratch in Rust, but in the process has created a nice static postcard simulator...
+This project is born to create a game engine from scratch in Rust, but in the process has been created a nice static postcard simulator...
 
 ![ZeroFPS Project editor viewport](panels/clip.gif)
 
