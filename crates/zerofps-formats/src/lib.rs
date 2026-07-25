@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
+    fs::{self, File},
+    io::{Read, Write},
+    path::{Component as PathComponent, Path, PathBuf},
 };
 use thiserror::Error;
 use zerofps_core::{
@@ -13,6 +14,20 @@ use zerofps_core::{
 
 pub const FORMAT_NAME: &str = "zerofps-project";
 pub const FORMAT_VERSION: u32 = 1;
+pub const ARCHIVE_MANIFEST: &str = "scene.json";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleAsset {
+    pub source: PathBuf,
+    pub archive_path: String,
+}
+
+#[derive(Debug)]
+pub struct LoadedBundle {
+    pub project: ProjectFile,
+    /// Archive-relative names mapped to safely extracted local files.
+    pub extracted_files: BTreeMap<String, PathBuf>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectFile {
@@ -95,6 +110,96 @@ impl ProjectFile {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, FormatError> {
         Self::from_json(&fs::read_to_string(path)?)
     }
+}
+
+/// Saves a ZIP-compatible ZeroFPS project container with a `.zfp` extension.
+pub fn save_zfp(
+    path: impl AsRef<Path>,
+    project: &ProjectFile,
+    files: &[BundleAsset],
+) -> Result<(), FormatError> {
+    let path = path.as_ref();
+    project.validate()?;
+    let mut names = BTreeSet::new();
+    for file in files {
+        validate_archive_path(&file.archive_path)?;
+        if !names.insert(file.archive_path.clone()) {
+            return Err(FormatError::InvalidArchive(format!(
+                "duplicate archive path `{}`",
+                file.archive_path
+            )));
+        }
+    }
+    let output = File::create(path)?;
+    let mut archive = zip::ZipWriter::new(output);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    archive.start_file(ARCHIVE_MANIFEST, options)?;
+    archive.write_all(project.to_json()?.as_bytes())?;
+
+    for file in files {
+        archive.start_file(&file.archive_path, options)?;
+        let mut source = File::open(&file.source)?;
+        std::io::copy(&mut source, &mut archive)?;
+    }
+    archive.finish()?;
+    Ok(())
+}
+
+/// Opens a `.zfp` and extracts only validated relative files beneath `cache_root`.
+pub fn load_zfp(
+    path: impl AsRef<Path>,
+    cache_root: impl AsRef<Path>,
+) -> Result<LoadedBundle, FormatError> {
+    let mut archive = zip::ZipArchive::new(File::open(path)?)?;
+    let mut manifest = String::new();
+    archive
+        .by_name(ARCHIVE_MANIFEST)
+        .map_err(|_| FormatError::InvalidArchive("missing scene.json".into()))?
+        .read_to_string(&mut manifest)?;
+    let project = ProjectFile::from_json(&manifest)?;
+    let cache_root = cache_root.as_ref();
+    fs::create_dir_all(cache_root)?;
+    let mut extracted_files = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let name = entry.name().to_owned();
+        if name == ARCHIVE_MANIFEST || entry.is_dir() {
+            continue;
+        }
+        validate_archive_path(&name)?;
+        let destination = cache_root.join(&name);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = File::create(&destination)?;
+        std::io::copy(&mut entry, &mut output)?;
+        extracted_files.insert(name, destination);
+    }
+    Ok(LoadedBundle {
+        project,
+        extracted_files,
+    })
+}
+
+fn validate_archive_path(path: &str) -> Result<(), FormatError> {
+    let parsed = Path::new(path);
+    if path.is_empty()
+        || parsed.is_absolute()
+        || parsed.components().any(|component| {
+            matches!(
+                component,
+                PathComponent::ParentDir | PathComponent::RootDir | PathComponent::Prefix(_)
+            )
+        })
+        || !(path.starts_with("assets/") || path.starts_with("fields/"))
+    {
+        return Err(FormatError::InvalidArchive(format!(
+            "unsafe or unsupported archive path `{path}`"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_name(kind: &'static str, name: &str) -> Result<(), FormatError> {
@@ -210,6 +315,8 @@ pub enum FormatError {
     Io(#[from] std::io::Error),
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("ZIP error: {0}")]
+    Zip(#[from] zip::result::ZipError),
     #[error("scene error: {0}")]
     Scene(#[from] zerofps_core::SceneError),
     #[error("expected format `{FORMAT_NAME}`, found `{0}`")]
@@ -220,6 +327,8 @@ pub enum FormatError {
     EmptyName(&'static str),
     #[error("invalid geometry tree: {0}")]
     InvalidTree(String),
+    #[error("invalid ZFP archive: {0}")]
+    InvalidArchive(String),
 }
 
 #[cfg(test)]
@@ -280,5 +389,77 @@ mod tests {
         let loaded = ProjectFile::load(&path).unwrap();
         assert_eq!(loaded.to_json().unwrap(), project.to_json().unwrap());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn zfp_round_trip_contains_manifest_assets_and_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "zerofps-zfp-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("model.glb");
+        let field = root.join("temperature.bin");
+        fs::write(&model, b"model bytes").unwrap();
+        fs::write(&field, b"field bytes").unwrap();
+        let archive = root.join("project.zfp");
+        let project = sample_project();
+        save_zfp(
+            &archive,
+            &project,
+            &[
+                BundleAsset {
+                    source: model,
+                    archive_path: "assets/0000-model.glb".into(),
+                },
+                BundleAsset {
+                    source: field,
+                    archive_path: "fields/temperature.bin".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let loaded = load_zfp(&archive, root.join("cache")).unwrap();
+        assert_eq!(
+            loaded.project.to_json().unwrap(),
+            project.to_json().unwrap()
+        );
+        assert_eq!(
+            fs::read(&loaded.extracted_files["assets/0000-model.glb"]).unwrap(),
+            b"model bytes"
+        );
+        assert_eq!(
+            fs::read(&loaded.extracted_files["fields/temperature.bin"]).unwrap(),
+            b"field bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zfp_rejects_escaping_paths() {
+        let file = BundleAsset {
+            source: PathBuf::from("unused"),
+            archive_path: "assets/../../escape".into(),
+        };
+        let path = std::env::temp_dir().join("zerofps-invalid.zfp");
+        assert!(matches!(
+            save_zfp(path, &sample_project(), &[file]),
+            Err(FormatError::InvalidArchive(_))
+        ));
+    }
+
+    #[test]
+    fn zfp_rejects_duplicate_entry_names_before_reading_sources() {
+        let duplicate = || BundleAsset {
+            source: PathBuf::from("unused"),
+            archive_path: "assets/0000/model.glb".into(),
+        };
+        let path = std::env::temp_dir().join("zerofps-duplicate.zfp");
+        assert!(matches!(
+            save_zfp(path, &sample_project(), &[duplicate(), duplicate()]),
+            Err(FormatError::InvalidArchive(_))
+        ));
     }
 }

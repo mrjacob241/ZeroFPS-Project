@@ -264,6 +264,9 @@ pub enum AttributeKey {
     Visible,
     Enabled,
     Material,
+    MaterialShader,
+    MaterialSmoothNormals,
+    MaterialUseImportedOptics,
     RenderLayer,
     Tint,
     CastShadows,
@@ -360,6 +363,15 @@ impl GeometryTree {
         defaults.insert(AttributeKey::RenderLayer, Attribute::Integer(0));
         defaults.insert(AttributeKey::Tint, Attribute::Color([1.0; 4]));
         defaults.insert(AttributeKey::Material, Attribute::Text("default".into()));
+        defaults.insert(
+            AttributeKey::MaterialShader,
+            Attribute::Text("diffuse".into()),
+        );
+        defaults.insert(AttributeKey::MaterialSmoothNormals, Attribute::Bool(true));
+        defaults.insert(
+            AttributeKey::MaterialUseImportedOptics,
+            Attribute::Bool(true),
+        );
         defaults.insert(AttributeKey::CollisionGroup, Attribute::Integer(0));
         Self {
             slots: Vec::new(),

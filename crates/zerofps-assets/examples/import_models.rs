@@ -29,7 +29,7 @@ fn main() {
         match import_file(&path) {
             Ok(asset) => {
                 println!(
-                    "PASS\t{}\tformat={}\taxis={}\tvertices={}\ttriangles={}\tprimitives={}\tmaterials={}\twarnings={}",
+                    "PASS\t{}\tformat={}\taxis={}\tvertices={}\ttriangles={}\tprimitives={}\tmaterials={}\ttextures={}\twarnings={}",
                     path.display(),
                     asset.source.format,
                     asset.source.up_axis.label(),
@@ -37,6 +37,7 @@ fn main() {
                     asset.triangle_count(),
                     asset.primitives.len(),
                     asset.materials.len(),
+                    asset.textures.len(),
                     asset.warnings.len(),
                 );
                 for warning in asset.warnings {

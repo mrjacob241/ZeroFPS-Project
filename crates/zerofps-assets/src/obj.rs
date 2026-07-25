@@ -265,6 +265,7 @@ where
         vertices,
         primitives,
         materials,
+        textures: BTreeMap::new(),
         source: SourceInfo {
             format: "obj".into(),
             path: Some(source_name.into()),
@@ -310,6 +311,8 @@ pub fn import_mtl(
                 shininess: 0.0,
                 opacity: 1.0,
                 base_color_texture: None,
+                transmission: None,
+                ior: None,
             });
             continue;
         }
