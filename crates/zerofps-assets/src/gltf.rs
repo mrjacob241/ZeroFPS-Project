@@ -139,7 +139,7 @@ fn visit_node(
                 let normal = normals
                     .as_ref()
                     .and_then(|values| values.get(index).copied())
-                    .map(|normal| normalize(z_up(transform_direction(world, normal))))
+                    .map(|normal| normalize(z_up(transform_normal(world, normal))))
                     .unwrap_or([0.0; 3]);
                 asset.vertices.push(Vertex {
                     position,
@@ -252,12 +252,40 @@ fn transform_point(matrix: Matrix, point: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn transform_direction(matrix: Matrix, direction: [f32; 3]) -> [f32; 3] {
+/// Transform a normal by the inverse transpose of a glTF node's linear
+/// transform. Using the ordinary direction matrix here is only correct for
+/// rotation and uniform scale and makes lighting disagree between objects.
+fn transform_normal(matrix: Matrix, normal: [f32; 3]) -> [f32; 3] {
+    let x = [matrix[0][0], matrix[0][1], matrix[0][2]];
+    let y = [matrix[1][0], matrix[1][1], matrix[1][2]];
+    let z = [matrix[2][0], matrix[2][1], matrix[2][2]];
+    let cofactor_x = cross(y, z);
+    let cofactor_y = cross(z, x);
+    let cofactor_z = cross(x, y);
+    let determinant = dot(x, cofactor_x);
+    if determinant.abs() <= f32::EPSILON {
+        return [0.0; 3];
+    }
     [
-        matrix[0][0] * direction[0] + matrix[1][0] * direction[1] + matrix[2][0] * direction[2],
-        matrix[0][1] * direction[0] + matrix[1][1] * direction[1] + matrix[2][1] * direction[2],
-        matrix[0][2] * direction[0] + matrix[1][2] * direction[1] + matrix[2][2] * direction[2],
+        (cofactor_x[0] * normal[0] + cofactor_y[0] * normal[1] + cofactor_z[0] * normal[2])
+            / determinant,
+        (cofactor_x[1] * normal[0] + cofactor_y[1] * normal[1] + cofactor_z[1] * normal[2])
+            / determinant,
+        (cofactor_x[2] * normal[0] + cofactor_y[2] * normal[1] + cofactor_z[2] * normal[2])
+            / determinant,
     ]
+}
+
+fn cross(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ]
+}
+
+fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 }
 
 fn z_up(value: [f32; 3]) -> [f32; 3] {
@@ -293,6 +321,21 @@ mod tests {
         assert_eq!(
             transform_point(multiply(parent, child), [0.0; 3]),
             [2.0, 3.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn node_normal_uses_inverse_transpose_under_non_uniform_scale() {
+        let mut scale = identity();
+        scale[0][0] = 2.0;
+        scale[1][1] = 3.0;
+        scale[2][2] = 4.0;
+        let normal = transform_normal(scale, [1.0, 1.0, 0.0]);
+        let transformed_tangent = [2.0, -3.0, 0.0];
+
+        assert!(
+            dot(normal, transformed_tangent).abs() < 1.0e-6,
+            "an imported normal must remain perpendicular to transformed geometry"
         );
     }
 }

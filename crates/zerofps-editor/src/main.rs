@@ -4,8 +4,15 @@
 //! model is a thin adapter which can later be replaced by `zerofps-core`
 //! handles without coupling the UI to runtime ownership.
 
+mod compositor_compile;
+mod compositor_cpu;
+mod compositor_graph;
+mod vulkan_compositor;
+mod vulkan_runtime;
+mod vulkan_viewport;
+
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant},
@@ -18,12 +25,13 @@ use eframe::egui::{
 use zerofps_assets::{MeshAsset, MeshAutofixReport, TextureAsset, autofix_mesh, import_file};
 use zerofps_core::{
     Attribute, AttributeDeclaration, AttributeKey, Component, GeometryTree, NodeId, Quat,
-    Vec3 as CoreVec3,
+    Transform, Vec3 as CoreVec3,
 };
 use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("ZeroFPS Project — Scene Editor")
             .with_inner_size([1440.0, 900.0])
@@ -160,6 +168,21 @@ enum WorkspaceTab {
     Compositing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderDevice {
+    Vulkan,
+    Cpu,
+}
+
+impl RenderDevice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vulkan => "Vulkan",
+            Self::Cpu => "CPU",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MaterialTab {
     Shader,
@@ -258,14 +281,155 @@ struct ImportedAsset {
     mesh: MeshAsset,
     autofixed_mesh: MeshAsset,
     autofix_report: MeshAutofixReport,
+    bounds: ([f32; 3], [f32; 3]),
 }
 
-struct CompositorImageAsset {
-    path: String,
+#[derive(Clone)]
+enum NodeSettings {
+    ObjectTexture {
+        object_index: usize,
+        channel: usize,
+    },
+    ImageAsset {
+        path: String,
+    },
+    ConstantValue {
+        value: f32,
+        color: [f32; 3],
+    },
+    Remap {
+        points: Vec<[f32; 2]>,
+        mode: usize,
+        selected: Option<usize>,
+    },
+    TextureMath {
+        operation: usize,
+        constant: f32,
+    },
+    SharpThreshold {
+        threshold: f32,
+    },
+    SmoothThreshold {
+        threshold: f32,
+        width: f32,
+    },
+    ImageFilter {
+        filter: usize,
+        radius: f32,
+    },
+    Output {
+        object_index: usize,
+        channel: usize,
+    },
+    TextureCombine {
+        mode: usize,
+        operation: usize,
+        alpha: f32,
+    },
+    ColorSpaceConvert {
+        from: usize,
+        to: usize,
+    },
+    ColorDecoder,
+    Grayscale {
+        mode: usize,
+    },
+    ColorEncoder,
+    ObjectHandle {
+        object_index: usize,
+        label: String,
+        control: usize,
+        value: f32,
+        minimum: f32,
+        maximum: f32,
+    },
+}
+
+impl NodeSettings {
+    fn kind(&self) -> usize {
+        match self {
+            Self::ObjectTexture { .. } => 0,
+            Self::ImageAsset { .. } => 1,
+            Self::ConstantValue { .. } => 2,
+            Self::Remap { .. } => 3,
+            Self::TextureMath { .. } => 4,
+            Self::SharpThreshold { .. } => 5,
+            Self::SmoothThreshold { .. } => 6,
+            Self::ImageFilter { .. } => 7,
+            Self::Output { .. } => 8,
+            Self::TextureCombine { .. } => 9,
+            Self::ColorSpaceConvert { .. } => 10,
+            Self::ColorDecoder => 11,
+            Self::Grayscale { .. } => 12,
+            Self::ColorEncoder => 13,
+            Self::ObjectHandle { .. } => 14,
+        }
+    }
+
+    fn default_for_kind(kind: usize) -> Option<Self> {
+        Some(match kind {
+            0 => Self::ObjectTexture {
+                object_index: 0,
+                channel: 0,
+            },
+            1 => Self::ImageAsset {
+                path: String::new(),
+            },
+            2 => Self::ConstantValue {
+                value: 0.5,
+                color: [0.5, 0.5, 0.5],
+            },
+            3 => Self::Remap {
+                points: vec![[0.0, 0.0], [0.33, 0.33], [0.67, 0.67], [1.0, 1.0]],
+                mode: 0,
+                selected: None,
+            },
+            4 => Self::TextureMath {
+                operation: 2,
+                constant: 0.5,
+            },
+            5 => Self::SharpThreshold { threshold: 0.5 },
+            6 => Self::SmoothThreshold {
+                threshold: 0.5,
+                width: 0.1,
+            },
+            7 => Self::ImageFilter {
+                filter: 0,
+                radius: 3.0,
+            },
+            8 => return None,
+            9 => Self::TextureCombine {
+                mode: 0,
+                operation: 2,
+                alpha: 0.5,
+            },
+            10 => Self::ColorSpaceConvert { from: 0, to: 1 },
+            11 => Self::ColorDecoder,
+            12 => Self::Grayscale { mode: 0 },
+            13 => Self::ColorEncoder,
+            14 => Self::ObjectHandle {
+                object_index: 0,
+                label: "Compositor value".into(),
+                control: 0,
+                value: 0.5,
+                minimum: 0.0,
+                maximum: 1.0,
+            },
+            _ => return None,
+        })
+    }
+}
+
+struct CompositorNode {
+    id: usize,
+    settings: NodeSettings,
+    position: Vec2,
 }
 
 #[derive(Clone, Copy)]
 struct PreviewVertex {
+    local_position: [f32; 3],
+    local_normal: [f32; 3],
     position: [f32; 3],
     normal: [f32; 3],
     uv: [f32; 2],
@@ -274,18 +438,34 @@ struct PreviewVertex {
 
 #[derive(Clone)]
 struct PreviewTriangle {
+    object_id: NodeId,
+    object_transform: Transform,
     vertices: [PreviewVertex; 3],
     base_color: [f32; 4],
+    source_base_color: [f32; 4],
     texture: Option<Arc<TextureAsset>>,
+    gpu_texture: Option<Arc<vulkan_runtime::GpuImage>>,
+    source_texture: Option<Arc<TextureAsset>>,
     shader: ShaderMode,
     smooth_normals: bool,
     transmission: f32,
     ior: f32,
 }
 
+#[derive(Clone)]
+enum TextureOverride {
+    Cpu(Arc<TextureAsset>),
+    Gpu(Arc<vulkan_runtime::GpuImage>),
+}
+
 struct DepthFrame {
-    color: ColorImage,
+    color: FrameColor,
     linear_depth: Vec<f32>,
+}
+
+enum FrameColor {
+    Cpu(ColorImage),
+    Vulkan(Arc<vulkan_runtime::GpuImage>),
 }
 
 struct RenderJob {
@@ -297,6 +477,8 @@ struct RenderJob {
     mode: ViewportMode,
     tool: Tool,
     reusable_depth: Vec<f32>,
+    device: RenderDevice,
+    queued_at: Instant,
 }
 
 struct RenderResult {
@@ -307,6 +489,47 @@ struct RenderResult {
     show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
+    render_time: Duration,
+    prepare_time: Duration,
+    device: RenderDevice,
+    queue_wait: Duration,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TimingMetric {
+    latest_ms: f64,
+    average_ms: f64,
+    maximum_ms: f64,
+    samples: u64,
+}
+
+impl TimingMetric {
+    fn record(&mut self, duration: Duration) {
+        let milliseconds = duration.as_secs_f64() * 1_000.0;
+        self.latest_ms = milliseconds;
+        self.maximum_ms = self.maximum_ms.max(milliseconds);
+        self.samples = self.samples.saturating_add(1);
+        self.average_ms = if self.samples == 1 {
+            milliseconds
+        } else {
+            self.average_ms * 0.9 + milliseconds * 0.1
+        };
+    }
+}
+
+#[derive(Default)]
+struct EditorPerformanceTelemetry {
+    viewport_cpu: TimingMetric,
+    viewport_vulkan: TimingMetric,
+    viewport_prepare: TimingMetric,
+    viewport_present: TimingMetric,
+    compositor_vulkan_submit: TimingMetric,
+    viewport_queue_wait: TimingMetric,
+    control_to_graph_apply: TimingMetric,
+    control_to_composite_ready: TimingMetric,
+    control_to_present: TimingMetric,
+    graph_compile: TimingMetric,
+    graph_evaluation: TimingMetric,
 }
 
 struct DisplayWorker {
@@ -437,6 +660,8 @@ impl DisplayWorker {
             .name("zerofps-display".into())
             .spawn(move || {
                 let mut workspace = RasterWorkspace::default();
+                let mut vulkan: Option<vulkan_viewport::VulkanViewport> = None;
+                let mut vulkan_unavailable = false;
                 loop {
                     let job = {
                         let (lock, ready) = &*worker_pending;
@@ -446,6 +671,9 @@ impl DisplayWorker {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         guard.take().expect("display job became available")
                     };
+                    let queue_wait = job.queued_at.elapsed();
+                    let render_started = Instant::now();
+                    let mut prepare_time = Duration::ZERO;
                     let frame = if job.mode == ViewportMode::Wireframe {
                         let width = job.viewport_size.x.round().max(1.0) as usize;
                         let height = job.viewport_size.y.round().max(1.0) as usize;
@@ -453,8 +681,64 @@ impl DisplayWorker {
                         linear_depth.resize(width * height, f32::INFINITY);
                         linear_depth.fill(f32::INFINITY);
                         DepthFrame {
-                            color: ColorImage::new([width, height], Color32::TRANSPARENT),
+                            color: FrameColor::Cpu(ColorImage::new(
+                                [width, height],
+                                Color32::TRANSPARENT,
+                            )),
                             linear_depth,
+                        }
+                    } else if job.device == RenderDevice::Vulkan && !vulkan_unavailable {
+                        if vulkan.is_none() {
+                            match vulkan_viewport::VulkanViewport::new() {
+                                Ok(renderer) => vulkan = Some(renderer),
+                                Err(_) => vulkan_unavailable = true,
+                            }
+                        }
+                        let rendered = vulkan.as_mut().and_then(|renderer| {
+                            let prepare_started = Instant::now();
+                            // A compositor result can change the packed material
+                            // vertices without changing geometry/scene state.
+                            // Key the persistent vertex buffer by both revisions;
+                            // otherwise rotating the object (scene revision) is
+                            // the first action that repairs stale lighting.
+                            let batches = build_vulkan_batches(
+                                &job.triangles,
+                                job.key.scene_revision ^ job.key.texture_revision.rotate_left(29),
+                            );
+                            prepare_time = prepare_started.elapsed();
+                            let projection = match job.camera.5 {
+                                ProjectionMode::Perspective => 0,
+                                ProjectionMode::Orthographic => 1,
+                            };
+                            renderer
+                                .render_resident(
+                                    job.viewport_size,
+                                    (
+                                        job.camera.0,
+                                        job.camera.1,
+                                        job.camera.2,
+                                        job.camera.3,
+                                        job.camera.4,
+                                        projection,
+                                    ),
+                                    &batches,
+                                )
+                                .ok()
+                        });
+                        if let Some(color) = rendered {
+                            DepthFrame {
+                                color: FrameColor::Vulkan(color),
+                                linear_depth: Vec::new(),
+                            }
+                        } else {
+                            vulkan_unavailable = true;
+                            rasterize_depth_frame(
+                                job.viewport_size,
+                                &job.triangles,
+                                job.camera,
+                                job.reusable_depth,
+                                &mut workspace,
+                            )
                         }
                     } else {
                         rasterize_depth_frame(
@@ -474,6 +758,10 @@ impl DisplayWorker {
                             show_grid: job.show_grid,
                             mode: job.mode,
                             tool: job.tool,
+                            render_time: render_started.elapsed(),
+                            prepare_time,
+                            device: job.device,
+                            queue_wait,
                         })
                         .is_err()
                     {
@@ -491,6 +779,115 @@ impl DisplayWorker {
         *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(job);
         ready.notify_one();
     }
+}
+
+fn build_vulkan_batches(
+    triangles: &[PreviewTriangle],
+    scene_revision: u64,
+) -> Vec<vulkan_viewport::GpuBatch> {
+    let mut groups: HashMap<usize, vulkan_viewport::GpuBatch> = HashMap::new();
+    for triangle in triangles {
+        let key = triangle
+            .gpu_texture
+            .as_ref()
+            .map(|texture| Arc::as_ptr(texture) as usize)
+            .or_else(|| {
+                triangle
+                    .texture
+                    .as_ref()
+                    .map(|texture| Arc::as_ptr(texture) as usize)
+            })
+            .unwrap_or(0);
+        let batch = groups
+            .entry(key)
+            .or_insert_with(|| vulkan_viewport::GpuBatch {
+                cache_key: scene_revision ^ 0x9e37_79b9_7f4a_7c15,
+                texture: triangle.texture.clone(),
+                gpu_texture: triangle.gpu_texture.clone(),
+                vertices: Vec::new(),
+            });
+        batch.cache_key = batch.cache_key.rotate_left(7)
+            ^ triangle.object_id.slot as u64
+            ^ ((triangle.object_id.generation as u64) << 32)
+            ^ triangle.vertices[0].local_position[0].to_bits() as u64
+            ^ ((triangle.vertices[0].local_position[1].to_bits() as u64) << 32)
+            ^ triangle.vertices[0].local_position[2].to_bits() as u64
+            ^ ((triangle.base_color[0].to_bits() as u64) << 1)
+            ^ ((triangle.base_color[1].to_bits() as u64) << 9)
+            ^ ((triangle.base_color[2].to_bits() as u64) << 17)
+            ^ ((triangle.base_color[3].to_bits() as u64) << 25)
+            ^ ((triangle.shader as u64) << 48)
+            ^ ((triangle.transmission.to_bits() as u64) << 32)
+            ^ ((triangle
+                .gpu_texture
+                .as_ref()
+                .is_some_and(|image| image.encoded_srgb) as u64)
+                << 63);
+        let local_positions = triangle.vertices.map(|vertex| {
+            CoreVec3::new(
+                vertex.local_position[0],
+                vertex.local_position[1],
+                vertex.local_position[2],
+            )
+        });
+        let face_normal = (local_positions[1] - local_positions[0])
+            .cross(local_positions[2] - local_positions[0])
+            .normalized();
+        for vertex in triangle.vertices {
+            let normal = if triangle.smooth_normals {
+                vertex.local_normal
+            } else {
+                [face_normal.x, face_normal.y, face_normal.z]
+            };
+            let transform = triangle.object_transform;
+            batch.vertices.push(vulkan_viewport::GpuVertex {
+                position: [
+                    vertex.local_position[0],
+                    vertex.local_position[1],
+                    vertex.local_position[2],
+                    1.0,
+                ],
+                normal: [normal[0], normal[1], normal[2], 0.0],
+                uv_color_rg: [vertex.uv[0], vertex.uv[1], vertex.color[0], vertex.color[1]],
+                color_ba_base_rg: [
+                    vertex.color[2],
+                    vertex.color[3],
+                    triangle.base_color[0],
+                    triangle.base_color[1],
+                ],
+                base_ba_material: [
+                    triangle.base_color[2],
+                    triangle.base_color[3],
+                    f32::from(triangle.shader == ShaderMode::Toon),
+                    triangle.transmission,
+                ],
+                object_translation: [
+                    transform.translation.x,
+                    transform.translation.y,
+                    transform.translation.z,
+                    0.0,
+                ],
+                object_rotation: [
+                    transform.rotation.x,
+                    transform.rotation.y,
+                    transform.rotation.z,
+                    transform.rotation.w,
+                ],
+                object_scale: [
+                    transform.scale.x,
+                    transform.scale.y,
+                    transform.scale.z,
+                    f32::from(
+                        triangle
+                            .gpu_texture
+                            .as_ref()
+                            .is_some_and(|image| image.encoded_srgb),
+                    ),
+                ],
+            });
+        }
+    }
+    groups.into_values().collect()
 }
 
 #[derive(Default)]
@@ -511,9 +908,11 @@ struct DepthCacheKey {
     grid_spacing: f32,
     projection: ProjectionMode,
     scene_revision: u64,
+    texture_revision: u64,
     show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
+    device: RenderDevice,
 }
 
 struct EditorApp {
@@ -527,34 +926,30 @@ struct EditorApp {
     compositor_pan: Vec2,
     compositor_zoom: f32,
     compositor_selected_node: usize,
-    compositor_node_active: Vec<bool>,
-    compositor_node_positions: Vec<Vec2>,
-    compositor_links: Vec<(usize, usize, usize)>,
+    compositor_nodes: Vec<CompositorNode>,
+    compositor_next_id: usize,
+    compositor_image_dialog_target: Option<usize>,
+    compositor_links: Vec<(usize, usize, usize, usize)>,
     compositor_dragging_node: Option<(usize, Vec2)>,
-    compositor_pending_output: Option<usize>,
+    compositor_pending_output: Option<(usize, usize)>,
     compositor_pending_spawn: Option<usize>,
-    compositor_object_index: usize,
-    compositor_texture_channel: usize,
-    compositor_constant: f32,
-    compositor_color: [f32; 3],
-    compositor_bezier_points: Vec<[f32; 2]>,
-    compositor_math_operation: usize,
-    compositor_threshold: f32,
-    compositor_threshold_width: f32,
-    compositor_filter: usize,
-    compositor_filter_radius: f32,
-    compositor_output_width: u32,
-    compositor_output_height: u32,
-    compositor_output_object_index: usize,
-    compositor_output_texture_channel: usize,
-    compositor_combine_mode: usize,
-    compositor_combine_operation: usize,
-    compositor_combine_alpha: f32,
-    compositor_color_space_from: usize,
-    compositor_color_space_to: usize,
-    compositor_extract_channel: usize,
-    compositor_grayscale_mode: usize,
-    compositor_texture_overrides: Vec<(NodeId, TextureAsset)>,
+    compositor_texture_overrides: Vec<(NodeId, TextureOverride)>,
+    compositor_eval_cache: HashMap<(usize, usize, u32), Arc<TextureAsset>>,
+    compositor_gpu_cache: HashMap<(usize, usize, u32), Arc<vulkan_runtime::GpuImage>>,
+    compositor_image_cache: HashMap<String, Arc<TextureAsset>>,
+    compositor_source_cache: HashMap<String, Arc<TextureAsset>>,
+    compositor_apply_due: Option<Instant>,
+    compositor_control_started: Option<Instant>,
+    compositor_present_revision: Option<(u64, Instant)>,
+    compositor_lod_max_dimension: u32,
+    render_device: RenderDevice,
+    performance: EditorPerformanceTelemetry,
+    cpu_compositor: compositor_cpu::CpuGraphWorker,
+    vulkan_compositor: Option<vulkan_compositor::VulkanGraphWorker>,
+    vulkan_compositor_attempted: bool,
+    vulkan_latest_generation: u64,
+    vulkan_waiting_generation: Option<u64>,
+    compositor_pending_target: Option<NodeId>,
     advanced: bool,
     show_grid: bool,
     grid_spacing: f32,
@@ -569,18 +964,23 @@ struct EditorApp {
     project_path: PathBuf,
     project_has_destination: bool,
     project_dirty: bool,
+    project_error_dialog: Option<(String, String)>,
     undo_stack: Vec<GeometryTree>,
     redo_stack: Vec<GeometryTree>,
     asset_import_path: String,
     imported_assets: Vec<ImportedAsset>,
-    compositor_images: Vec<CompositorImageAsset>,
     viewport_mode: ViewportMode,
     projection_mode: ProjectionMode,
     viewport_color: Option<TextureHandle>,
+    viewport_native_texture: Option<TextureId>,
+    viewport_native_view: Option<usize>,
+    wgpu_render_state: Option<egui_wgpu::RenderState>,
     viewport_depth: Vec<f32>,
     viewport_depth_key: Option<DepthCacheKey>,
     scene_revision: u64,
+    texture_revision: u64,
     cached_preview_revision: u64,
+    cached_preview_texture_revision: u64,
     cached_preview: Arc<Vec<PreviewTriangle>>,
     display_worker: DisplayWorker,
     input_worker: InputWorker,
@@ -596,6 +996,13 @@ struct EditorApp {
 impl EditorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
+        if let Some(render_state) = &cc.wgpu_render_state {
+            let _ = vulkan_runtime::install_runtime(
+                render_state.device.clone(),
+                render_state.queue.clone(),
+                render_state.adapter.get_info().name,
+            );
+        }
         Self {
             scene: EditorScene::default(),
             workspace_tab: WorkspaceTab::Scene,
@@ -606,53 +1013,39 @@ impl EditorApp {
             material_tab: MaterialTab::Shader,
             compositor_pan: Vec2::ZERO,
             compositor_zoom: 1.0,
-            compositor_selected_node: 8,
-            compositor_node_active: vec![
-                false, false, false, false, false, false, false, false, true, false, false, false,
-                false, false,
-            ],
-            compositor_node_positions: vec![
-                Vec2::new(0.0, 0.0),
-                Vec2::new(0.0, 240.0),
-                Vec2::new(0.0, 440.0),
-                Vec2::new(280.0, 0.0),
-                Vec2::new(280.0, 340.0),
-                Vec2::new(560.0, 0.0),
-                Vec2::new(560.0, 190.0),
-                Vec2::new(560.0, 420.0),
-                Vec2::new(300.0, 100.0),
-                Vec2::new(280.0, 560.0),
-                Vec2::ZERO,
-                Vec2::ZERO,
-                Vec2::ZERO,
-                Vec2::ZERO,
-            ],
+            compositor_selected_node: 0,
+            compositor_nodes: vec![CompositorNode {
+                id: 0,
+                settings: NodeSettings::Output {
+                    object_index: 0,
+                    channel: 0,
+                },
+                position: Vec2::new(300.0, 100.0),
+            }],
+            compositor_next_id: 1,
+            compositor_image_dialog_target: None,
             compositor_links: Vec::new(),
             compositor_dragging_node: None,
             compositor_pending_output: None,
             compositor_pending_spawn: None,
-            compositor_object_index: 0,
-            compositor_texture_channel: 0,
-            compositor_constant: 0.5,
-            compositor_color: [0.5, 0.5, 0.5],
-            compositor_bezier_points: vec![[0.0, 0.0], [0.33, 0.33], [0.67, 0.67], [1.0, 1.0]],
-            compositor_math_operation: 2,
-            compositor_threshold: 0.5,
-            compositor_threshold_width: 0.1,
-            compositor_filter: 0,
-            compositor_filter_radius: 3.0,
-            compositor_output_width: 1920,
-            compositor_output_height: 1080,
-            compositor_output_object_index: 0,
-            compositor_output_texture_channel: 0,
-            compositor_combine_mode: 0,
-            compositor_combine_operation: 0,
-            compositor_combine_alpha: 0.5,
-            compositor_color_space_from: 0,
-            compositor_color_space_to: 1,
-            compositor_extract_channel: 0,
-            compositor_grayscale_mode: 0,
             compositor_texture_overrides: Vec::new(),
+            compositor_eval_cache: HashMap::new(),
+            compositor_gpu_cache: HashMap::new(),
+            compositor_image_cache: HashMap::new(),
+            compositor_source_cache: HashMap::new(),
+            compositor_apply_due: None,
+            compositor_control_started: None,
+            compositor_present_revision: None,
+            compositor_lod_max_dimension: u32::MAX,
+            render_device: RenderDevice::Vulkan,
+            performance: EditorPerformanceTelemetry::default(),
+            cpu_compositor: compositor_cpu::CpuGraphWorker::new()
+                .expect("CPU compositor worker should start"),
+            vulkan_compositor: None,
+            vulkan_compositor_attempted: false,
+            vulkan_latest_generation: 0,
+            vulkan_waiting_generation: None,
+            compositor_pending_target: None,
             advanced: false,
             show_grid: true,
             grid_spacing: 1.0,
@@ -678,18 +1071,23 @@ impl EditorApp {
             project_path: PathBuf::from("Unnamed.zfp"),
             project_has_destination: false,
             project_dirty: true,
+            project_error_dialog: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             asset_import_path: String::new(),
             imported_assets: Vec::new(),
-            compositor_images: Vec::new(),
             viewport_mode: ViewportMode::Shaded,
             projection_mode: ProjectionMode::Orthographic,
             viewport_color: None,
+            viewport_native_texture: None,
+            viewport_native_view: None,
+            wgpu_render_state: cc.wgpu_render_state.clone(),
             viewport_depth: Vec::new(),
             viewport_depth_key: None,
             scene_revision: 0,
+            texture_revision: 0,
             cached_preview_revision: u64::MAX,
+            cached_preview_texture_revision: u64::MAX,
             cached_preview: Arc::new(Vec::new()),
             display_worker: DisplayWorker::new(cc.egui_ctx.clone()),
             input_worker: InputWorker::new(cc.egui_ctx.clone()),
@@ -718,6 +1116,7 @@ impl EditorApp {
             match result.asset {
                 Ok(asset) => {
                     let triangle_count = asset.triangle_count();
+                    let bounds = mesh_bounds(&asset);
                     let (autofixed_mesh, autofix_report) = autofix_mesh(&asset);
                     let inferred_grid_spacing = self
                         .imported_assets
@@ -751,6 +1150,7 @@ impl EditorApp {
                         existing.mesh = asset;
                         existing.autofixed_mesh = autofixed_mesh;
                         existing.autofix_report = autofix_report;
+                        existing.bounds = bounds;
                         index
                     } else {
                         self.imported_assets.push(ImportedAsset {
@@ -758,6 +1158,7 @@ impl EditorApp {
                             mesh: asset,
                             autofixed_mesh,
                             autofix_report,
+                            bounds,
                         });
                         self.imported_assets.len() - 1
                     };
@@ -902,26 +1303,35 @@ impl EditorApp {
                 .compositor_texture_overrides
                 .iter()
                 .find(|(target, _)| *target == id)
-                .map(|(_, texture)| Arc::new(texture.clone()));
+                .map(|(_, texture)| texture.clone());
             for primitive in &asset.primitives {
                 let material = primitive
                     .material
                     .as_ref()
                     .and_then(|name| asset.materials.get(name));
+                let source_base_color = material
+                    .map(|material| material.base_color)
+                    .unwrap_or([0.42, 0.64, 0.78, 1.0]);
                 let base_color = if compositor_override.is_some() {
                     [1.0; 4]
                 } else {
-                    material
-                        .map(|material| material.base_color)
-                        .unwrap_or([0.42, 0.64, 0.78, 1.0])
+                    source_base_color
                 };
-                let texture = compositor_override.clone().or_else(|| {
+                let source_texture = {
                     material
                         .and_then(|material| material.base_color_texture.as_ref())
                         .and_then(|name| asset.textures.get(name))
                         .cloned()
                         .map(Arc::new)
-                });
+                };
+                let texture = match &compositor_override {
+                    Some(TextureOverride::Cpu(texture)) => Some(Arc::clone(texture)),
+                    _ => source_texture.clone(),
+                };
+                let gpu_texture = match &compositor_override {
+                    Some(TextureOverride::Gpu(texture)) => Some(Arc::clone(texture)),
+                    _ => None,
+                };
                 let transmission = if use_imported_optics {
                     material
                         .and_then(|material| material.transmission)
@@ -940,6 +1350,8 @@ impl EditorApp {
                 };
                 for triangle in primitive.indices.chunks_exact(3) {
                     let mut vertices = [PreviewVertex {
+                        local_position: [0.0; 3],
+                        local_normal: [0.0, 0.0, 1.0],
                         position: [0.0; 3],
                         normal: [0.0, 0.0, 1.0],
                         uv: [0.0; 2],
@@ -961,6 +1373,8 @@ impl EditorApp {
                         let world_normal =
                             transform_normal(local_normal, transform.scale, transform.rotation);
                         *destination = PreviewVertex {
+                            local_position: source,
+                            local_normal: source_vertex.normal,
                             position: [world.x, world.y, world.z],
                             normal: [world_normal.x, world_normal.y, world_normal.z],
                             uv: source_vertex.uv,
@@ -968,9 +1382,14 @@ impl EditorApp {
                         };
                     }
                     output.push(PreviewTriangle {
+                        object_id: id,
+                        object_transform: transform,
                         vertices,
                         base_color,
+                        source_base_color,
                         texture: texture.clone(),
+                        gpu_texture: gpu_texture.clone(),
+                        source_texture: source_texture.clone(),
                         shader,
                         smooth_normals,
                         transmission,
@@ -986,6 +1405,33 @@ impl EditorApp {
         if self.cached_preview_revision != self.scene_revision {
             self.cached_preview = Arc::new(self.build_preview_triangles());
             self.cached_preview_revision = self.scene_revision;
+            self.cached_preview_texture_revision = self.texture_revision;
+        } else if self.cached_preview_texture_revision != self.texture_revision {
+            let triangles = Arc::make_mut(&mut self.cached_preview);
+            for triangle in triangles {
+                if let Some((_, texture)) = self
+                    .compositor_texture_overrides
+                    .iter()
+                    .find(|(target, _)| *target == triangle.object_id)
+                {
+                    match texture {
+                        TextureOverride::Cpu(texture) => {
+                            triangle.texture = Some(Arc::clone(texture));
+                            triangle.gpu_texture = None;
+                        }
+                        TextureOverride::Gpu(texture) => {
+                            triangle.texture = None;
+                            triangle.gpu_texture = Some(Arc::clone(texture));
+                        }
+                    }
+                    triangle.base_color = [1.0; 4];
+                } else {
+                    triangle.texture = triangle.source_texture.clone();
+                    triangle.gpu_texture = None;
+                    triangle.base_color = triangle.source_base_color;
+                }
+            }
+            self.cached_preview_texture_revision = self.texture_revision;
         }
     }
 
@@ -1041,11 +1487,19 @@ impl EditorApp {
                     message: format!("Saved {}", self.project_path.display()),
                 });
             }
-            Err(error) => self.logs.push(LogEntry {
-                level: "ERROR",
-                color: Color32::from_rgb(235, 91, 91),
-                message: format!("Could not save project: {error}"),
-            }),
+            Err(error) => {
+                let message = format!(
+                    "Could not save `{}`.\n\n{}\n\nThe previous project file was preserved.",
+                    self.project_path.display(),
+                    error
+                );
+                self.project_error_dialog = Some(("Project Save Failed".into(), message));
+                self.logs.push(LogEntry {
+                    level: "ERROR",
+                    color: Color32::from_rgb(235, 91, 91),
+                    message: format!("Could not save project: {error}"),
+                });
+            }
         }
     }
 
@@ -1206,24 +1660,27 @@ impl EditorApp {
             Ok(path) => {
                 self.compositor_image_dialog_result = None;
                 if let Some(path) = path {
-                    let path = path.to_string_lossy().into_owned();
-                    if !self
-                        .compositor_images
-                        .iter()
-                        .any(|image| image.path == path)
-                    {
-                        self.compositor_images
-                            .push(CompositorImageAsset { path: path.clone() });
-                        self.project_dirty = true;
-                        self.logs.push(LogEntry {
-                            level: "IMPORT",
-                            color: Color32::from_rgb(112, 210, 156),
-                            message: format!("Registered compositor image `{path}`"),
-                        });
+                    let path_str = path.to_string_lossy().into_owned();
+                    if let Some(target_id) = self.compositor_image_dialog_target.take() {
+                        if let Some(node) =
+                            self.compositor_nodes.iter_mut().find(|n| n.id == target_id)
+                        {
+                            if let NodeSettings::ImageAsset { path } = &mut node.settings {
+                                *path = path_str.clone();
+                                self.project_dirty = true;
+                                self.logs.push(LogEntry {
+                                    level: "IMPORT",
+                                    color: Color32::from_rgb(112, 210, 156),
+                                    message: format!("Registered compositor image `{path_str}`"),
+                                });
+                            }
+                        }
                     }
                 }
             }
-            Err(mpsc::TryRecvError::Disconnected) => self.compositor_image_dialog_result = None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.compositor_image_dialog_result = None;
+            }
             Err(mpsc::TryRecvError::Empty) => {}
         }
     }
@@ -1268,11 +1725,44 @@ impl EditorApp {
                     message: format!("Loaded {}", self.project_path.display()),
                 });
             }
-            Err(error) => self.logs.push(LogEntry {
-                level: "ERROR",
-                color: Color32::from_rgb(235, 91, 91),
-                message: format!("Could not load project: {error}"),
-            }),
+            Err(error) => {
+                let message = format!("Could not open `{}`.\n\n{}", path.display(), error);
+                self.project_error_dialog = Some(("Project Load Failed".into(), message));
+                self.logs.push(LogEntry {
+                    level: "ERROR",
+                    color: Color32::from_rgb(235, 91, 91),
+                    message: format!("Could not load project: {error}"),
+                });
+            }
+        }
+    }
+
+    fn project_error_popup(&mut self, ctx: &egui::Context) {
+        let Some((title, message)) = self.project_error_dialog.clone() else {
+            return;
+        };
+        let mut dismiss = false;
+        egui::Window::new(title)
+            .id(Id::new("project_error_popup"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.colored_label(
+                    Color32::from_rgb(235, 91, 91),
+                    "The project operation failed.",
+                );
+                ui.add_space(6.0);
+                ui.label(message);
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    dismiss = ui.button("OK").clicked();
+                });
+            });
+        if dismiss || ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.project_error_dialog = None;
         }
     }
 
@@ -1303,104 +1793,22 @@ impl EditorApp {
                 }
                 .into(),
             ),
-        ] {
-            project.project.properties.insert(key.into(), value);
-        }
-        for (key, value) in [
             (
-                "compositor.setting.object_index",
-                self.compositor_object_index.to_string(),
-            ),
-            (
-                "compositor.setting.texture_channel",
-                self.compositor_texture_channel.to_string(),
-            ),
-            (
-                "compositor.setting.constant",
-                self.compositor_constant.to_string(),
-            ),
-            (
-                "compositor.setting.color",
-                format!(
-                    "{},{},{}",
-                    self.compositor_color[0], self.compositor_color[1], self.compositor_color[2]
-                ),
-            ),
-            (
-                "compositor.setting.bezier",
-                self.compositor_bezier_points
-                    .iter()
-                    .map(|point| format!("{},{}", point[0], point[1]))
-                    .collect::<Vec<_>>()
-                    .join(";"),
-            ),
-            (
-                "compositor.setting.math_operation",
-                self.compositor_math_operation.to_string(),
-            ),
-            (
-                "compositor.setting.threshold",
-                self.compositor_threshold.to_string(),
-            ),
-            (
-                "compositor.setting.threshold_width",
-                self.compositor_threshold_width.to_string(),
-            ),
-            (
-                "compositor.setting.filter",
-                self.compositor_filter.to_string(),
-            ),
-            (
-                "compositor.setting.filter_radius",
-                self.compositor_filter_radius.to_string(),
-            ),
-            (
-                "compositor.setting.output_width",
-                self.compositor_output_width.to_string(),
-            ),
-            (
-                "compositor.setting.output_height",
-                self.compositor_output_height.to_string(),
-            ),
-            (
-                "compositor.setting.output_object_index",
-                self.compositor_output_object_index.to_string(),
-            ),
-            (
-                "compositor.setting.output_texture_channel",
-                self.compositor_output_texture_channel.to_string(),
-            ),
-            (
-                "compositor.setting.combine_mode",
-                self.compositor_combine_mode.to_string(),
-            ),
-            (
-                "compositor.setting.combine_operation",
-                self.compositor_combine_operation.to_string(),
-            ),
-            (
-                "compositor.setting.combine_alpha",
-                self.compositor_combine_alpha.to_string(),
-            ),
-            (
-                "compositor.setting.color_space_from",
-                self.compositor_color_space_from.to_string(),
-            ),
-            (
-                "compositor.setting.color_space_to",
-                self.compositor_color_space_to.to_string(),
-            ),
-            (
-                "compositor.setting.extract_channel",
-                self.compositor_extract_channel.to_string(),
-            ),
-            (
-                "compositor.setting.grayscale_mode",
-                self.compositor_grayscale_mode.to_string(),
+                "editor.device",
+                self.render_device.label().to_ascii_lowercase(),
             ),
         ] {
             project.project.properties.insert(key.into(), value);
         }
+        // Save compositor next_id and selected
+        project.project.properties.insert(
+            "compositor.next_id".into(),
+            self.compositor_next_id.to_string(),
+        );
+        project.project.properties.insert(
+            "compositor.selected".into(),
+            self.compositor_selected_node.to_string(),
+        );
         let referenced: BTreeSet<String> = project
             .scene
             .geometry
@@ -1434,48 +1842,216 @@ impl EditorApp {
             });
         }
         rewrite_asset_paths(&mut project, &mapping);
-        for (index, image) in self.compositor_images.iter().enumerate() {
-            let source = PathBuf::from(&image.path);
-            if !source.is_file() {
-                return (
-                    Err(format!(
-                        "referenced compositor image does not exist: {}",
-                        image.path
-                    )),
-                    Vec::new(),
-                );
-            }
-            let filename = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(safe_bundle_filename)
-                .unwrap_or_else(|| "image.png".into());
-            let archive_path = format!("assets/compositor/{index:04}-{filename}");
+        // Serialize compositor nodes
+        for node in &self.compositor_nodes {
+            let id = node.id;
+            let kind = node.settings.kind();
             project
                 .project
                 .properties
-                .insert(format!("compositor.image.{index:04}"), archive_path.clone());
-            files.push(BundleAsset {
-                source,
-                archive_path,
-            });
-        }
-        for (index, position) in self.compositor_node_positions.iter().enumerate() {
+                .insert(format!("compositor.node.{id}.kind"), kind.to_string());
             project.project.properties.insert(
-                format!("compositor.node_position.{index:04}"),
-                format!("{},{}", position.x, position.y),
+                format!("compositor.node.{id}.x"),
+                node.position.x.to_string(),
             );
-        }
-        for (index, active) in self.compositor_node_active.iter().enumerate() {
             project.project.properties.insert(
-                format!("compositor.node_active.{index:04}"),
-                active.to_string(),
+                format!("compositor.node.{id}.y"),
+                node.position.y.to_string(),
             );
+            match &node.settings {
+                NodeSettings::ObjectTexture {
+                    object_index,
+                    channel,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.object_index"),
+                        object_index.to_string(),
+                    );
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.channel"), channel.to_string());
+                }
+                NodeSettings::ImageAsset { path } => {
+                    if !path.is_empty() {
+                        let source = PathBuf::from(path);
+                        if source.is_file() {
+                            let filename = source
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(safe_bundle_filename)
+                                .unwrap_or_else(|| "image.png".into());
+                            let archive_path = format!("assets/compositor/{id:04}-{filename}");
+                            project.project.properties.insert(
+                                format!("compositor.node.{id}.image_archive"),
+                                archive_path.clone(),
+                            );
+                            files.push(BundleAsset {
+                                source,
+                                archive_path,
+                            });
+                        } else {
+                            project
+                                .project
+                                .properties
+                                .insert(format!("compositor.node.{id}.image_path"), path.clone());
+                        }
+                    }
+                }
+                NodeSettings::ConstantValue { value, color } => {
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.constant"), value.to_string());
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.color"),
+                        format!("{},{},{}", color[0], color[1], color[2]),
+                    );
+                }
+                NodeSettings::Remap { points, mode, .. } => {
+                    let bezier_str = points
+                        .iter()
+                        .map(|p| format!("{},{}", p[0], p[1]))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.bezier"), bezier_str);
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.remap_mode"), mode.to_string());
+                }
+                NodeSettings::TextureMath {
+                    operation,
+                    constant,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.math_operation"),
+                        operation.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.math_constant"),
+                        constant.to_string(),
+                    );
+                }
+                NodeSettings::SharpThreshold { threshold } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.threshold"),
+                        threshold.to_string(),
+                    );
+                }
+                NodeSettings::SmoothThreshold { threshold, width } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.threshold"),
+                        threshold.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.threshold_width"),
+                        width.to_string(),
+                    );
+                }
+                NodeSettings::ImageFilter { filter, radius } => {
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.filter"), filter.to_string());
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.filter_radius"),
+                        radius.to_string(),
+                    );
+                }
+                NodeSettings::Output {
+                    object_index,
+                    channel,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.object_index"),
+                        object_index.to_string(),
+                    );
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.channel"), channel.to_string());
+                }
+                NodeSettings::TextureCombine {
+                    mode,
+                    operation,
+                    alpha,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.combine_mode"),
+                        mode.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.combine_operation"),
+                        operation.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.combine_alpha"),
+                        alpha.to_string(),
+                    );
+                }
+                NodeSettings::ColorSpaceConvert { from, to } => {
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.cs_from"), from.to_string());
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.cs_to"), to.to_string());
+                }
+                NodeSettings::ColorDecoder => {}
+                NodeSettings::Grayscale { mode } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.grayscale_mode"),
+                        mode.to_string(),
+                    );
+                }
+                NodeSettings::ColorEncoder => {}
+                NodeSettings::ObjectHandle {
+                    object_index,
+                    label,
+                    control,
+                    value,
+                    minimum,
+                    maximum,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.object_index"),
+                        object_index.to_string(),
+                    );
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.handle_label"), label.clone());
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.handle_control"),
+                        control.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.handle_value"),
+                        value.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.handle_minimum"),
+                        minimum.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.handle_maximum"),
+                        maximum.to_string(),
+                    );
+                }
+            }
         }
-        for (index, (from, to, input)) in self.compositor_links.iter().enumerate() {
+        for (index, (from_id, from_output, to_id, to_input)) in
+            self.compositor_links.iter().enumerate()
+        {
             project.project.properties.insert(
                 format!("compositor.link.{index:04}"),
-                format!("{from},{to},{input}"),
+                format!("{from_id},{from_output},{to_id},{to_input}"),
             );
         }
         (Ok(project), files)
@@ -1523,103 +2099,202 @@ impl EditorApp {
             Some("compositing") => WorkspaceTab::Compositing,
             _ => self.workspace_tab,
         };
+        self.render_device = match properties
+            .get("editor.device")
+            .or_else(|| properties.get("compositor.backend"))
+            .map(String::as_str)
+        {
+            Some("cpu") => RenderDevice::Cpu,
+            Some("vulkan") => RenderDevice::Vulkan,
+            _ => self.render_device,
+        };
         let unsigned = |key: &str| {
             properties
                 .get(key)
                 .and_then(|value| value.parse::<usize>().ok())
         };
-        self.compositor_object_index =
-            unsigned("compositor.setting.object_index").unwrap_or(self.compositor_object_index);
-        self.compositor_texture_channel = unsigned("compositor.setting.texture_channel")
-            .filter(|value| *value < 6)
-            .unwrap_or(self.compositor_texture_channel);
-        self.compositor_constant =
-            number("compositor.setting.constant").unwrap_or(self.compositor_constant);
-        if let Some(color) = properties
-            .get("compositor.setting.color")
-            .and_then(|value| parse_compositor_color(value))
-        {
-            self.compositor_color = color;
-        }
-        if let Some(points) = properties
-            .get("compositor.setting.bezier")
-            .and_then(|value| parse_compositor_bezier(value))
-        {
-            self.compositor_bezier_points = points;
-        }
-        self.compositor_math_operation = unsigned("compositor.setting.math_operation")
-            .filter(|value| *value < 8)
-            .unwrap_or(self.compositor_math_operation);
-        self.compositor_threshold =
-            number("compositor.setting.threshold").unwrap_or(self.compositor_threshold);
-        self.compositor_threshold_width =
-            number("compositor.setting.threshold_width").unwrap_or(self.compositor_threshold_width);
-        self.compositor_filter = unsigned("compositor.setting.filter")
-            .filter(|value| *value < 7)
-            .unwrap_or(self.compositor_filter);
-        self.compositor_filter_radius =
-            number("compositor.setting.filter_radius").unwrap_or(self.compositor_filter_radius);
-        self.compositor_output_width = properties
-            .get("compositor.setting.output_width")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(self.compositor_output_width);
-        self.compositor_output_height = properties
-            .get("compositor.setting.output_height")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(self.compositor_output_height);
-        self.compositor_output_object_index = unsigned("compositor.setting.output_object_index")
-            .unwrap_or(self.compositor_output_object_index);
-        self.compositor_output_texture_channel =
-            unsigned("compositor.setting.output_texture_channel")
-                .filter(|value| *value < 6)
-                .unwrap_or(self.compositor_output_texture_channel);
-        self.compositor_combine_mode = unsigned("compositor.setting.combine_mode")
-            .filter(|value| *value < 2)
-            .unwrap_or(self.compositor_combine_mode);
-        self.compositor_combine_operation = unsigned("compositor.setting.combine_operation")
-            .filter(|value| *value < 8)
-            .unwrap_or(self.compositor_combine_operation);
-        self.compositor_combine_alpha =
-            number("compositor.setting.combine_alpha").unwrap_or(self.compositor_combine_alpha);
-        self.compositor_color_space_from = unsigned("compositor.setting.color_space_from")
-            .filter(|value| *value < 2)
-            .unwrap_or(self.compositor_color_space_from);
-        self.compositor_color_space_to = unsigned("compositor.setting.color_space_to")
-            .filter(|value| *value < 2)
-            .unwrap_or(self.compositor_color_space_to);
-        self.compositor_extract_channel = unsigned("compositor.setting.extract_channel")
-            .filter(|value| *value < 4)
-            .unwrap_or(self.compositor_extract_channel);
-        self.compositor_grayscale_mode = unsigned("compositor.setting.grayscale_mode")
-            .filter(|value| *value < 3)
-            .unwrap_or(self.compositor_grayscale_mode);
-        self.compositor_images = properties
-            .iter()
-            .filter(|(key, _)| key.starts_with("compositor.image."))
-            .map(|(_, path)| CompositorImageAsset { path: path.clone() })
-            .collect();
-        for (key, value) in properties {
-            if let Some(index) = key
-                .strip_prefix("compositor.node_position.")
-                .and_then(|value| value.parse::<usize>().ok())
-                && let Some(position) = parse_compositor_position(value)
-                && let Some(stored) = self.compositor_node_positions.get_mut(index)
-            {
-                *stored = position;
-            }
-            if let Some(index) = key
-                .strip_prefix("compositor.node_active.")
-                .and_then(|value| value.parse::<usize>().ok())
-                && let Ok(active) = value.parse::<bool>()
-                && let Some(stored) = self.compositor_node_active.get_mut(index)
-            {
-                *stored = active;
+        // Load compositor nodes from new per-instance format
+        // Collect all node IDs that exist
+        let mut node_ids: BTreeSet<usize> = BTreeSet::new();
+        for key in properties.keys() {
+            if let Some(rest) = key.strip_prefix("compositor.node.") {
+                if let Some(dot_pos) = rest.find('.') {
+                    if let Ok(id) = rest[..dot_pos].parse::<usize>() {
+                        node_ids.insert(id);
+                    }
+                }
             }
         }
-        self.compositor_node_active[8] = true;
-        if !self.compositor_node_active[self.compositor_selected_node] {
-            self.compositor_selected_node = 8;
+        if !node_ids.is_empty() {
+            let mut loaded_nodes: Vec<CompositorNode> = Vec::new();
+            for id in &node_ids {
+                let id = *id;
+                let kind = match properties
+                    .get(&format!("compositor.node.{id}.kind"))
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let x = properties
+                    .get(&format!("compositor.node.{id}.x"))
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let y = properties
+                    .get(&format!("compositor.node.{id}.y"))
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let get_usize = |key: &str| {
+                    properties
+                        .get(key)
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0)
+                };
+                let get_f32 = |key: &str| {
+                    properties
+                        .get(key)
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(0.0)
+                };
+                let settings = match kind {
+                    0 => NodeSettings::ObjectTexture {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        channel: get_usize(&format!("compositor.node.{id}.channel")),
+                    },
+                    1 => {
+                        let path = if let Some(p) =
+                            properties.get(&format!("compositor.node.{id}.image_archive"))
+                        {
+                            p.clone()
+                        } else {
+                            properties
+                                .get(&format!("compositor.node.{id}.image_path"))
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                        NodeSettings::ImageAsset { path }
+                    }
+                    2 => {
+                        let value = get_f32(&format!("compositor.node.{id}.constant"));
+                        let color = properties
+                            .get(&format!("compositor.node.{id}.color"))
+                            .and_then(|v| parse_compositor_color(v))
+                            .unwrap_or([0.5, 0.5, 0.5]);
+                        NodeSettings::ConstantValue { value, color }
+                    }
+                    3 => {
+                        let points = properties
+                            .get(&format!("compositor.node.{id}.bezier"))
+                            .and_then(|v| parse_compositor_bezier(v))
+                            .unwrap_or_else(|| {
+                                vec![[0.0, 0.0], [0.33, 0.33], [0.67, 0.67], [1.0, 1.0]]
+                            });
+                        let mode = get_usize(&format!("compositor.node.{id}.remap_mode"));
+                        NodeSettings::Remap {
+                            points,
+                            mode,
+                            selected: None,
+                        }
+                    }
+                    4 => NodeSettings::TextureMath {
+                        operation: get_usize(&format!("compositor.node.{id}.math_operation")),
+                        constant: get_f32(&format!("compositor.node.{id}.math_constant")),
+                    },
+                    5 => NodeSettings::SharpThreshold {
+                        threshold: get_f32(&format!("compositor.node.{id}.threshold")),
+                    },
+                    6 => NodeSettings::SmoothThreshold {
+                        threshold: get_f32(&format!("compositor.node.{id}.threshold")),
+                        width: get_f32(&format!("compositor.node.{id}.threshold_width")),
+                    },
+                    7 => NodeSettings::ImageFilter {
+                        filter: get_usize(&format!("compositor.node.{id}.filter")),
+                        radius: get_f32(&format!("compositor.node.{id}.filter_radius")),
+                    },
+                    8 => NodeSettings::Output {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        channel: get_usize(&format!("compositor.node.{id}.channel")),
+                    },
+                    9 => NodeSettings::TextureCombine {
+                        mode: get_usize(&format!("compositor.node.{id}.combine_mode")),
+                        operation: get_usize(&format!("compositor.node.{id}.combine_operation")),
+                        alpha: get_f32(&format!("compositor.node.{id}.combine_alpha")),
+                    },
+                    10 => NodeSettings::ColorSpaceConvert {
+                        from: get_usize(&format!("compositor.node.{id}.cs_from")),
+                        to: get_usize(&format!("compositor.node.{id}.cs_to")),
+                    },
+                    11 => NodeSettings::ColorDecoder,
+                    12 => NodeSettings::Grayscale {
+                        mode: get_usize(&format!("compositor.node.{id}.grayscale_mode")),
+                    },
+                    13 => NodeSettings::ColorEncoder,
+                    14 => NodeSettings::ObjectHandle {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        label: properties
+                            .get(&format!("compositor.node.{id}.handle_label"))
+                            .cloned()
+                            .unwrap_or_else(|| "Compositor value".into()),
+                        control: get_usize(&format!("compositor.node.{id}.handle_control")),
+                        value: get_f32(&format!("compositor.node.{id}.handle_value")),
+                        minimum: properties
+                            .get(&format!("compositor.node.{id}.handle_minimum"))
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0.0),
+                        maximum: properties
+                            .get(&format!("compositor.node.{id}.handle_maximum"))
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1.0),
+                    },
+                    _ => continue,
+                };
+                loaded_nodes.push(CompositorNode {
+                    id,
+                    settings,
+                    position: Vec2::new(x, y),
+                });
+            }
+            // Ensure Output node (kind 8) is present
+            if !loaded_nodes
+                .iter()
+                .any(|n| matches!(n.settings, NodeSettings::Output { .. }))
+            {
+                loaded_nodes.push(CompositorNode {
+                    id: 0,
+                    settings: NodeSettings::Output {
+                        object_index: 0,
+                        channel: 0,
+                    },
+                    position: Vec2::new(300.0, 100.0),
+                });
+            }
+            self.compositor_nodes = loaded_nodes;
+            // Set next_id
+            let max_id = self
+                .compositor_nodes
+                .iter()
+                .map(|n| n.id)
+                .max()
+                .unwrap_or(0);
+            self.compositor_next_id = properties
+                .get("compositor.next_id")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(max_id + 1);
         }
+        // Load selected
+        if let Some(sel) = unsigned("compositor.selected") {
+            if self.compositor_nodes.iter().any(|n| n.id == sel) {
+                self.compositor_selected_node = sel;
+            } else {
+                self.compositor_selected_node = self
+                    .compositor_nodes
+                    .iter()
+                    .find(|n| matches!(n.settings, NodeSettings::Output { .. }))
+                    .map(|n| n.id)
+                    .unwrap_or(0);
+            }
+        }
+        // Load links - support both 3-number (old) and 4-number (new) formats
         let stored_links: Vec<_> = properties
             .iter()
             .filter_map(|(key, value)| {
@@ -1627,11 +2302,10 @@ impl EditorApp {
                     .then(|| parse_compositor_link(value))
                     .flatten()
             })
-            .filter(|(from, to, input)| {
-                from != to
-                    && *from < self.compositor_node_positions.len()
-                    && *to < self.compositor_node_positions.len()
-                    && *input < compositor_input_count(*to, self.compositor_combine_mode)
+            .filter(|(from_id, _from_out, to_id, _to_input)| {
+                from_id != to_id
+                    && self.compositor_nodes.iter().any(|n| n.id == *from_id)
+                    && self.compositor_nodes.iter().any(|n| n.id == *to_id)
             })
             .collect();
         if properties
@@ -1642,35 +2316,48 @@ impl EditorApp {
         }
     }
 
-    fn compositor_node_controls_ui(&mut self, node: usize, ui: &mut egui::Ui) {
+    fn compositor_node_controls_ui(&mut self, node_id: usize, ui: &mut egui::Ui) {
         let mut changed = false;
-        match node {
+        let mut open_browse = false;
+        let kind = self
+            .compositor_nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .map(|n| n.settings.kind())
+            .unwrap_or(usize::MAX);
+        match kind {
             0 => {
                 let objects: Vec<String> = self
                     .scene
                     .tree
                     .iter()
-                    .map(|(_, node)| node.name.clone())
+                    .map(|(_, n)| n.name.clone())
                     .collect();
-                self.compositor_object_index = self
-                    .compositor_object_index
-                    .min(objects.len().saturating_sub(1));
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::ObjectTexture {
+                    ref mut object_index,
+                    ref mut channel,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                *object_index = (*object_index).min(objects.len().saturating_sub(1));
                 ui.label("Object");
-                egui::ComboBox::from_id_salt("compositor_object")
+                egui::ComboBox::from_id_salt(("compositor_object", node_id))
                     .selected_text(
                         objects
-                            .get(self.compositor_object_index)
+                            .get(*object_index)
                             .map(String::as_str)
                             .unwrap_or("No scene objects"),
                     )
                     .show_ui(ui, |ui| {
                         for (index, name) in objects.iter().enumerate() {
                             changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_object_index,
-                                    index,
-                                    name.as_str(),
-                                )
+                                .selectable_value(object_index, index, name.as_str())
                                 .changed();
                         }
                     });
@@ -1683,58 +2370,66 @@ impl EditorApp {
                     "Emissive",
                     "Occlusion",
                 ];
-                egui::ComboBox::from_id_salt("compositor_texture_channel")
-                    .selected_text(channels[self.compositor_texture_channel])
+                egui::ComboBox::from_id_salt(("compositor_texture_channel", node_id))
+                    .selected_text(channels[*channel])
                     .show_ui(ui, |ui| {
-                        for (index, channel) in channels.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_texture_channel,
-                                    index,
-                                    *channel,
-                                )
-                                .changed();
+                        for (index, ch) in channels.iter().enumerate() {
+                            changed |= ui.selectable_value(channel, index, *ch).changed();
                         }
                     });
             }
             1 => {
+                let (current_path, dialog_open) = {
+                    let pos = self
+                        .compositor_nodes
+                        .iter()
+                        .position(|n| n.id == node_id)
+                        .unwrap();
+                    let NodeSettings::ImageAsset { ref path } = self.compositor_nodes[pos].settings
+                    else {
+                        return;
+                    };
+                    (path.clone(), self.compositor_image_dialog_result.is_some())
+                };
                 ui.label("External texture");
                 ui.horizontal(|ui| {
-                    let mut path = self
-                        .compositor_images
-                        .first()
-                        .map(|image| image.path.clone())
-                        .unwrap_or_default();
+                    let mut path_display = current_path.clone();
                     ui.add_enabled(
                         false,
-                        egui::TextEdit::singleline(&mut path)
+                        egui::TextEdit::singleline(&mut path_display)
                             .hint_text("Choose PNG or JPEG")
                             .desired_width(125.0),
                     );
                     if ui
-                        .add_enabled(
-                            self.compositor_image_dialog_result.is_none(),
-                            egui::Button::new("Browse…"),
-                        )
+                        .add_enabled(!dialog_open, egui::Button::new("Browse…"))
                         .clicked()
                     {
-                        self.start_compositor_image_import(ui.ctx());
+                        open_browse = true;
+                        self.compositor_image_dialog_target = Some(node_id);
                     }
                 });
                 ui.label("Color space");
                 ui.label("Auto (from image metadata)");
             }
             2 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::ConstantValue {
+                    ref mut value,
+                    ref mut color,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 ui.label("Scalar");
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.compositor_constant, 0.0..=1.0))
-                    .changed();
+                changed |= ui.add(egui::Slider::new(value, 0.0..=1.0)).changed();
                 ui.label("RGB color");
-                changed |= ui
-                    .color_edit_button_rgb(&mut self.compositor_color)
-                    .changed();
+                changed |= ui.color_edit_button_rgb(color).changed();
                 ui.horizontal(|ui| {
-                    for channel in &mut self.compositor_color {
+                    for channel in color.iter_mut() {
                         changed |= ui
                             .add(egui::DragValue::new(channel).range(0.0..=1.0).speed(0.01))
                             .changed();
@@ -1742,11 +2437,62 @@ impl EditorApp {
                 });
             }
             3 => {
-                ui.label("RGB transfer curve");
-                changed |= bezier_editor(ui, &mut self.compositor_bezier_points);
-                ui.small("Drag the two inner points; endpoints remain at (0,0) and (1,1).");
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::Remap {
+                    ref mut points,
+                    ref mut mode,
+                    ref mut selected,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Interpolation");
+                let modes = ["Polyline", "Bézier"];
+                egui::ComboBox::from_id_salt(("compositor_remap_mode", node_id))
+                    .selected_text(modes[*mode])
+                    .show_ui(ui, |ui| {
+                        for (index, m) in modes.iter().enumerate() {
+                            changed |= ui.selectable_value(mode, index, *m).changed();
+                        }
+                    });
+                ui.label("Curve");
+                // Use bezier_editor for Bézier mode; for Polyline fall back to the same widget
+                if points.len() == 4 {
+                    changed |= bezier_editor(ui, points);
+                } else {
+                    // For non-standard point counts show basic info
+                    ui.small(format!("{} control points", points.len()));
+                }
+                let can_delete = selected
+                    .map(|idx| idx > 0 && idx + 1 < points.len())
+                    .unwrap_or(false);
+                if ui
+                    .add_enabled(can_delete, egui::Button::new("Remove selected point"))
+                    .clicked()
+                {
+                    let idx = selected.take().unwrap();
+                    points.remove(idx);
+                    changed = true;
+                }
+                ui.small("Click curve to add · click point to select · endpoints fixed.");
             }
             4 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::TextureMath {
+                    ref mut operation,
+                    ref mut constant,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 let operations = [
                     "Add",
                     "Subtract",
@@ -1758,45 +2504,62 @@ impl EditorApp {
                     "Absolute Difference",
                 ];
                 ui.label("Operation");
-                egui::ComboBox::from_id_salt("compositor_math_operation")
-                    .selected_text(operations[self.compositor_math_operation])
+                egui::ComboBox::from_id_salt(("compositor_math_operation", node_id))
+                    .selected_text(operations[*operation])
                     .show_ui(ui, |ui| {
-                        for (index, operation) in operations.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_math_operation,
-                                    index,
-                                    *operation,
-                                )
-                                .changed();
+                        for (index, op) in operations.iter().enumerate() {
+                            changed |= ui.selectable_value(operation, index, *op).changed();
                         }
                     });
                 ui.label("Fallback value");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut self.compositor_constant).speed(0.01))
-                    .changed();
+                changed |= ui.add(egui::DragValue::new(constant).speed(0.01)).changed();
             }
             5 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::SharpThreshold { ref mut threshold } =
+                    self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 ui.label("Threshold");
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.compositor_threshold, 0.0..=1.0))
-                    .changed();
+                changed |= ui.add(egui::Slider::new(threshold, 0.0..=1.0)).changed();
                 ui.small("Values below the threshold become 0; values above it become 1.");
             }
             6 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::SmoothThreshold {
+                    ref mut threshold,
+                    ref mut width,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 ui.label("Threshold");
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.compositor_threshold, 0.0..=1.0))
-                    .changed();
+                changed |= ui.add(egui::Slider::new(threshold, 0.0..=1.0)).changed();
                 ui.label("Transition width");
-                changed |= ui
-                    .add(egui::Slider::new(
-                        &mut self.compositor_threshold_width,
-                        0.0..=1.0,
-                    ))
-                    .changed();
+                changed |= ui.add(egui::Slider::new(width, 0.0..=1.0)).changed();
             }
             7 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::ImageFilter {
+                    ref mut filter,
+                    ref mut radius,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 let filters = [
                     "Gaussian Blur",
                     "Box Blur",
@@ -1807,22 +2570,16 @@ impl EditorApp {
                     "Erode",
                 ];
                 ui.label("Filter");
-                egui::ComboBox::from_id_salt("compositor_filter")
-                    .selected_text(filters[self.compositor_filter])
+                egui::ComboBox::from_id_salt(("compositor_filter", node_id))
+                    .selected_text(filters[*filter])
                     .show_ui(ui, |ui| {
-                        for (index, filter) in filters.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(&mut self.compositor_filter, index, *filter)
-                                .changed();
+                        for (index, f) in filters.iter().enumerate() {
+                            changed |= ui.selectable_value(filter, index, *f).changed();
                         }
                     });
                 ui.label("Radius");
                 changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.compositor_filter_radius)
-                            .range(0.0..=128.0)
-                            .speed(0.25),
-                    )
+                    .add(egui::DragValue::new(radius).range(0.0..=128.0).speed(0.25))
                     .changed();
             }
             8 => {
@@ -1830,28 +2587,32 @@ impl EditorApp {
                     .scene
                     .tree
                     .iter()
-                    .map(|(_, node)| node.name.clone())
+                    .map(|(_, n)| n.name.clone())
                     .collect();
-                self.compositor_output_object_index = self
-                    .compositor_output_object_index
-                    .min(objects.len().saturating_sub(1));
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::Output {
+                    ref mut object_index,
+                    ref mut channel,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                *object_index = (*object_index).min(objects.len().saturating_sub(1));
                 ui.label("Target object");
-                egui::ComboBox::from_id_salt("compositor_output_object")
+                egui::ComboBox::from_id_salt(("compositor_output_object", node_id))
                     .selected_text(
                         objects
-                            .get(self.compositor_output_object_index)
+                            .get(*object_index)
                             .map(String::as_str)
                             .unwrap_or("No scene objects"),
                     )
                     .show_ui(ui, |ui| {
                         for (index, name) in objects.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_output_object_index,
-                                    index,
-                                    name,
-                                )
-                                .changed();
+                            changed |= ui.selectable_value(object_index, index, name).changed();
                         }
                     });
                 let channels = [
@@ -1863,39 +2624,51 @@ impl EditorApp {
                     "Occlusion",
                 ];
                 ui.label("Overwrite texture");
-                egui::ComboBox::from_id_salt("compositor_output_channel")
-                    .selected_text(channels[self.compositor_output_texture_channel])
+                egui::ComboBox::from_id_salt(("compositor_output_channel", node_id))
+                    .selected_text(channels[*channel])
                     .show_ui(ui, |ui| {
-                        for (index, channel) in channels.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_output_texture_channel,
-                                    index,
-                                    *channel,
-                                )
-                                .changed();
+                        for (index, ch) in channels.iter().enumerate() {
+                            changed |= ui.selectable_value(channel, index, *ch).changed();
                         }
                     });
                 ui.small("The connected image replaces this texture when the graph is applied.");
             }
             9 => {
-                ui.label("Combine mode");
+                let (mode, operation, alpha) = {
+                    let pos = self
+                        .compositor_nodes
+                        .iter()
+                        .position(|n| n.id == node_id)
+                        .unwrap();
+                    let NodeSettings::TextureCombine {
+                        mode,
+                        operation,
+                        alpha,
+                    } = self.compositor_nodes[pos].settings
+                    else {
+                        return;
+                    };
+                    (mode, operation, alpha)
+                };
+                let alpha_connected = self
+                    .compositor_links
+                    .iter()
+                    .any(|&(_, _, to, input)| to == node_id && input == 2);
                 let modes = ["Algebra", "Mix"];
-                egui::ComboBox::from_id_salt("compositor_combine_mode")
-                    .selected_text(modes[self.compositor_combine_mode])
+                let mut new_mode = mode;
+                let mut new_operation = operation;
+                let mut new_alpha = alpha;
+                ui.label("Combine mode");
+                egui::ComboBox::from_id_salt(("compositor_combine_mode", node_id))
+                    .selected_text(modes[mode])
                     .show_ui(ui, |ui| {
-                        for (index, mode) in modes.iter().enumerate() {
-                            let mode_changed = ui
-                                .selectable_value(&mut self.compositor_combine_mode, index, *mode)
-                                .changed();
-                            changed |= mode_changed;
-                            if mode_changed && self.compositor_combine_mode == 0 {
-                                self.compositor_links
-                                    .retain(|(_, to, input)| *to != 9 || *input != 2);
+                        for (index, m) in modes.iter().enumerate() {
+                            if ui.selectable_value(&mut new_mode, index, *m).changed() {
+                                changed = true;
                             }
                         }
                     });
-                if self.compositor_combine_mode == 0 {
+                if new_mode == 0 {
                     let operations = [
                         "Add",
                         "Subtract",
@@ -1907,33 +2680,31 @@ impl EditorApp {
                         "Absolute Difference",
                     ];
                     ui.label("Algebra operation");
-                    egui::ComboBox::from_id_salt("compositor_combine_operation")
-                        .selected_text(operations[self.compositor_combine_operation])
+                    egui::ComboBox::from_id_salt(("compositor_combine_operation", node_id))
+                        .selected_text(operations[operation])
                         .show_ui(ui, |ui| {
-                            for (index, operation) in operations.iter().enumerate() {
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut self.compositor_combine_operation,
-                                        index,
-                                        *operation,
-                                    )
-                                    .changed();
+                            for (index, op) in operations.iter().enumerate() {
+                                if ui
+                                    .selectable_value(&mut new_operation, index, *op)
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
                             }
                         });
                 } else {
                     ui.label("Alpha");
-                    let alpha_connected = self
-                        .compositor_links
-                        .iter()
-                        .any(|(_, to, input)| *to == 9 && *input == 2);
-                    changed |= ui
+                    if ui
                         .add_enabled(
                             !alpha_connected,
-                            egui::DragValue::new(&mut self.compositor_combine_alpha)
+                            egui::DragValue::new(&mut new_alpha)
                                 .range(0.0..=1.0)
                                 .speed(0.01),
                         )
-                        .changed();
+                        .changed()
+                    {
+                        changed = true;
+                    }
                     if alpha_connected {
                         ui.small("Driven by the Alpha input socket.");
                     } else {
@@ -1941,72 +2712,154 @@ impl EditorApp {
                     }
                     ui.small("Result = alpha × A + (1 − alpha) × B");
                 }
+                if changed {
+                    let pos = self
+                        .compositor_nodes
+                        .iter()
+                        .position(|n| n.id == node_id)
+                        .unwrap();
+                    let NodeSettings::TextureCombine {
+                        mode: ref mut m,
+                        operation: ref mut op,
+                        alpha: ref mut a,
+                    } = self.compositor_nodes[pos].settings
+                    else {
+                        return;
+                    };
+                    *m = new_mode;
+                    *op = new_operation;
+                    *a = new_alpha;
+                }
+                if new_mode != mode && new_mode == 0 {
+                    self.compositor_links
+                        .retain(|&(_, _, to, input)| to != node_id || input != 2);
+                }
             }
             10 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::ColorSpaceConvert {
+                    ref mut from,
+                    ref mut to,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 let spaces = ["sRGB", "Linear RGB"];
                 ui.label("From");
-                egui::ComboBox::from_id_salt("compositor_color_space_from")
-                    .selected_text(spaces[self.compositor_color_space_from])
+                egui::ComboBox::from_id_salt(("compositor_color_space_from", node_id))
+                    .selected_text(spaces[*from])
                     .show_ui(ui, |ui| {
                         for (index, space) in spaces.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_color_space_from,
-                                    index,
-                                    *space,
-                                )
-                                .changed();
+                            changed |= ui.selectable_value(from, index, *space).changed();
                         }
                     });
                 ui.label("To");
-                egui::ComboBox::from_id_salt("compositor_color_space_to")
-                    .selected_text(spaces[self.compositor_color_space_to])
+                egui::ComboBox::from_id_salt(("compositor_color_space_to", node_id))
+                    .selected_text(spaces[*to])
                     .show_ui(ui, |ui| {
                         for (index, space) in spaces.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_color_space_to,
-                                    index,
-                                    *space,
-                                )
-                                .changed();
+                            changed |= ui.selectable_value(to, index, *space).changed();
                         }
                     });
             }
             11 => {
-                let channels = ["Red", "Green", "Blue", "Alpha"];
-                ui.label("Extract channel");
-                egui::ComboBox::from_id_salt("compositor_extract_channel")
-                    .selected_text(channels[self.compositor_extract_channel])
-                    .show_ui(ui, |ui| {
-                        for (index, channel) in channels.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.compositor_extract_channel,
-                                    index,
-                                    *channel,
-                                )
-                                .changed();
-                        }
-                    });
+                ui.small("Splits RGBA image into R, G, B, A channels.");
             }
             12 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::Grayscale { ref mut mode } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
                 let modes = ["Luminance (Rec. 709)", "Average", "Lightness"];
                 ui.label("Conversion");
-                egui::ComboBox::from_id_salt("compositor_grayscale_mode")
-                    .selected_text(modes[self.compositor_grayscale_mode])
+                egui::ComboBox::from_id_salt(("compositor_grayscale_mode", node_id))
+                    .selected_text(modes[*mode])
                     .show_ui(ui, |ui| {
-                        for (index, mode) in modes.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(&mut self.compositor_grayscale_mode, index, *mode)
-                                .changed();
+                        for (index, m) in modes.iter().enumerate() {
+                            changed |= ui.selectable_value(mode, index, *m).changed();
                         }
                     });
             }
-            _ => {
-                ui.label("Inputs");
-                ui.small("R, G, B and A are joined into one RGBA image.");
+            13 => {
+                ui.small("Joins R, G, B, A channels into one RGBA image.\nUnconnected RGB default to 0; Alpha defaults to 1.");
             }
+            14 => {
+                let objects: Vec<String> = self
+                    .scene
+                    .tree
+                    .iter()
+                    .map(|(_, n)| n.name.clone())
+                    .collect();
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|n| n.id == node_id)
+                    .unwrap();
+                let NodeSettings::ObjectHandle {
+                    ref mut object_index,
+                    ref mut label,
+                    ref mut control,
+                    ref mut value,
+                    ref mut minimum,
+                    ref mut maximum,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                *object_index = (*object_index).min(objects.len().saturating_sub(1));
+                ui.label("Scene object");
+                egui::ComboBox::from_id_salt(("compositor_handle_object", node_id))
+                    .selected_text(
+                        objects
+                            .get(*object_index)
+                            .map(String::as_str)
+                            .unwrap_or("No scene objects"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (index, name) in objects.iter().enumerate() {
+                            changed |= ui.selectable_value(object_index, index, name).changed();
+                        }
+                    });
+                ui.label("Label");
+                changed |= ui.text_edit_singleline(label).changed();
+                ui.label("Scene control");
+                egui::ComboBox::from_id_salt(("compositor_handle_control", node_id))
+                    .selected_text(if *control == 0 {
+                        "Slider"
+                    } else {
+                        "Number field"
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(control, 0, "Slider").changed();
+                        changed |= ui.selectable_value(control, 1, "Number field").changed();
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Range");
+                    changed |= ui.add(egui::DragValue::new(minimum).speed(0.01)).changed();
+                    changed |= ui.add(egui::DragValue::new(maximum).speed(0.01)).changed();
+                });
+                if *maximum < *minimum {
+                    std::mem::swap(minimum, maximum);
+                    changed = true;
+                }
+                *value = value.clamp(*minimum, *maximum);
+            }
+            _ => {}
+        }
+        if open_browse {
+            self.start_compositor_image_import(ui.ctx());
+        }
+        if changed {
+            self.invalidate_compositor_from(node_id);
         }
         self.project_dirty |= changed;
     }
@@ -2101,6 +2954,7 @@ impl EditorApp {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
+        let previous_workspace = self.workspace_tab;
         egui::TopBottomPanel::top("top_bar")
             .exact_height(70.0)
             .frame(panel_frame(Color32::from_rgb(25, 27, 34)))
@@ -2159,6 +3013,43 @@ impl EditorApp {
                         });
                     }
                     ui.menu_button("Settings", |ui| {
+                        ui.strong("Device");
+                        let previous_device = self.render_device;
+                        egui::ComboBox::from_id_salt("settings_render_device")
+                            .selected_text(self.render_device.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.render_device,
+                                    RenderDevice::Vulkan,
+                                    "Vulkan",
+                                );
+                                ui.selectable_value(
+                                    &mut self.render_device,
+                                    RenderDevice::Cpu,
+                                    "CPU",
+                                );
+                            });
+                        if self.render_device != previous_device {
+                            self.compositor_eval_cache.clear();
+                            self.compositor_gpu_cache.clear();
+                            if self.render_device == RenderDevice::Cpu {
+                                self.compositor_texture_overrides.retain(|(_, texture)| {
+                                    matches!(texture, TextureOverride::Cpu(_))
+                                });
+                                self.compositor_apply_due = Some(Instant::now());
+                            }
+                            self.viewport_depth_key = None;
+                            self.viewport_requested_key = None;
+                            self.scene_revision = self.scene_revision.wrapping_add(1);
+                            self.project_dirty = true;
+                        }
+                        ui.small(match self.render_device {
+                            RenderDevice::Vulkan => {
+                                "GPU viewport + compositing · automatic CPU fallback"
+                            }
+                            RenderDevice::Cpu => "Portable reference renderer + compositor",
+                        });
+                        ui.separator();
                         ui.strong("Viewport");
                         ui.checkbox(&mut self.show_grid, "Show grid");
                         egui::ComboBox::from_id_salt("settings_grid_spacing")
@@ -2197,6 +3088,30 @@ impl EditorApp {
                             } else {
                                 "Saved"
                             });
+                        let (device_label, badge_fill, badge_text) = match self.render_device {
+                            RenderDevice::Vulkan => (
+                                " GPU ",
+                                Color32::from_rgb(42, 112, 70),
+                                Color32::from_rgb(182, 255, 205),
+                            ),
+                            RenderDevice::Cpu => (
+                                " CPU ",
+                                Color32::from_rgb(126, 96, 28),
+                                Color32::from_rgb(255, 225, 139),
+                            ),
+                        };
+                        ui.label(
+                            RichText::new(device_label)
+                                .monospace()
+                                .strong()
+                                .small()
+                                .color(badge_text)
+                                .background_color(badge_fill),
+                        )
+                        .on_hover_text(match self.render_device {
+                            RenderDevice::Vulkan => "Vulkan GPU rendering and compositing",
+                            RenderDevice::Cpu => "CPU reference rendering and compositing",
+                        });
                     });
                 });
                 ui.separator();
@@ -2274,6 +3189,11 @@ impl EditorApp {
                     });
                 });
             });
+        if previous_workspace == WorkspaceTab::Compositing
+            && self.workspace_tab == WorkspaceTab::Scene
+        {
+            self.apply_compositor();
+        }
     }
 
     fn hierarchy(&mut self, ctx: &egui::Context) {
@@ -2332,6 +3252,12 @@ impl EditorApp {
     }
 
     fn inspector(&mut self, ctx: &egui::Context) {
+        let selected_object_index = self
+            .scene
+            .selected
+            .and_then(|selected| self.scene.tree.iter().position(|(id, _)| id == selected));
+        let mut compositor_handle_changed = false;
+        let mut changed_handle_nodes = Vec::new();
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(300.0)
@@ -2658,6 +3584,62 @@ impl EditorApp {
                                         .weak(),
                                 );
                             });
+                            if let Some(object_index) = selected_object_index {
+                                let has_handles = self.compositor_nodes.iter().any(|node| {
+                                    matches!(
+                                        node.settings,
+                                        NodeSettings::ObjectHandle {
+                                            object_index: target,
+                                            ..
+                                        } if target == object_index
+                                    )
+                                });
+                                if has_handles {
+                                    egui::CollapsingHeader::new(
+                                        RichText::new("Object Handles").strong(),
+                                    )
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for node in &mut self.compositor_nodes {
+                                            let NodeSettings::ObjectHandle {
+                                                object_index: target,
+                                                label,
+                                                control,
+                                                value,
+                                                minimum,
+                                                maximum,
+                                            } = &mut node.settings
+                                            else {
+                                                continue;
+                                            };
+                                            if *target != object_index {
+                                                continue;
+                                            }
+                                            ui.label(label.as_str());
+                                            let response = if *control == 0 {
+                                                ui.add(
+                                                    egui::Slider::new(value, *minimum..=*maximum)
+                                                        .show_value(true),
+                                                )
+                                            } else {
+                                                ui.add(
+                                                    egui::DragValue::new(value)
+                                                        .range(*minimum..=*maximum)
+                                                        .speed(
+                                                            ((*maximum - *minimum).abs() / 100.0)
+                                                                .max(0.001),
+                                                        ),
+                                                )
+                                            };
+                                            if response.changed() {
+                                                compositor_handle_changed = true;
+                                                changed_handle_nodes.push(node.id);
+                                                self.project_dirty = true;
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                             if self.advanced {
                                 egui::CollapsingHeader::new("Advanced")
                                     .default_open(true)
@@ -2683,6 +3665,15 @@ impl EditorApp {
                         });
                 });
             });
+        if compositor_handle_changed {
+            self.compositor_control_started = Some(Instant::now());
+            for node_id in changed_handle_nodes {
+                self.invalidate_compositor_from(node_id);
+            }
+            // Vulkan work is coalesced by latest-request workers, so an
+            // additional UI debounce only adds visible control latency.
+            self.compositor_apply_due = Some(Instant::now());
+        }
     }
 
     fn bottom_panel(&mut self, ctx: &egui::Context) {
@@ -2706,7 +3697,7 @@ impl EditorApp {
                     BottomTab::Assets => self.assets_panel(ui),
                     BottomTab::Scripts => scripts_panel(ui),
                     BottomTab::Console => console_panel(ui, &self.logs),
-                    BottomTab::Telemetry => telemetry_panel(ui, self.play_state),
+                    BottomTab::Telemetry => telemetry_panel(ui, self.play_state, &self.performance),
                 }
             });
     }
@@ -2773,21 +3764,55 @@ impl EditorApp {
         );
     }
 
-    fn activate_compositor_node(&mut self, index: usize) {
-        self.compositor_node_active[index] = true;
-        self.compositor_selected_node = index;
-        self.compositor_pending_spawn = Some(index);
+    fn activate_compositor_node(&mut self, kind: usize) {
+        let Some(settings) = NodeSettings::default_for_kind(kind) else {
+            return;
+        };
+        let id = self.compositor_next_id;
+        self.compositor_next_id += 1;
+        self.compositor_nodes.push(CompositorNode {
+            id,
+            settings,
+            position: Vec2::ZERO,
+        });
+        self.compositor_selected_node = id;
+        self.compositor_pending_spawn = Some(id);
         self.compositor_pending_output = None;
+        self.compositor_eval_cache.clear();
+        self.compositor_gpu_cache.clear();
         self.project_dirty = true;
     }
 
-    fn compositor_input_source(&self, node: usize, input: usize) -> Result<usize, String> {
+    fn invalidate_compositor_from(&mut self, node_id: usize) {
+        let mut pending = vec![node_id];
+        let mut affected = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if !affected.insert(current) {
+                continue;
+            }
+            pending.extend(
+                self.compositor_links
+                    .iter()
+                    .filter_map(|&(from, _, to, _)| (from == current).then_some(to)),
+            );
+        }
+        self.compositor_eval_cache
+            .retain(|(cached_node, _, _), _| !affected.contains(cached_node));
+        self.compositor_gpu_cache
+            .retain(|(cached_node, _, _), _| !affected.contains(cached_node));
+    }
+
+    fn compositor_input_source(
+        &self,
+        to_id: usize,
+        to_input: usize,
+    ) -> Result<(usize, usize), String> {
         self.compositor_links
             .iter()
-            .find_map(|(from, to, target_input)| {
-                (*to == node && *target_input == input).then_some(*from)
+            .find_map(|&(from_id, from_output, to, input)| {
+                (to == to_id && input == to_input).then_some((from_id, from_output))
             })
-            .ok_or_else(|| format!("input {} on node {} is not connected", input + 1, node))
+            .ok_or_else(|| format!("input {} on node {} is not connected", to_input + 1, to_id))
     }
 
     fn object_asset_path(&self, object_index: usize) -> Option<&str> {
@@ -2809,18 +3834,131 @@ impl EditorApp {
         self.scene.tree.iter().nth(object_index).map(|(id, _)| id)
     }
 
+    fn projected_object_extent(&self, object_index: usize) -> Option<f32> {
+        let (id, node) = self.scene.tree.iter().nth(object_index)?;
+        let path = node
+            .components
+            .iter()
+            .find_map(|component| match component {
+                Component::Model { asset } => Some(asset.as_str()),
+                _ => None,
+            })?;
+        let bounds = self
+            .imported_assets
+            .iter()
+            .find(|asset| asset.path == path)?
+            .bounds;
+        let size = self
+            .viewport_depth_key
+            .map(|key| key.size)
+            .unwrap_or([1280, 720]);
+        let center = Pos2::new(size[0] as f32 * 0.5, size[1] as f32 * 0.5);
+        let scale = size[0].min(size[1]) as f32 * 0.18 * self.camera_zoom;
+        let transform = self.scene.tree.node(id).ok()?.global_transform();
+        let mut minimum = Pos2::new(f32::INFINITY, f32::INFINITY);
+        let mut maximum = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let mut projected = 0usize;
+        for x in [bounds.0[0], bounds.1[0]] {
+            for y in [bounds.0[1], bounds.1[1]] {
+                for z in [bounds.0[2], bounds.1[2]] {
+                    let world = transform
+                        .rotation
+                        .rotate(transform.scale.component_mul(CoreVec3::new(x, y, z)))
+                        + transform.translation;
+                    if let Some(point) = project(
+                        [world.x, world.y, world.z],
+                        center,
+                        scale,
+                        self.camera_yaw,
+                        self.camera_pitch,
+                        self.camera_target,
+                        self.projection_mode,
+                        self.grid_spacing,
+                    ) {
+                        minimum.x = minimum.x.min(point.x);
+                        minimum.y = minimum.y.min(point.y);
+                        maximum.x = maximum.x.max(point.x);
+                        maximum.y = maximum.y.max(point.y);
+                        projected += 1;
+                    }
+                }
+            }
+        }
+        (projected > 0).then_some((maximum.x - minimum.x).max(maximum.y - minimum.y))
+    }
+
+    fn ensure_vulkan_compositor(&mut self) -> bool {
+        if self.vulkan_compositor.is_some() {
+            return true;
+        }
+        if self.vulkan_compositor_attempted {
+            return false;
+        }
+        self.vulkan_compositor_attempted = true;
+        match vulkan_compositor::VulkanGraphWorker::new() {
+            Ok(compositor) => {
+                self.logs.push(LogEntry {
+                    level: "VULKAN",
+                    color: Color32::from_rgb(112, 210, 156),
+                    message: format!("Compositor connected to {}", compositor.device_name),
+                });
+                self.vulkan_compositor = Some(compositor);
+                true
+            }
+            Err(message) => {
+                self.logs.push(LogEntry {
+                    level: "FALLBACK",
+                    color: Color32::from_rgb(244, 190, 88),
+                    message: format!("Vulkan compositor unavailable; using CPU: {message}"),
+                });
+                false
+            }
+        }
+    }
+
     fn evaluate_compositor_node(
-        &self,
-        node: usize,
-        visiting: &mut BTreeSet<usize>,
-    ) -> Result<TextureAsset, String> {
-        if !visiting.insert(node) {
+        &mut self,
+        node_id: usize,
+        output: usize,
+        visiting: &mut BTreeSet<(usize, usize)>,
+    ) -> Result<Arc<TextureAsset>, String> {
+        // Transitional safety valve: Vulkan mode must not accidentally run a
+        // CPU-only node over an unlimited 4K/8K source while GPU coverage is
+        // being completed. This affects only the temporary CPU graph value;
+        // source assets and GPU-resident outputs retain full resolution.
+        let fallback_lod = if self.render_device == RenderDevice::Vulkan {
+            self.compositor_lod_max_dimension.min(1024)
+        } else {
+            self.compositor_lod_max_dimension
+        };
+        let cache_key = (node_id, output, self.compositor_lod_max_dimension);
+        if let Some(texture) = self.compositor_eval_cache.get(&cache_key) {
+            return Ok(Arc::clone(texture));
+        }
+        if let Some(image) = self.compositor_gpu_cache.get(&cache_key) {
+            let texture = Arc::new(TextureAsset {
+                name: "compositor-explicit-readback".into(),
+                width: image.width,
+                height: image.height,
+                pixels: image.readback_rgba8()?,
+            });
+            self.compositor_eval_cache
+                .insert(cache_key, Arc::clone(&texture));
+            return Ok(texture);
+        }
+        if !visiting.insert((node_id, output)) {
             return Err("compositor graph contains a cycle".into());
         }
-        let result = match node {
-            0 => {
+        let settings = self
+            .compositor_nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .map(|n| n.settings.clone())
+            .ok_or_else(|| format!("node {} not found", node_id))?;
+        let result = match settings {
+            NodeSettings::ObjectTexture { object_index, .. } => {
                 let path = self
-                    .object_asset_path(self.compositor_object_index)
+                    .object_asset_path(object_index)
                     .ok_or("Object Texture has no model object selected")?;
                 let mesh = self
                     .imported_assets
@@ -2835,179 +3973,374 @@ impl EditorApp {
                     .filter_map(|name| mesh.materials.get(name))
                     .find_map(|material| material.base_color_texture.as_ref())
                     .ok_or("Object Texture source has no base-color texture")?;
-                mesh.textures
+                let source = mesh
+                    .textures
                     .get(texture_name)
                     .cloned()
-                    .ok_or_else(|| format!("texture `{texture_name}` is unavailable"))
+                    .map(Arc::new)
+                    .ok_or_else(|| format!("texture `{texture_name}` is unavailable"))?;
+                Ok(resize_texture_for_lod(&source, fallback_lod))
             }
-            1 => {
-                let path = self
-                    .compositor_images
-                    .first()
-                    .map(|image| image.path.as_str())
-                    .ok_or("Image Asset has no imported image")?;
-                let image = image::open(path)
-                    .map_err(|error| format!("could not decode `{path}`: {error}"))?
-                    .into_rgba8();
-                Ok(TextureAsset {
-                    name: PathBuf::from(path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("compositor-image")
-                        .into(),
-                    width: image.width(),
-                    height: image.height(),
-                    pixels: image.into_raw(),
-                })
+            NodeSettings::ImageAsset { path } => {
+                if path.is_empty() {
+                    return Err("Image Asset has no imported image".into());
+                }
+                let source = if let Some(texture) = self.compositor_image_cache.get(&path) {
+                    Arc::clone(texture)
+                } else {
+                    let image = image::open(&path)
+                        .map_err(|e| format!("could not decode `{path}`: {e}"))?
+                        .into_rgba8();
+                    let texture = Arc::new(TextureAsset {
+                        name: std::path::PathBuf::from(&path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("compositor-image")
+                            .into(),
+                        width: image.width(),
+                        height: image.height(),
+                        pixels: image.into_raw(),
+                    });
+                    self.compositor_image_cache
+                        .insert(path, Arc::clone(&texture));
+                    texture
+                };
+                Ok(resize_texture_for_lod(&source, fallback_lod))
             }
-            2 => Ok(TextureAsset {
+            NodeSettings::ConstantValue { color, .. } => Ok(Arc::new(TextureAsset {
                 name: "compositor-constant".into(),
                 width: 1,
                 height: 1,
-                pixels: self
-                    .compositor_color
+                pixels: color
                     .iter()
-                    .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+                    .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
                     .chain(std::iter::once(255))
                     .collect(),
-            }),
-            4 => {
-                let source = self.compositor_input_source(node, 0)?;
-                let texture = self.evaluate_compositor_node(source, visiting)?;
-                Ok(apply_compositor_math(
-                    texture,
-                    self.compositor_math_operation,
-                    self.compositor_constant,
-                ))
+            })),
+            NodeSettings::Remap { .. } => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                self.evaluate_compositor_node(from_id, from_out, visiting)
             }
-            3 | 5..=7 => {
-                let source = self.compositor_input_source(node, 0)?;
-                self.evaluate_compositor_node(source, visiting)
+            NodeSettings::TextureMath {
+                operation,
+                constant,
+            } => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                let texture = self.evaluate_compositor_node(from_id, from_out, visiting)?;
+                Ok(Arc::new(apply_compositor_math(
+                    (*texture).clone(),
+                    operation,
+                    constant,
+                )))
             }
-            9 => {
-                let a = self
-                    .evaluate_compositor_node(self.compositor_input_source(node, 0)?, visiting)?;
-                let b = self
-                    .evaluate_compositor_node(self.compositor_input_source(node, 1)?, visiting)?;
-                let alpha = if self.compositor_combine_mode == 1 {
+            NodeSettings::SharpThreshold { .. }
+            | NodeSettings::SmoothThreshold { .. }
+            | NodeSettings::ImageFilter { .. } => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                self.evaluate_compositor_node(from_id, from_out, visiting)
+            }
+            NodeSettings::Output { .. } => Err("cannot evaluate Output as image source".into()),
+            NodeSettings::TextureCombine {
+                mode,
+                operation,
+                alpha,
+            } => {
+                let (a_id, a_out) = self.compositor_input_source(node_id, 0)?;
+                let a = self.evaluate_compositor_node(a_id, a_out, visiting)?;
+                let (b_id, b_out) = self.compositor_input_source(node_id, 1)?;
+                let b = self.evaluate_compositor_node(b_id, b_out, visiting)?;
+                let alpha_tex = if mode == 1 {
                     self.compositor_links
                         .iter()
-                        .find_map(|(from, to, input)| (*to == 9 && *input == 2).then_some(*from))
-                        .map(|source| self.evaluate_compositor_node(source, visiting))
+                        .find_map(|&(from_id, from_out, to, input)| {
+                            (to == node_id && input == 2).then_some((from_id, from_out))
+                        })
+                        .map(|(fid, fo)| self.evaluate_compositor_node(fid, fo, visiting))
                         .transpose()?
                 } else {
                     None
                 };
-                Ok(combine_compositor_textures(
+                Ok(Arc::new(combine_compositor_textures(
                     &a,
                     &b,
-                    alpha.as_ref(),
-                    self.compositor_combine_mode,
-                    self.compositor_combine_operation,
-                    self.compositor_combine_alpha,
-                ))
+                    alpha_tex.as_deref(),
+                    mode,
+                    operation,
+                    alpha,
+                )))
             }
-            10 => {
-                let source = self.compositor_input_source(node, 0)?;
-                let texture = self.evaluate_compositor_node(source, visiting)?;
-                Ok(convert_compositor_color_space(
-                    texture,
-                    self.compositor_color_space_from,
-                    self.compositor_color_space_to,
-                ))
+            NodeSettings::ColorSpaceConvert { from, to } => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                let texture = self.evaluate_compositor_node(from_id, from_out, visiting)?;
+                Ok(Arc::new(convert_compositor_color_space(
+                    (*texture).clone(),
+                    from,
+                    to,
+                )))
             }
-            11 => {
-                let source = self.compositor_input_source(node, 0)?;
-                let texture = self.evaluate_compositor_node(source, visiting)?;
-                Ok(extract_compositor_channel(
-                    texture,
-                    self.compositor_extract_channel,
-                ))
+            NodeSettings::ColorDecoder => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                let texture = self.evaluate_compositor_node(from_id, from_out, visiting)?;
+                Ok(Arc::new(extract_compositor_channel(
+                    (*texture).clone(),
+                    output,
+                )))
             }
-            12 => {
-                let source = self.compositor_input_source(node, 0)?;
-                let texture = self.evaluate_compositor_node(source, visiting)?;
-                Ok(grayscale_compositor_texture(
-                    texture,
-                    self.compositor_grayscale_mode,
-                ))
+            NodeSettings::Grayscale { mode } => {
+                let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
+                let texture = self.evaluate_compositor_node(from_id, from_out, visiting)?;
+                Ok(Arc::new(grayscale_compositor_texture(
+                    (*texture).clone(),
+                    mode,
+                )))
             }
-            13 => {
-                let mut channels = Vec::with_capacity(4);
-                for input in 0..3 {
-                    channels.push(self.evaluate_compositor_node(
-                        self.compositor_input_source(node, input)?,
-                        visiting,
-                    )?);
-                }
-                let alpha = self
-                    .compositor_links
-                    .iter()
-                    .find_map(|(from, to, input)| (*to == 13 && *input == 3).then_some(*from))
-                    .map(|source| self.evaluate_compositor_node(source, visiting))
-                    .transpose()?;
-                Ok(join_compositor_channels(
-                    [&channels[0], &channels[1], &channels[2]],
-                    alpha.as_ref(),
-                ))
+            NodeSettings::ColorEncoder => {
+                let make_default = |v: u8| TextureAsset {
+                    name: "compositor-default".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![v, v, v, 255],
+                };
+                let r = match self.compositor_input_source(node_id, 0) {
+                    Ok((fid, fo)) => self.evaluate_compositor_node(fid, fo, visiting)?,
+                    Err(_) => Arc::new(make_default(0)),
+                };
+                let g = match self.compositor_input_source(node_id, 1) {
+                    Ok((fid, fo)) => self.evaluate_compositor_node(fid, fo, visiting)?,
+                    Err(_) => Arc::new(make_default(0)),
+                };
+                let b = match self.compositor_input_source(node_id, 2) {
+                    Ok((fid, fo)) => self.evaluate_compositor_node(fid, fo, visiting)?,
+                    Err(_) => Arc::new(make_default(0)),
+                };
+                let a = match self.compositor_input_source(node_id, 3) {
+                    Ok((fid, fo)) => self.evaluate_compositor_node(fid, fo, visiting)?,
+                    Err(_) => Arc::new(make_default(255)),
+                };
+                Ok(Arc::new(join_compositor_channels([&r, &g, &b], Some(&a))))
             }
-            _ => Err(format!("node {node} cannot be evaluated as an image")),
+            NodeSettings::ObjectHandle { value, .. } => {
+                let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Ok(Arc::new(TextureAsset {
+                    name: "compositor-object-handle".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![channel, channel, channel, 255],
+                }))
+            }
         };
-        visiting.remove(&node);
+        visiting.remove(&(node_id, output));
+        if let Ok(texture) = &result {
+            self.compositor_eval_cache
+                .insert(cache_key, Arc::clone(texture));
+        }
         result
     }
 
     fn apply_compositor(&mut self) {
-        let result = (|| {
-            if self.compositor_output_texture_channel != 0 {
-                return Err("only Base Color output is implemented in this build".into());
+        let Some(output_id) = self
+            .compositor_nodes
+            .iter()
+            .find(|node| matches!(node.settings, NodeSettings::Output { .. }))
+            .map(|node| node.id)
+        else {
+            return;
+        };
+
+        self.vulkan_latest_generation = self.vulkan_latest_generation.wrapping_add(1);
+        let generation = self.vulkan_latest_generation;
+        let object_index = self.compositor_nodes.iter().find_map(|node| {
+            (node.id == output_id).then(|| match node.settings {
+                NodeSettings::Output { object_index, .. } => Some(object_index),
+                _ => None,
+            })?
+        });
+        let target = object_index.and_then(|index| self.object_node_id(index));
+        if self.compositor_input_source(output_id, 0).is_err() {
+            if let Some(target) = target {
+                let before = self.compositor_texture_overrides.len();
+                self.compositor_texture_overrides
+                    .retain(|(id, _)| *id != target);
+                if before != self.compositor_texture_overrides.len() {
+                    self.texture_revision = self.texture_revision.wrapping_add(1);
+                }
             }
-            let source = self.compositor_input_source(8, 0)?;
-            let texture = self.evaluate_compositor_node(source, &mut BTreeSet::new())?;
-            let target = self
-                .object_node_id(self.compositor_output_object_index)
-                .ok_or("Output has no scene object selected")?;
-            if self
-                .object_asset_path(self.compositor_output_object_index)
-                .is_none()
-            {
-                return Err("Output target is not a model object".into());
-            }
-            if let Some((_, current)) = self
-                .compositor_texture_overrides
-                .iter_mut()
-                .find(|(id, _)| *id == target)
-            {
-                *current = texture;
-            } else {
-                self.compositor_texture_overrides.push((target, texture));
-            }
-            let name = self
-                .scene
-                .tree
-                .node(target)
-                .map(|node| node.name.clone())
-                .unwrap_or_else(|_| "model".into());
-            Ok::<_, String>(name)
-        })();
-        match result {
-            Ok(name) => {
-                self.scene_revision = self.scene_revision.wrapping_add(1);
+            return;
+        }
+        let projected_extent = object_index
+            .and_then(|index| self.projected_object_extent(index))
+            .unwrap_or(1024.0);
+        let lod = select_compositor_lod_for_backend(
+            projected_extent,
+            self.compositor_lod_max_dimension,
+            self.render_device,
+        );
+        if lod != self.compositor_lod_max_dimension {
+            self.compositor_lod_max_dimension = lod;
+        }
+
+        let compile_started = Instant::now();
+        let compiled = match self.compile_compositor_graph(output_id, generation, lod) {
+            Ok(compiled) => compiled,
+            Err(message) => {
                 self.logs.push(LogEntry {
-                    level: "COMPOSITE",
-                    color: Color32::from_rgb(112, 210, 156),
-                    message: format!("Applied compositor output to `{name}`"),
+                    level: "ERROR",
+                    color: Color32::from_rgb(235, 91, 91),
+                    message: format!("Could not compile compositor: {message}"),
                 });
+                return;
             }
-            Err(message) => self.logs.push(LogEntry {
+        };
+        self.performance
+            .graph_compile
+            .record(compile_started.elapsed());
+        if let Some(started) = self.compositor_control_started {
+            self.performance
+                .control_to_graph_apply
+                .record(started.elapsed());
+        }
+        let Some(target) = target.or_else(|| self.object_node_id(compiled.object_index)) else {
+            self.logs.push(LogEntry {
                 level: "ERROR",
                 color: Color32::from_rgb(235, 91, 91),
-                message: format!("Could not apply compositor: {message}"),
-            }),
+                message: "Could not apply compositor: output target is not a model".into(),
+            });
+            return;
+        };
+        if compiled.channel != 0 {
+            return;
+        }
+
+        self.compositor_pending_target = Some(target);
+        self.vulkan_waiting_generation = Some(generation);
+        let graph = Arc::new(compiled.graph);
+        if self.render_device == RenderDevice::Vulkan && self.ensure_vulkan_compositor() {
+            self.vulkan_compositor
+                .as_ref()
+                .expect("Vulkan graph worker was initialized")
+                .submit_latest(graph);
+        } else {
+            self.cpu_compositor.submit_latest(graph);
+        }
+    }
+
+    fn poll_compositor_apply(&mut self, ctx: &egui::Context) {
+        let Some(due) = self.compositor_apply_due else {
+            return;
+        };
+        if Instant::now() >= due {
+            self.compositor_apply_due = None;
+            self.apply_compositor();
+        } else {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    fn poll_vulkan_compositor(&mut self, ctx: &egui::Context) {
+        enum CompletedGraph {
+            Cpu(compositor_cpu::CpuGraphResult),
+            Vulkan(vulkan_compositor::GraphResult),
+        }
+        let mut newest = None;
+        while let Some(result) = self.cpu_compositor.try_result() {
+            newest = Some(CompletedGraph::Cpu(result));
+        }
+        if let Some(worker) = &self.vulkan_compositor {
+            while let Some(result) = worker.try_result() {
+                newest = Some(CompletedGraph::Vulkan(result));
+            }
+        }
+        let Some(result) = newest else {
+            if self.vulkan_waiting_generation.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(8));
+            }
+            return;
+        };
+        let generation = match &result {
+            CompletedGraph::Cpu(result) => result.generation,
+            CompletedGraph::Vulkan(result) => result.generation,
+        };
+        if generation != self.vulkan_latest_generation {
+            ctx.request_repaint_after(Duration::from_millis(8));
+            return;
+        }
+        self.vulkan_waiting_generation = None;
+        if let Some(started) = self.compositor_control_started {
+            self.performance
+                .control_to_composite_ready
+                .record(started.elapsed());
+        }
+        let Some(target) = self.compositor_pending_target.take() else {
+            return;
+        };
+        let completed = match result {
+            CompletedGraph::Cpu(result) => {
+                self.performance.graph_evaluation.record(result.worker_time);
+                result.texture.map(TextureOverride::Cpu)
+            }
+            CompletedGraph::Vulkan(result) => {
+                self.performance
+                    .compositor_vulkan_submit
+                    .record(result.worker_time);
+                result.texture.map(TextureOverride::Gpu)
+            }
+        };
+        match completed {
+            Ok(texture) => {
+                if let Some((_, current)) = self
+                    .compositor_texture_overrides
+                    .iter_mut()
+                    .find(|(id, _)| *id == target)
+                {
+                    *current = texture;
+                } else {
+                    self.compositor_texture_overrides.push((target, texture));
+                }
+                self.texture_revision = self.texture_revision.wrapping_add(1);
+                if let Some(started) = self.compositor_control_started {
+                    self.compositor_present_revision = Some((self.texture_revision, started));
+                }
+            }
+            Err(message) => {
+                self.logs.push(LogEntry {
+                    level: "ERROR",
+                    color: Color32::from_rgb(235, 91, 91),
+                    message: format!("Compositor graph execution failed: {message}"),
+                });
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn schedule_compositor_lod_update(&mut self, ctx: &egui::Context) {
+        if self.render_device == RenderDevice::Vulkan {
+            return;
+        }
+        let object_index = self
+            .compositor_nodes
+            .iter()
+            .find_map(|node| match node.settings {
+                NodeSettings::Output { object_index, .. } => Some(object_index),
+                _ => None,
+            });
+        let Some(projected) = object_index.and_then(|index| self.projected_object_extent(index))
+        else {
+            return;
+        };
+        if select_compositor_lod_for_backend(
+            projected,
+            self.compositor_lod_max_dimension,
+            self.render_device,
+        ) != self.compositor_lod_max_dimension
+        {
+            let due = Instant::now() + Duration::from_millis(100);
+            self.compositor_apply_due.get_or_insert(due);
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
     fn compositing_workspace(&mut self, ctx: &egui::Context) {
+        let previous_links = self.compositor_links.clone();
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(18, 20, 26)))
             .show(ctx, |ui| {
@@ -3016,59 +4349,28 @@ impl EditorApp {
                     ui.separator();
                     ui.menu_button("Add", |ui| {
                         ui.menu_button("Input", |ui| {
-                            for (index, label) in [
-                                (0, "Object Texture"),
-                                (1, "Image Asset"),
-                                (2, "Constant Value"),
-                            ] {
-                                if compositor_add_button(
-                                    ui,
-                                    !self.compositor_node_active[index],
-                                    label,
-                                ) {
+                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle")] {
+                                if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
                             }
                         });
                         ui.menu_button("Color", |ui| {
-                            for (index, label) in [
-                                (3, "Bézier Curves"),
-                                (10, "Color Space Convert"),
-                                (11, "Channel Extract"),
-                                (13, "Channel Join"),
-                                (12, "Grayscale"),
-                            ] {
-                                if compositor_add_button(
-                                    ui,
-                                    !self.compositor_node_active[index],
-                                    label,
-                                ) {
+                            for (index, label) in [(3, "Remap"), (10, "Color Space Convert"), (11, "Color Decoder"), (13, "Color Encoder"), (12, "Grayscale")] {
+                                if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
                             }
                         });
                         ui.menu_button("Converter", |ui| {
-                            for (index, label) in [
-                                (4, "Texture Math"),
-                                (9, "Texture Combine"),
-                                (5, "Sharp Threshold"),
-                                (6, "Smooth Threshold"),
-                            ] {
-                                if compositor_add_button(
-                                    ui,
-                                    !self.compositor_node_active[index],
-                                    label,
-                                ) {
+                            for (index, label) in [(4, "Texture Math"), (9, "Texture Combine"), (5, "Sharp Threshold"), (6, "Smooth Threshold")] {
+                                if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
                             }
                         });
                         ui.menu_button("Filter", |ui| {
-                            if compositor_add_button(
-                                ui,
-                                !self.compositor_node_active[7],
-                                "Image Filter",
-                            ) {
+                            if compositor_add_button(ui, true, "Image Filter") {
                                 self.activate_compositor_node(7);
                             }
                         });
@@ -3076,19 +4378,13 @@ impl EditorApp {
                         ui.add_enabled(false, egui::Button::new("Output (always present)"));
                     });
                     ui.menu_button("Node", |ui| {
-                        if ui
-                            .add_enabled(
-                                self.compositor_selected_node != 8,
-                                egui::Button::new("Remove from graph"),
-                            )
-                            .clicked()
-                        {
-                            let removed = self.compositor_selected_node;
-                            self.compositor_node_active[removed] = false;
-                            self.compositor_links
-                                .retain(|(from, to, _)| *from != removed && *to != removed);
+                        let sel = self.compositor_selected_node;
+                        let can_remove = !self.compositor_nodes.iter().any(|n| n.id == sel && matches!(n.settings, NodeSettings::Output { .. }));
+                        if ui.add_enabled(can_remove, egui::Button::new("Remove from graph")).clicked() {
+                            self.compositor_nodes.retain(|n| n.id != sel);
+                            self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
                             self.compositor_pending_output = None;
-                            self.compositor_selected_node = 8;
+                            self.compositor_selected_node = self.compositor_nodes.iter().find(|n| matches!(n.settings, NodeSettings::Output { .. })).map(|n| n.id).unwrap_or(0);
                             self.project_dirty = true;
                             ui.close_menu();
                         }
@@ -3101,21 +4397,12 @@ impl EditorApp {
                             ui.close_menu();
                         }
                     });
-                    if ui.button("Apply").clicked() {
-                        self.apply_compositor();
-                    }
-                    ui.separator();
-                    if ui.button("Import Image…").clicked() {
-                        self.start_compositor_image_import(ui.ctx());
-                    }
                     ui.label(
-                        RichText::new(format!("{} image assets", self.compositor_images.len()))
-                            .weak()
-                            .small(),
-                    );
-                    ui.separator();
-                    ui.label(
-                        RichText::new("Apply writes the graph result to the target Base Color")
+                        RichText::new(if self.render_device == RenderDevice::Vulkan {
+                            "Device: Vulkan"
+                        } else {
+                            "Device: CPU"
+                        })
                             .weak()
                             .small(),
                     );
@@ -3130,8 +4417,7 @@ impl EditorApp {
                 if response.hovered() {
                     let scroll = ui.input(|input| input.smooth_scroll_delta.y);
                     if scroll != 0.0 {
-                        self.compositor_zoom =
-                            (self.compositor_zoom * (scroll * 0.0015).exp()).clamp(0.35, 2.5);
+                        self.compositor_zoom = (self.compositor_zoom * (scroll * 0.0015).exp()).clamp(0.35, 2.5);
                     }
                 }
 
@@ -3149,182 +4435,153 @@ impl EditorApp {
                     let offset_y = self.compositor_pan.y.rem_euclid(grid_spacing);
                     let mut x = canvas.left() + offset_x;
                     while x < canvas.right() {
-                        painter.line_segment(
-                            [Pos2::new(x, canvas.top()), Pos2::new(x, canvas.bottom())],
-                            Stroke::new(1.0, Color32::from_rgb(31, 34, 42)),
-                        );
+                        painter.line_segment([Pos2::new(x, canvas.top()), Pos2::new(x, canvas.bottom())], Stroke::new(1.0, Color32::from_rgb(31, 34, 42)));
                         x += grid_spacing;
                     }
                     let mut y = canvas.top() + offset_y;
                     while y < canvas.bottom() {
-                        painter.line_segment(
-                            [Pos2::new(canvas.left(), y), Pos2::new(canvas.right(), y)],
-                            Stroke::new(1.0, Color32::from_rgb(31, 34, 42)),
-                        );
+                        painter.line_segment([Pos2::new(canvas.left(), y), Pos2::new(canvas.right(), y)], Stroke::new(1.0, Color32::from_rgb(31, 34, 42)));
                         y += grid_spacing;
                     }
                 }
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs = [
+                let node_specs_by_kind: [(&str, &str, Color32); 15] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
-                    ("Bézier Curves", "Color", Color32::from_rgb(122, 88, 151)),
-                    (
-                        "Texture Math",
-                        "Converter",
-                        Color32::from_rgb(105, 112, 122),
-                    ),
-                    (
-                        "Sharp Threshold",
-                        "Converter",
-                        Color32::from_rgb(105, 112, 122),
-                    ),
-                    (
-                        "Smooth Threshold",
-                        "Converter",
-                        Color32::from_rgb(105, 112, 122),
-                    ),
+                    ("Remap", "Color", Color32::from_rgb(122, 88, 151)),
+                    ("Texture Math", "Converter", Color32::from_rgb(105, 112, 122)),
+                    ("Sharp Threshold", "Converter", Color32::from_rgb(105, 112, 122)),
+                    ("Smooth Threshold", "Converter", Color32::from_rgb(105, 112, 122)),
                     ("Image Filter", "Filter", Color32::from_rgb(92, 128, 92)),
                     ("Output", "Texture Writer", Color32::from_rgb(128, 113, 72)),
-                    (
-                        "Texture Combine",
-                        "Converter",
-                        Color32::from_rgb(105, 112, 122),
-                    ),
-                    (
-                        "Color Space Convert",
-                        "Color",
-                        Color32::from_rgb(122, 88, 151),
-                    ),
-                    (
-                        "Channel Extract",
-                        "Color",
-                        Color32::from_rgb(122, 88, 151),
-                    ),
+                    ("Texture Combine", "Converter", Color32::from_rgb(105, 112, 122)),
+                    ("Color Space Convert", "Color", Color32::from_rgb(122, 88, 151)),
+                    ("Color Decoder", "Color", Color32::from_rgb(122, 88, 151)),
                     ("Grayscale", "Color", Color32::from_rgb(122, 88, 151)),
-                    (
-                        "Channel Join",
-                        "Color",
-                        Color32::from_rgb(122, 88, 151),
-                    ),
+                    ("Color Encoder", "Color", Color32::from_rgb(122, 88, 151)),
+                    ("Object Handle", "Input", Color32::from_rgb(76, 122, 155)),
                 ];
-                let node_heights = [
-                    205.0, 165.0, 215.0, 300.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
-                    175.0, 140.0, 140.0, 165.0,
+                let node_heights_by_kind: [f32; 15] = [
+                    205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
+                    175.0, 140.0, 140.0, 165.0, 285.0,
                 ];
                 let node_width = 230.0;
-                if let Some(index) = self.compositor_pending_spawn.take() {
-                    self.compositor_node_positions[index] = compositor_centered_position(
-                        canvas,
-                        origin,
-                        scale,
-                        Vec2::new(node_width, node_heights[index]),
-                    );
-                }
-                let mut node_rects: Vec<_> = self
-                    .compositor_node_positions
-                    .iter()
-                    .enumerate()
-                    .map(|(index, position)| {
-                        Rect::from_min_size(
-                            origin + *position * scale,
-                            Vec2::new(node_width, node_heights[index]) * scale,
-                        )
-                    })
-                    .collect();
 
-                let output_socket = |node: Rect| Pos2::new(node.right(), node.top() + 70.0 * scale);
-                let combine_mode = self.compositor_combine_mode;
-                let input_socket = |node: Rect, index: usize, input: usize| {
-                    let y = if compositor_input_count(index, combine_mode) == 1 {
-                        70.0
-                    } else if index == 13 {
-                        75.0 + input as f32 * 22.0
-                    } else {
-                        85.0 + input as f32 * 30.0
-                    };
-                    Pos2::new(node.left(), node.top() + y * scale)
+                // Handle pending spawn: center the new node
+                if let Some(id) = self.compositor_pending_spawn.take() {
+                    if let Some(node) = self.compositor_nodes.iter_mut().find(|n| n.id == id) {
+                        let kind = node.settings.kind();
+                        let height = node_heights_by_kind[kind];
+                        node.position = compositor_centered_position(canvas, origin, scale, Vec2::new(node_width, height));
+                    }
+                }
+
+                // Build node rects indexed by node_id
+                let node_id_rects: Vec<(usize, Rect)> = self.compositor_nodes.iter().map(|node| {
+                    let kind = node.settings.kind();
+                    let height = node_heights_by_kind[kind];
+                    let rect = Rect::from_min_size(origin + node.position * scale, Vec2::new(node_width, height) * scale);
+                    (node.id, rect)
+                }).collect();
+                let rect_by_id: std::collections::HashMap<usize, Rect> = node_id_rects.iter().cloned().collect();
+
+                let output_socket = |node_rect: Rect, kind: usize, out_idx: usize| -> Pos2 {
+                    let base_y = if kind == 11 { 70.0 + out_idx as f32 * 22.0 } else { 70.0 };
+                    Pos2::new(node_rect.right(), node_rect.top() + base_y * scale)
                 };
-                let (pointer, primary_pressed, primary_down, primary_released) =
-                    ui.input(|input| {
-                        (
-                            input.pointer.interact_pos(),
-                            input.pointer.button_pressed(egui::PointerButton::Primary),
-                            input.pointer.button_down(egui::PointerButton::Primary),
-                            input.pointer.button_released(egui::PointerButton::Primary),
-                        )
-                    });
-                if primary_pressed
-                    && let Some(pointer) = pointer
-                    && canvas.contains(pointer)
-                {
+                let input_socket = |node_rect: Rect, kind: usize, input: usize| -> Pos2 {
+                    let y = match kind {
+                        9 => 85.0 + input as f32 * 30.0,
+                        11 => 70.0,
+                        13 => 75.0 + input as f32 * 22.0,
+                        _ => 70.0,
+                    };
+                    Pos2::new(node_rect.left(), node_rect.top() + y * scale)
+                };
+
+                let (pointer, primary_pressed, primary_down, primary_released) = ui.input(|input| (
+                    input.pointer.interact_pos(),
+                    input.pointer.button_pressed(egui::PointerButton::Primary),
+                    input.pointer.button_down(egui::PointerButton::Primary),
+                    input.pointer.button_released(egui::PointerButton::Primary),
+                ));
+
+                if primary_pressed && let Some(ptr) = pointer && canvas.contains(ptr) {
                     let socket_radius = 12.0 * scale.max(0.7);
                     let mut handled = false;
-                    for (index, node_rect) in node_rects.iter().enumerate() {
-                        if !self.compositor_node_active[index] {
-                            continue;
+                    // Check output sockets
+                    'outer: for &(node_id, node_rect) in &node_id_rects {
+                        let kind = self.compositor_nodes.iter().find(|n| n.id == node_id).map(|n| n.settings.kind()).unwrap_or(0);
+                        for out_idx in 0..compositor_output_count(kind) {
+                            if ptr.distance(output_socket(node_rect, kind, out_idx)) <= socket_radius {
+                                self.compositor_pending_output = if self.compositor_pending_output == Some((node_id, out_idx)) {
+                                    None
+                                } else {
+                                    Some((node_id, out_idx))
+                                };
+                                self.compositor_selected_node = node_id;
+                                handled = true;
+                                break 'outer;
+                            }
                         }
-                        if pointer.distance(output_socket(*node_rect)) <= socket_radius {
-                            self.compositor_pending_output =
-                                (self.compositor_pending_output != Some(index)).then_some(index);
-                            self.compositor_selected_node = index;
-                            handled = true;
-                            break;
-                        }
-                        for input in 0..compositor_input_count(index, combine_mode) {
-                            if pointer.distance(input_socket(*node_rect, index, input))
-                                <= socket_radius
-                            {
-                                if let Some(from) = self.compositor_pending_output.take() {
-                                    if from != index {
-                                        if let Some(link) =
-                                            self.compositor_links.iter().position(|candidate| {
-                                                *candidate == (from, index, input)
-                                            })
-                                        {
+                        // Check input sockets
+                        let cm = if kind == 9 {
+                            self.compositor_nodes.iter().find(|n| n.id == node_id)
+                                .and_then(|n| if let NodeSettings::TextureCombine { mode, .. } = n.settings { Some(mode) } else { None })
+                                .unwrap_or(0)
+                        } else { 0 };
+                        for input in 0..compositor_input_count(kind, cm) {
+                            if ptr.distance(input_socket(node_rect, kind, input)) <= socket_radius {
+                                if let Some((from_id, from_out)) = self.compositor_pending_output.take() {
+                                    if from_id != node_id {
+                                        // Toggle link: if exact link exists, remove it; otherwise replace
+                                        if let Some(link) = self.compositor_links.iter().position(|&(fid, fo, tid, ti)| fid == from_id && fo == from_out && tid == node_id && ti == input) {
                                             self.compositor_links.remove(link);
                                         } else {
-                                            self.compositor_links.retain(
-                                                |(_, to, target_input)| {
-                                                    *to != index || *target_input != input
-                                                },
-                                            );
-                                            self.compositor_links.push((from, index, input));
+                                            self.compositor_links.retain(|&(_, _, to, ti)| to != node_id || ti != input);
+                                            self.compositor_links.push((from_id, from_out, node_id, input));
                                         }
                                         self.project_dirty = true;
                                     }
                                 } else {
                                     let old_len = self.compositor_links.len();
-                                    self.compositor_links.retain(|(_, to, target_input)| {
-                                        *to != index || *target_input != input
-                                    });
+                                    self.compositor_links.retain(|&(_, _, to, ti)| to != node_id || ti != input);
                                     self.project_dirty |= old_len != self.compositor_links.len();
                                 }
-                                self.compositor_selected_node = index;
+                                self.compositor_selected_node = node_id;
+                                handled = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    // Check close buttons (non-Output nodes)
+                    if !handled {
+                        for &(node_id, node_rect) in &node_id_rects {
+                            let kind = self.compositor_nodes.iter().find(|n| n.id == node_id).map(|n| n.settings.kind()).unwrap_or(0);
+                            if kind == 8 { continue; }
+                            let close_pos = Pos2::new(node_rect.right() - 13.0 * scale, node_rect.top() + 15.0 * scale);
+                            if ptr.distance(close_pos) <= 10.0 * scale {
+                                let id_to_remove = node_id;
+                                self.compositor_nodes.retain(|n| n.id != id_to_remove);
+                                self.compositor_links.retain(|&(fid, _, tid, _)| fid != id_to_remove && tid != id_to_remove);
+                                self.compositor_pending_output = None;
+                                self.compositor_selected_node = self.compositor_nodes.iter().find(|n| matches!(n.settings, NodeSettings::Output { .. })).map(|n| n.id).unwrap_or(0);
+                                self.project_dirty = true;
                                 handled = true;
                                 break;
                             }
                         }
-                        if handled {
-                            break;
-                        }
                     }
+                    // Check header drag
                     if !handled {
-                        for (index, node_rect) in node_rects.iter().enumerate().rev() {
-                            if !self.compositor_node_active[index] {
-                                continue;
-                            }
-                            let header_rect = Rect::from_min_size(
-                                node_rect.min,
-                                Vec2::new(node_rect.width(), 30.0 * scale),
-                            );
-                            if header_rect.contains(pointer) {
-                                self.compositor_selected_node = index;
-                                self.compositor_dragging_node =
-                                    Some((index, pointer - node_rect.min));
+                        for &(node_id, node_rect) in node_id_rects.iter().rev() {
+                            let header_rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), 30.0 * scale));
+                            if header_rect.contains(ptr) {
+                                self.compositor_selected_node = node_id;
+                                self.compositor_dragging_node = Some((node_id, ptr - node_rect.min));
                                 self.compositor_pending_output = None;
                                 handled = true;
                                 break;
@@ -3335,68 +4592,72 @@ impl EditorApp {
                         self.compositor_pending_output = None;
                     }
                 }
-                if primary_down
-                    && let (Some(pointer), Some((index, grab_offset))) =
-                        (pointer, self.compositor_dragging_node)
-                {
-                    self.compositor_node_positions[index] =
-                        (pointer - grab_offset - origin) / scale;
-                    node_rects[index] = Rect::from_min_size(
-                        pointer - grab_offset,
-                        Vec2::new(node_width, node_heights[index]) * scale,
-                    );
+
+                if primary_down && let (Some(ptr), Some((drag_id, grab_offset))) = (pointer, self.compositor_dragging_node) {
+                    if let Some(node) = self.compositor_nodes.iter_mut().find(|n| n.id == drag_id) {
+                        node.position = (ptr - grab_offset - origin) / scale;
+                    }
                     ctx.request_repaint();
                 }
                 if primary_released && self.compositor_dragging_node.take().is_some() {
                     self.project_dirty = true;
                 }
 
-                for &(from, to, input) in &self.compositor_links {
-                    if !self.compositor_node_active[from] || !self.compositor_node_active[to] {
-                        continue;
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
+                    let sel = self.compositor_selected_node;
+                    if let Some(node) = self.compositor_nodes.iter().find(|n| n.id == sel) {
+                        if !matches!(node.settings, NodeSettings::Output { .. }) {
+                            self.compositor_nodes.retain(|n| n.id != sel);
+                            self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
+                            self.compositor_pending_output = None;
+                            self.compositor_selected_node = self.compositor_nodes.iter().find(|n| matches!(n.settings, NodeSettings::Output { .. })).map(|n| n.id).unwrap_or(0);
+                            self.project_dirty = true;
+                        }
                     }
-                    let start = output_socket(node_rects[from]);
-                    let end = input_socket(node_rects[to], to, input);
-                    painter.add(egui::Shape::line(
-                        compositor_link_curve(start, end),
-                        Stroke::new(3.0, Color32::from_rgb(218, 190, 92)),
-                    ));
-                }
-                if let (Some(from), Some(pointer)) = (self.compositor_pending_output, pointer) {
-                    painter.add(egui::Shape::line(
-                        compositor_link_curve(output_socket(node_rects[from]), pointer),
-                        Stroke::new(2.0, Color32::from_rgb(108, 190, 255)),
-                    ));
                 }
 
-                for (index, ((title, kind, header), node_rect)) in node_specs
-                    .iter()
-                    .zip(node_rects.iter().copied())
-                    .enumerate()
-                {
-                    if !self.compositor_node_active[index] {
-                        continue;
+                // Draw links
+                for &(from_id, from_out, to_id, to_input) in &self.compositor_links {
+                    if let (Some(&from_rect), Some(&to_rect)) = (rect_by_id.get(&from_id), rect_by_id.get(&to_id)) {
+                        let from_kind = self.compositor_nodes.iter().find(|n| n.id == from_id).map(|n| n.settings.kind()).unwrap_or(0);
+                        let to_kind = self.compositor_nodes.iter().find(|n| n.id == to_id).map(|n| n.settings.kind()).unwrap_or(0);
+                        let to_cm = if to_kind == 9 {
+                            self.compositor_nodes.iter().find(|n| n.id == to_id)
+                                .and_then(|n| if let NodeSettings::TextureCombine { mode, .. } = n.settings { Some(mode) } else { None })
+                                .unwrap_or(0)
+                        } else { 0 };
+                        let _ = to_cm;
+                        let start = output_socket(from_rect, from_kind, from_out);
+                        let end = input_socket(to_rect, to_kind, to_input);
+                        painter.add(egui::Shape::line(compositor_link_curve(start, end), Stroke::new(3.0, Color32::from_rgb(218, 190, 92))));
                     }
-                    let selected = self.compositor_selected_node == index;
-                    painter.rect_filled(
-                        node_rect,
-                        6.0,
-                        if selected {
-                            Color32::from_rgb(47, 50, 61)
-                        } else {
-                            Color32::from_rgb(36, 39, 48)
-                        },
-                    );
-                    let header_rect = Rect::from_min_size(
-                        node_rect.min,
-                        Vec2::new(node_rect.width(), 30.0 * scale),
-                    );
-                    painter.rect_filled(header_rect, 6.0, *header);
-                    let border = if selected {
-                        Color32::from_rgb(108, 190, 255)
-                    } else {
-                        Color32::from_rgb(67, 71, 83)
+                }
+                if let (Some((from_id, from_out)), Some(ptr)) = (self.compositor_pending_output, pointer) {
+                    if let Some(&from_rect) = rect_by_id.get(&from_id) {
+                        let from_kind = self.compositor_nodes.iter().find(|n| n.id == from_id).map(|n| n.settings.kind()).unwrap_or(0);
+                        painter.add(egui::Shape::line(
+                            compositor_link_curve(output_socket(from_rect, from_kind, from_out), ptr),
+                            Stroke::new(2.0, Color32::from_rgb(108, 190, 255)),
+                        ));
+                    }
+                }
+
+                // Draw nodes
+                for &(node_id, node_rect) in &node_id_rects {
+                    let node = match self.compositor_nodes.iter().find(|n| n.id == node_id) {
+                        Some(n) => n,
+                        None => continue,
                     };
+                    let kind = node.settings.kind();
+                    let (title, kind_label, header_color) = node_specs_by_kind[kind];
+                    let is_output = kind == 8;
+                    let selected = self.compositor_selected_node == node_id;
+                    let cm = if let NodeSettings::TextureCombine { mode, .. } = node.settings { mode } else { 0 };
+
+                    painter.rect_filled(node_rect, 6.0, if selected { Color32::from_rgb(47, 50, 61) } else { Color32::from_rgb(36, 39, 48) });
+                    let header_rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), 30.0 * scale));
+                    painter.rect_filled(header_rect, 6.0, header_color);
+                    let border = if selected { Color32::from_rgb(108, 190, 255) } else { Color32::from_rgb(67, 71, 83) };
                     for (a, b) in [
                         (node_rect.left_top(), node_rect.right_top()),
                         (node_rect.right_top(), node_rect.right_bottom()),
@@ -3405,89 +4666,60 @@ impl EditorApp {
                     ] {
                         painter.line_segment([a, b], Stroke::new(2.0, border));
                     }
-                    painter.text(
-                        header_rect.left_center() + Vec2::new(9.0 * scale, 0.0),
-                        Align2::LEFT_CENTER,
-                        *title,
-                        FontId::proportional(13.0 * scale),
-                        Color32::WHITE,
-                    );
-                    painter.text(
-                        node_rect.left_top() + Vec2::new(10.0, 45.0) * scale,
-                        Align2::LEFT_TOP,
-                        *kind,
-                        FontId::proportional(11.0 * scale),
-                        Color32::from_gray(166),
-                    );
-                    for input in 0..compositor_input_count(index, combine_mode) {
-                        let position = input_socket(node_rect, index, input);
-                        painter.circle_filled(
-                            position,
-                            6.0 * scale,
-                            Color32::from_rgb(218, 190, 92),
-                        );
-                        if index == 9 {
-                            painter.text(
-                                position + Vec2::new(10.0 * scale, 0.0),
-                                Align2::LEFT_CENTER,
-                                ["A", "B", "Alpha"][input],
-                                FontId::proportional(10.0 * scale),
-                                Color32::from_gray(180),
-                            );
-                        } else if index == 13 {
-                            painter.text(
-                                position + Vec2::new(10.0 * scale, 0.0),
-                                Align2::LEFT_CENTER,
-                                ["R", "G", "B", "A"][input],
-                                FontId::proportional(10.0 * scale),
-                                Color32::from_gray(180),
-                            );
+                    painter.text(header_rect.left_center() + Vec2::new(9.0 * scale, 0.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0 * scale), Color32::WHITE);
+                    if !is_output {
+                        painter.text(Pos2::new(node_rect.right() - 13.0 * scale, node_rect.top() + 15.0 * scale), Align2::CENTER_CENTER, "×", FontId::proportional(16.0 * scale), Color32::from_rgba_unmultiplied(255, 255, 255, 160));
+                    }
+                    painter.text(node_rect.left_top() + Vec2::new(10.0, 45.0) * scale, Align2::LEFT_TOP, kind_label, FontId::proportional(11.0 * scale), Color32::from_gray(166));
+
+                    // Draw input sockets
+                    for input in 0..compositor_input_count(kind, cm) {
+                        let pos = input_socket(node_rect, kind, input);
+                        painter.circle_filled(pos, 6.0 * scale, Color32::from_rgb(218, 190, 92));
+                        if kind == 9 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["A", "B", "Alpha"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 13 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["R", "G", "B", "A"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
                         }
                     }
-                    painter.circle_filled(
-                        output_socket(node_rect),
-                        6.0 * scale,
-                        Color32::from_rgb(218, 190, 92),
-                    );
-                    let layer_id = compositor_control_layer(ui.layer_id(), index);
+
+                    // Draw output sockets
+                    if kind == 11 {
+                        for (out_idx, label) in ["R", "G", "B", "A"].iter().enumerate() {
+                            let pos = output_socket(node_rect, kind, out_idx);
+                            painter.circle_filled(pos, 6.0 * scale, Color32::from_rgb(218, 190, 92));
+                            painter.text(pos - Vec2::new(10.0 * scale, 0.0), Align2::RIGHT_CENTER, *label, FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        }
+                    } else {
+                        painter.circle_filled(output_socket(node_rect, kind, 0), 6.0 * scale, Color32::from_rgb(218, 190, 92));
+                    }
+
+                    // Draw node controls UI
+                    let layer_id = compositor_control_layer(ui.layer_id(), node_id);
                     ui.ctx().set_sublayer(ui.layer_id(), layer_id);
                     let controls_origin = node_rect.min + Vec2::new(10.0, 62.0) * scale;
-                    let transform =
-                        egui::emath::TSTransform::from_translation(controls_origin.to_vec2())
-                            * egui::emath::TSTransform::from_scaling(scale);
+                    let transform = egui::emath::TSTransform::from_translation(controls_origin.to_vec2()) * egui::emath::TSTransform::from_scaling(scale);
                     ui.ctx().set_transform_layer(layer_id, transform);
-                    let local_rect = Rect::from_min_size(
-                        Pos2::ZERO,
-                        Vec2::new(node_width - 20.0, node_heights[index] - 70.0),
-                    );
-                    let mut controls_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .layer_id(layer_id)
-                            .max_rect(local_rect)
-                            .layout(Layout::top_down(Align::Min)),
-                    );
+                    let local_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(node_width - 20.0, node_heights_by_kind[kind] - 70.0));
+                    let mut controls_ui = ui.new_child(egui::UiBuilder::new().layer_id(layer_id).max_rect(local_rect).layout(Layout::top_down(Align::Min)));
                     controls_ui.set_clip_rect(local_rect);
                     controls_ui.style_mut().spacing.item_spacing.y = 3.0;
-                    self.compositor_node_controls_ui(index, &mut controls_ui);
+                    self.compositor_node_controls_ui(node_id, &mut controls_ui);
                 }
 
+                // Palette sidebar
                 let palette = Rect::from_min_max(rect.min, Pos2::new(canvas.left(), rect.bottom()));
                 painter.rect_filled(palette, 0.0, Color32::from_rgb(25, 27, 34));
-                painter.text(
-                    palette.left_top() + Vec2::new(12.0, 14.0),
-                    Align2::LEFT_TOP,
-                    "NODES",
-                    FontId::proportional(12.0),
-                    Color32::from_rgb(108, 190, 255),
-                );
+                painter.text(palette.left_top() + Vec2::new(12.0, 14.0), Align2::LEFT_TOP, "NODES", FontId::proportional(12.0), Color32::from_rgb(108, 190, 255));
                 for (index, label) in [
                     "Input / Object Texture",
                     "Input / Image Asset",
                     "Input / Constant Value",
-                    "Color / Bézier Curves",
+                    "Input / Object Handle",
+                    "Color / Remap",
                     "Color / Color Space Convert",
-                    "Color / Channel Extract",
-                    "Color / Channel Join",
+                    "Color / Color Decoder",
+                    "Color / Color Encoder",
                     "Color / Grayscale",
                     "Converter / Texture Math",
                     "Converter / Texture Combine",
@@ -3495,39 +4727,28 @@ impl EditorApp {
                     "Converter / Smooth Threshold",
                     "Filter / Image Filter",
                     "Output / Texture Writer",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    painter.text(
-                        palette.left_top() + Vec2::new(12.0, 46.0 + index as f32 * 27.0),
-                        Align2::LEFT_TOP,
-                        *label,
-                        FontId::proportional(12.0),
-                        Color32::from_gray(190),
-                    );
+                ].iter().enumerate() {
+                    painter.text(palette.left_top() + Vec2::new(12.0, 46.0 + index as f32 * 27.0), Align2::LEFT_TOP, *label, FontId::proportional(12.0), Color32::from_gray(190));
                 }
 
-                let properties =
-                    Rect::from_min_max(Pos2::new(canvas.right(), rect.top()), rect.max);
+                // Properties sidebar
+                let properties = Rect::from_min_max(Pos2::new(canvas.right(), rect.top()), rect.max);
                 painter.rect_filled(properties, 0.0, Color32::from_rgb(25, 27, 34));
-                let mut info_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(properties.shrink(12.0))
-                        .layout(Layout::top_down(Align::Min)),
-                );
+                let mut info_ui = ui.new_child(egui::UiBuilder::new().max_rect(properties.shrink(12.0)).layout(Layout::top_down(Align::Min)));
                 info_ui.heading("Selection");
-                info_ui.label(node_specs[self.compositor_selected_node].0);
-                info_ui.small(format!(
-                    "Position: {:.0}, {:.0}",
-                    self.compositor_node_positions[self.compositor_selected_node].x,
-                    self.compositor_node_positions[self.compositor_selected_node].y
-                ));
+                let sel_id = self.compositor_selected_node;
+                if let Some(node) = self.compositor_nodes.iter().find(|n| n.id == sel_id) {
+                    let kind = node.settings.kind();
+                    info_ui.label(node_specs_by_kind[kind].0);
+                    info_ui.small(format!("Position: {:.0}, {:.0}", node.position.x, node.position.y));
+                }
                 info_ui.separator();
-                info_ui.small(
-                    "Edit settings directly inside the node. Drag its colored header to move it; click sockets to connect or disconnect.",
-                );
+                info_ui.small("Edit settings directly inside the node. Drag its colored header to move it; click sockets to connect or disconnect.");
             });
+        if self.compositor_links != previous_links {
+            self.compositor_eval_cache.clear();
+            self.compositor_gpu_cache.clear();
+        }
     }
 
     fn viewport(&mut self, ctx: &egui::Context) {
@@ -3625,6 +4846,7 @@ impl EditorApp {
                         viewport_extent: response.rect.width().min(response.rect.height()),
                     });
                 }
+                self.schedule_compositor_lod_update(ctx);
                 self.refresh_preview_cache();
                 let preview = Arc::clone(&self.cached_preview);
                 let viewport_texture = {
@@ -3640,25 +4862,84 @@ impl EditorApp {
                         grid_spacing: self.grid_spacing,
                         projection: self.projection_mode,
                         scene_revision: self.scene_revision,
+                        texture_revision: self.texture_revision,
                         show_grid: self.show_grid,
                         mode: self.viewport_mode,
                         tool: self.active_tool,
+                        device: self.render_device,
                     };
                     let mut newest_completed = None;
                     while let Ok(result) = self.display_worker.results.try_recv() {
                         newest_completed = Some(result);
                     }
                     if let Some(result) = newest_completed {
-                        self.viewport_depth = result.frame.linear_depth;
-                        if let Some(texture) = &mut self.viewport_color {
-                            texture.set(result.frame.color, TextureOptions::NEAREST);
-                        } else {
-                            self.viewport_color = Some(ctx.load_texture(
-                                "viewport-depth-color",
-                                result.frame.color,
-                                TextureOptions::NEAREST,
-                            ));
+                        self.performance
+                            .viewport_queue_wait
+                            .record(result.queue_wait);
+                        if let Some((revision, started)) = self.compositor_present_revision {
+                            if result.key.texture_revision >= revision {
+                                self.performance
+                                    .control_to_present
+                                    .record(started.elapsed());
+                                self.compositor_present_revision = None;
+                                self.compositor_control_started = None;
+                            }
                         }
+                        match result.device {
+                            RenderDevice::Vulkan => {
+                                self.performance.viewport_vulkan.record(result.render_time);
+                                self.performance
+                                    .viewport_prepare
+                                    .record(result.prepare_time);
+                            }
+                            RenderDevice::Cpu => {
+                                self.performance.viewport_cpu.record(result.render_time)
+                            }
+                        }
+                        let presentation_started = Instant::now();
+                        self.viewport_depth = result.frame.linear_depth;
+                        match result.frame.color {
+                            FrameColor::Cpu(color) => {
+                                if let Some(texture) = &mut self.viewport_color {
+                                    texture.set(color, TextureOptions::NEAREST);
+                                } else {
+                                    self.viewport_color = Some(ctx.load_texture(
+                                        "viewport-depth-color",
+                                        color,
+                                        TextureOptions::NEAREST,
+                                    ));
+                                }
+                                self.viewport_native_texture = None;
+                                self.viewport_native_view = None;
+                            }
+                            FrameColor::Vulkan(image) => {
+                                if let Some(render_state) = &self.wgpu_render_state {
+                                    let view_key = Arc::as_ptr(&image.view) as usize;
+                                    if self.viewport_native_view != Some(view_key) {
+                                        let mut renderer = render_state.renderer.write();
+                                        if let Some(id) = self.viewport_native_texture {
+                                            renderer.update_egui_texture_from_wgpu_texture(
+                                                &render_state.device,
+                                                &image.view,
+                                                wgpu::FilterMode::Nearest,
+                                                id,
+                                            );
+                                        } else {
+                                            self.viewport_native_texture =
+                                                Some(renderer.register_native_texture(
+                                                    &render_state.device,
+                                                    &image.view,
+                                                    wgpu::FilterMode::Nearest,
+                                                ));
+                                        }
+                                        self.viewport_native_view = Some(view_key);
+                                    }
+                                }
+                            }
+                        }
+                        self.performance
+                            .viewport_present
+                            .record(presentation_started.elapsed());
                         self.viewport_depth_key = Some(result.key);
                         self.presented_view = Some(PresentedView {
                             camera: result.camera,
@@ -3687,10 +4968,13 @@ impl EditorApp {
                             mode: self.viewport_mode,
                             tool: self.active_tool,
                             reusable_depth: std::mem::take(&mut self.viewport_depth),
+                            device: self.render_device,
+                            queued_at: Instant::now(),
                         });
                         self.viewport_requested_key = Some(key);
                     }
-                    self.viewport_color.as_ref().map(TextureHandle::id)
+                    self.viewport_native_texture
+                        .or_else(|| self.viewport_color.as_ref().map(TextureHandle::id))
                 };
                 if let Some(presented) = &self.presented_view {
                     draw_viewport(
@@ -3741,6 +5025,16 @@ impl EditorApp {
                                 "{object_count} objects  •  {triangle_count} preview tris"
                             ));
                             ui.separator();
+                            let timing = match self.render_device {
+                                RenderDevice::Vulkan => self.performance.viewport_vulkan,
+                                RenderDevice::Cpu => self.performance.viewport_cpu,
+                            };
+                            ui.small(format!(
+                                "{} viewport {:.2} ms",
+                                self.render_device.label(),
+                                timing.latest_ms
+                            ));
+                            ui.separator();
                             ui.small(if self.viewport_focused {
                                 "Viewport focused  •  RMB orbit  •  Wheel zoom"
                             } else {
@@ -3762,6 +5056,8 @@ impl eframe::App for EditorApp {
         self.poll_save_as();
         self.poll_load_project();
         self.poll_compositor_image_import();
+        self.poll_vulkan_compositor(ctx);
+        self.poll_compositor_apply(ctx);
         self.poll_build(ctx);
         self.shortcuts(ctx);
         self.top_bar(ctx);
@@ -3775,6 +5071,7 @@ impl eframe::App for EditorApp {
             WorkspaceTab::Compositing => self.compositing_workspace(ctx),
         }
         self.status_bar(ctx);
+        self.project_error_popup(ctx);
     }
 }
 
@@ -3921,14 +5218,22 @@ fn parse_compositor_position(value: &str) -> Option<Vec2> {
     Some(Vec2::new(x.parse().ok()?, y.parse().ok()?))
 }
 
-fn compositor_input_count(node: usize, combine_mode: usize) -> usize {
-    if node == 9 {
-        if combine_mode == 1 { 3 } else { 2 }
-    } else if node == 13 {
-        4
-    } else {
-        1
+fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
+    match kind {
+        9 => {
+            if combine_mode == 1 {
+                3
+            } else {
+                2
+            }
+        }
+        13 => 4,
+        _ => 1,
     }
+}
+
+fn compositor_output_count(kind: usize) -> usize {
+    if kind == 11 { 4 } else { 1 }
 }
 
 fn compositor_control_layer(parent: egui::LayerId, node: usize) -> egui::LayerId {
@@ -3945,6 +5250,55 @@ fn compositor_add_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> bool 
 
 fn compositor_centered_position(canvas: Rect, origin: Pos2, scale: f32, node_size: Vec2) -> Vec2 {
     (canvas.center() - origin) / scale - node_size * 0.5
+}
+
+fn select_compositor_lod(projected_extent: f32, current: u32) -> u32 {
+    let demand = (projected_extent.max(1.0) * 1.5).ceil() as u32;
+    let desired = demand.next_power_of_two().clamp(128, 4096);
+    if current == u32::MAX {
+        return desired;
+    }
+    if desired > current && demand as f32 <= current as f32 * 1.15 {
+        current
+    } else if desired < current && demand as f32 >= current as f32 * 0.45 {
+        current
+    } else {
+        desired
+    }
+}
+
+fn select_compositor_lod_for_backend(
+    projected_extent: f32,
+    current: u32,
+    backend: RenderDevice,
+) -> u32 {
+    match backend {
+        RenderDevice::Vulkan => u32::MAX,
+        RenderDevice::Cpu => select_compositor_lod(projected_extent, current),
+    }
+}
+
+fn resize_texture_for_lod(texture: &Arc<TextureAsset>, maximum: u32) -> Arc<TextureAsset> {
+    let largest = texture.width.max(texture.height);
+    if maximum == u32::MAX || largest <= maximum || texture.width == 0 || texture.height == 0 {
+        return Arc::clone(texture);
+    }
+    let scale = maximum as f32 / largest as f32;
+    let width = ((texture.width as f32 * scale).round() as u32).max(1);
+    let height = ((texture.height as f32 * scale).round() as u32).max(1);
+    let Some(image) =
+        image::RgbaImage::from_raw(texture.width, texture.height, texture.pixels.clone())
+    else {
+        return Arc::clone(texture);
+    };
+    let resized =
+        image::imageops::resize(&image, width, height, image::imageops::FilterType::Triangle);
+    Arc::new(TextureAsset {
+        name: format!("{}-lod-{maximum}", texture.name),
+        width,
+        height,
+        pixels: resized.into_raw(),
+    })
 }
 
 fn combine_compositor_textures(
@@ -4008,7 +5362,7 @@ fn apply_compositor_math(
     operation: usize,
     fallback: f32,
 ) -> TextureAsset {
-    for pixel in texture.pixels.chunks_exact_mut(4) {
+    for_each_rgba_parallel(&mut texture.pixels, |pixel| {
         for channel in &mut pixel[..3] {
             let value = *channel as f32 / 255.0;
             let result = match operation {
@@ -4029,7 +5383,7 @@ fn apply_compositor_math(
             };
             *channel = (result.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
-    }
+    });
     texture.name = "compositor-math".into();
     texture
 }
@@ -4040,7 +5394,7 @@ fn convert_compositor_color_space(
     to: usize,
 ) -> TextureAsset {
     if from != to {
-        for pixel in texture.pixels.chunks_exact_mut(4) {
+        for_each_rgba_parallel(&mut texture.pixels, |pixel| {
             for channel in &mut pixel[..3] {
                 let value = *channel as f32 / 255.0;
                 let converted = if from == 0 {
@@ -4056,26 +5410,26 @@ fn convert_compositor_color_space(
                 };
                 *channel = (converted.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
-        }
+        });
     }
     texture.name = "compositor-color-space".into();
     texture
 }
 
 fn extract_compositor_channel(mut texture: TextureAsset, channel: usize) -> TextureAsset {
-    for pixel in texture.pixels.chunks_exact_mut(4) {
+    for_each_rgba_parallel(&mut texture.pixels, |pixel| {
         let value = pixel[channel.min(3)];
         pixel[0] = value;
         pixel[1] = value;
         pixel[2] = value;
         pixel[3] = 255;
-    }
+    });
     texture.name = "compositor-channel".into();
     texture
 }
 
 fn grayscale_compositor_texture(mut texture: TextureAsset, mode: usize) -> TextureAsset {
-    for pixel in texture.pixels.chunks_exact_mut(4) {
+    for_each_rgba_parallel(&mut texture.pixels, |pixel| {
         let [red, green, blue] = [pixel[0] as f32, pixel[1] as f32, pixel[2] as f32];
         let gray = match mode {
             1 => (red + green + blue) / 3.0,
@@ -4090,9 +5444,35 @@ fn grayscale_compositor_texture(mut texture: TextureAsset, mode: usize) -> Textu
         pixel[0] = gray;
         pixel[1] = gray;
         pixel[2] = gray;
-    }
+    });
     texture.name = "compositor-grayscale".into();
     texture
+}
+
+fn for_each_rgba_parallel(pixels: &mut [u8], operation: impl Fn(&mut [u8]) + Sync) {
+    let pixel_count = pixels.len() / 4;
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8);
+    if pixel_count < 65_536 || workers == 1 {
+        for pixel in pixels.chunks_exact_mut(4) {
+            operation(pixel);
+        }
+        return;
+    }
+    let chunk_pixels = pixel_count.div_ceil(workers);
+    let chunk_bytes = chunk_pixels * 4;
+    std::thread::scope(|scope| {
+        for chunk in pixels.chunks_mut(chunk_bytes) {
+            let operation = &operation;
+            scope.spawn(move || {
+                for pixel in chunk.chunks_exact_mut(4) {
+                    operation(pixel);
+                }
+            });
+        }
+    });
 }
 
 fn join_compositor_channels(rgb: [&TextureAsset; 3], alpha: Option<&TextureAsset>) -> TextureAsset {
@@ -4128,12 +5508,39 @@ fn join_compositor_channels(rgb: [&TextureAsset; 3], alpha: Option<&TextureAsset
     }
 }
 
-fn parse_compositor_link(value: &str) -> Option<(usize, usize, usize)> {
+fn parse_compositor_link(value: &str) -> Option<(usize, usize, usize, usize)> {
     let mut fields = value.split(',');
-    let from = fields.next()?.parse().ok()?;
-    let to = fields.next()?.parse().ok()?;
-    let input = fields.next().map(str::parse).transpose().ok()?.unwrap_or(0);
-    fields.next().is_none().then_some((from, to, input))
+    let first: usize = fields.next()?.parse().ok()?;
+    let second: usize = fields.next()?.parse().ok()?;
+    let third_str = fields.next();
+    let fourth_str = fields.next();
+    if fields.next().is_some() {
+        return None;
+    }
+    match (third_str, fourth_str) {
+        (Some(third), Some(fourth)) => {
+            // 4-number format: from_id, from_output, to_id, to_input
+            let from_output: usize = third.parse().ok()?;
+            let to_id: usize = second; // wait, reorder: first=from_id, second=from_output, third=to_id, fourth=to_input
+            let _ = to_id;
+            let from_id = first;
+            let from_out: usize = second;
+            let to: usize = third.parse().ok()?;
+            let input: usize = fourth.parse().ok()?;
+            let _ = from_output;
+            Some((from_id, from_out, to, input))
+        }
+        (Some(third), None) => {
+            // 3-number format (old): from, to, input — from_output=0
+            let to: usize = second;
+            let input: usize = third.parse().ok()?;
+            Some((first, 0, to, input))
+        }
+        (None, _) => {
+            // 2-number format (very old): from, to — input=0, from_output=0
+            Some((first, 0, second, 0))
+        }
+    }
 }
 
 fn parse_compositor_color(value: &str) -> Option<[f32; 3]> {
@@ -4193,7 +5600,7 @@ fn rewrite_compositor_image_paths<T: AsRef<std::path::Path>>(
     mapping: &BTreeMap<String, T>,
 ) {
     for (key, path) in &mut project.project.properties {
-        if key.starts_with("compositor.image.")
+        if (key.starts_with("compositor.image.") || key.ends_with(".image_archive"))
             && let Some(replacement) = mapping.get(path)
         {
             *path = replacement.as_ref().to_string_lossy().into_owned();
@@ -4313,7 +5720,7 @@ fn console_panel(ui: &mut egui::Ui, logs: &[LogEntry]) {
         });
 }
 
-fn telemetry_panel(ui: &mut egui::Ui, state: PlayState) {
+fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerformanceTelemetry) {
     let live = matches!(state, PlayState::Running | PlayState::Paused);
     ui.horizontal(|ui| {
         ui.label(
@@ -4326,16 +5733,60 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState) {
                 .strong(),
         );
         ui.separator();
-        ui.label("Frame  16.67 ms");
-        ui.label("Tick  8.33 ms");
-        ui.label("Objects  5");
-        ui.label("Draws  2");
+        ui.label(format!(
+            "Viewport worker  {:.3} ms",
+            performance.viewport_vulkan.latest_ms
+        ));
+        ui.label(format!(
+            "Graph submit  {:.3} ms",
+            performance.compositor_vulkan_submit.latest_ms
+        ));
         ui.label("Socket  loopback");
     });
     ui.add_space(8.0);
+    egui::Grid::new("editor_execution_telemetry")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Stage");
+            ui.strong("Latest");
+            ui.strong("EMA");
+            ui.strong("Maximum");
+            ui.strong("Samples");
+            ui.end_row();
+            for (name, metric) in [
+                ("Vulkan viewport worker", performance.viewport_vulkan),
+                ("GPU batch preparation", performance.viewport_prepare),
+                (
+                    "egui native texture presentation",
+                    performance.viewport_present,
+                ),
+                ("Viewport queue wait", performance.viewport_queue_wait),
+                ("Control → graph apply", performance.control_to_graph_apply),
+                (
+                    "Control → composite ready",
+                    performance.control_to_composite_ready,
+                ),
+                ("Control → presented frame", performance.control_to_present),
+                ("Graph compilation", performance.graph_compile),
+                ("Graph evaluation", performance.graph_evaluation),
+                ("CPU viewport", performance.viewport_cpu),
+                (
+                    "Vulkan graph encode + submission",
+                    performance.compositor_vulkan_submit,
+                ),
+            ] {
+                ui.label(name);
+                ui.monospace(format!("{:.3} ms", metric.latest_ms));
+                ui.monospace(format!("{:.3} ms", metric.average_ms));
+                ui.monospace(format!("{:.3} ms", metric.maximum_ms));
+                ui.monospace(metric.samples.to_string());
+                ui.end_row();
+            }
+        });
+    ui.add_space(8.0);
     ui.small(
-        "The compiled game process owns simulation. This panel receives bounded debug telemetry \
-         while the editor remains active.",
+        "Vulkan viewport timing covers batch preparation plus command encoding/submission. The \
+         resident color target is sampled directly by egui; depth is not read back during normal rendering.",
     );
 }
 
@@ -4384,7 +5835,7 @@ fn rasterize_depth_frame(
         projection_mode,
         grid_spacing,
     );
-    let light = CoreVec3::new(-0.35, 0.8, 0.45).normalized();
+    let light = global_light_direction();
     let camera_position = perspective_camera_position(
         yaw,
         pitch,
@@ -4404,7 +5855,7 @@ fn rasterize_depth_frame(
         let normal = (world[1] - world[0])
             .cross(world[2] - world[0])
             .normalized();
-        let diffuse = normal.dot(light).abs();
+        let diffuse = normal.dot(light).max(0.0);
         let band = shader_light_factor(diffuse, triangle.shader);
         clip_preview_polygon_to_near_into(
             triangle,
@@ -4536,7 +5987,7 @@ fn rasterize_depth_frame(
         }
     });
     DepthFrame {
-        color,
+        color: FrameColor::Cpu(color),
         linear_depth,
     }
 }
@@ -4679,7 +6130,7 @@ fn rasterize_triangle_band(
                         face_normal
                     };
                     let pixel_light = if smooth_normals {
-                        shader_light_factor(shading_normal.dot(light_direction).abs(), shader)
+                        shader_light_factor(shading_normal.dot(light_direction).max(0.0), shader)
                     } else {
                         light
                     };
@@ -4816,7 +6267,7 @@ fn raycast_depth_frame(
     let mut linear_depth = vec![f32::INFINITY; width * height];
     if triangles.is_empty() {
         return DepthFrame {
-            color,
+            color: FrameColor::Cpu(color),
             linear_depth,
         };
     }
@@ -4828,14 +6279,14 @@ fn raycast_depth_frame(
         projection_mode,
         grid_spacing,
     );
-    let light = CoreVec3::new(-0.35, 0.8, 0.45).normalized();
+    let light = global_light_direction();
     let mut raster_triangles = Vec::with_capacity(triangles.len());
     for triangle in triangles {
         let points = triangle.map(|point| CoreVec3::new(point[0], point[1], point[2]));
         let normal = (points[1] - points[0])
             .cross(points[2] - points[0])
             .normalized();
-        let diffuse = normal.dot(light).abs();
+        let diffuse = normal.dot(light).max(0.0);
         let band = ((0.25 + diffuse * 0.75) * 3.0).round() / 3.0;
         raster_triangles.push(RaycastTriangle {
             points,
@@ -5015,7 +6466,7 @@ fn raycast_depth_frame(
         }
     }
     DepthFrame {
-        color,
+        color: FrameColor::Cpu(color),
         linear_depth,
     }
 }
@@ -5353,6 +6804,12 @@ fn transform_normal(normal: CoreVec3, scale: CoreVec3, rotation: Quat) -> CoreVe
         .normalized()
 }
 
+/// Editor directional light in world coordinates. Translation and camera
+/// orientation must never participate in this value.
+fn global_light_direction() -> CoreVec3 {
+    CoreVec3::new(-0.35, 0.8, 0.45).normalized()
+}
+
 fn grid_distance_alpha(zoom: f32, grid_spacing: f32) -> f32 {
     (zoom.max(0.0) * grid_spacing.max(f32::EPSILON))
         .powf(1.5)
@@ -5629,6 +7086,19 @@ fn infer_grid_spacing(asset: &MeshAsset) -> Option<f32> {
     })
 }
 
+fn mesh_bounds(asset: &MeshAsset) -> ([f32; 3], [f32; 3]) {
+    asset.vertices.iter().fold(
+        ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+        |(mut minimum, mut maximum), vertex| {
+            for axis in 0..3 {
+                minimum[axis] = minimum[axis].min(vertex.position[axis]);
+                maximum[axis] = maximum[axis].max(vertex.position[axis]);
+            }
+            (minimum, maximum)
+        },
+    )
+}
+
 fn pan_camera_target(
     target: CoreVec3,
     pointer_delta: Vec2,
@@ -5847,6 +7317,8 @@ fn clip_polygon_to_near_into(
 
 fn interpolate_preview_vertex(a: PreviewVertex, b: PreviewVertex, amount: f32) -> PreviewVertex {
     PreviewVertex {
+        local_position: interpolate_point(a.local_position, b.local_position, amount),
+        local_normal: interpolate_point(a.local_normal, b.local_normal, amount),
         position: interpolate_point(a.position, b.position, amount),
         normal: interpolate_point(a.normal, b.normal, amount),
         uv: [
@@ -6349,14 +7821,24 @@ mod tests {
     #[test]
     fn rasterized_frame_produces_color_and_reusable_depth() {
         let triangle = |positions: [[f32; 3]; 3]| PreviewTriangle {
+            object_id: NodeId {
+                slot: 0,
+                generation: 0,
+            },
+            object_transform: Transform::IDENTITY,
             vertices: positions.map(|position| PreviewVertex {
+                local_position: position,
+                local_normal: [0.0, 0.0, 1.0],
                 position,
                 normal: [0.0, 0.0, 1.0],
                 uv: [0.0; 2],
                 color: [1.0; 4],
             }),
             base_color: [0.42, 0.64, 0.78, 1.0],
+            source_base_color: [0.42, 0.64, 0.78, 1.0],
             texture: None,
+            gpu_texture: None,
+            source_texture: None,
             shader: ShaderMode::Toon,
             smooth_normals: false,
             transmission: 0.0,
@@ -6391,11 +7873,16 @@ mod tests {
         );
         assert_eq!(frame.linear_depth.len(), 64 * 64);
         assert_eq!(frame.linear_depth, reversed.linear_depth);
-        assert_eq!(frame.color, reversed.color);
+        let (FrameColor::Cpu(frame_color), FrameColor::Cpu(reversed_color)) =
+            (&frame.color, &reversed.color)
+        else {
+            panic!("CPU rasterizer returned a non-CPU frame");
+        };
+        assert_eq!(frame_color, reversed_color);
         let center = 57 * 64 + 32;
         assert!(frame.linear_depth[center].is_finite());
         assert!((frame.linear_depth[center] - PERSPECTIVE_CAMERA_DISTANCE).abs() < 0.1);
-        assert_ne!(frame.color.pixels[center], Color32::TRANSPARENT);
+        assert_ne!(frame_color.pixels[center], Color32::TRANSPARENT);
     }
 
     #[test]
@@ -6507,6 +7994,25 @@ mod tests {
     }
 
     #[test]
+    fn directional_light_is_global_and_object_rotation_changes_world_normal() {
+        let light = global_light_direction();
+        let local_normal = light;
+        let identity_world =
+            transform_normal(local_normal, CoreVec3::new(1.0, 1.0, 1.0), Quat::IDENTITY);
+        let turned_world = transform_normal(
+            local_normal,
+            CoreVec3::new(1.0, 1.0, 1.0),
+            Quat::from_axis_angle(CoreVec3::Z, std::f32::consts::PI),
+        );
+
+        assert!(identity_world.dot(light) > 0.99);
+        assert!(
+            turned_world.dot(light) < identity_world.dot(light) - 0.5,
+            "the normal must rotate into world space while the light stays fixed"
+        );
+    }
+
+    #[test]
     fn grid_alpha_decreases_with_camera_distance() {
         let near = grid_distance_alpha(1.0, 1.0);
         let medium = grid_distance_alpha(0.25, 1.0);
@@ -6540,8 +8046,12 @@ mod tests {
             parse_compositor_position("-12.5,300"),
             Some(Vec2::new(-12.5, 300.0))
         );
-        assert_eq!(parse_compositor_link("3,7"), Some((3, 7, 0)));
-        assert_eq!(parse_compositor_link("3,9,2"), Some((3, 9, 2)));
+        // parse_compositor_link: 2-number (old) -> (from, 0, to, 0)
+        assert_eq!(parse_compositor_link("3,7"), Some((3, 0, 7, 0)));
+        // 3-number (old) -> (from, 0, to, input)
+        assert_eq!(parse_compositor_link("3,9,2"), Some((3, 0, 9, 2)));
+        // 4-number (new) -> (from_id, from_out, to_id, to_input)
+        assert_eq!(parse_compositor_link("3,1,9,2"), Some((3, 1, 9, 2)));
         assert_eq!(parse_compositor_position("invalid"), None);
         assert_eq!(parse_compositor_link("3,invalid"), None);
         assert_eq!(parse_compositor_color("0.1,0.5,1"), Some([0.1, 0.5, 1.0]));
@@ -6555,6 +8065,8 @@ mod tests {
         assert_eq!(compositor_input_count(9, 0), 2);
         assert_eq!(compositor_input_count(9, 1), 3);
         assert_eq!(compositor_input_count(13, 0), 4);
+        assert_eq!(compositor_output_count(11), 4);
+        assert_eq!(compositor_output_count(0), 1);
         let parent = egui::LayerId::new(egui::Order::Background, Id::new("fixture"));
         assert_eq!(compositor_control_layer(parent, 3).order, parent.order);
         let canvas = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(900.0, 650.0));
@@ -6584,6 +8096,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan device"]
+    fn vulkan_worker_mixes_and_returns_asynchronously() {
+        let mut worker = vulkan_compositor::VulkanCompositorWorker::new()
+            .expect("Vulkan worker should initialize");
+        let texture = |name: &str, pixels| {
+            Arc::new(TextureAsset {
+                name: name.into(),
+                width: 1,
+                height: 1,
+                pixels,
+            })
+        };
+        let generation = worker.submit_latest(
+            9,
+            u32::MAX,
+            texture("red", vec![255, 0, 0, 255]),
+            texture("blue", vec![0, 0, 255, 255]),
+            1,
+            0,
+            0.5,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(result) = worker.try_result() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "Vulkan worker timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(result.generation, generation);
+        let output = result.texture.expect("Vulkan mix should succeed");
+        assert_eq!((output.width, output.height), (1, 1));
+    }
+
+    #[test]
     fn compositor_math_multiply_zero_blacks_rgb_and_preserves_alpha() {
         let texture = TextureAsset {
             name: "earth".into(),
@@ -6593,6 +8140,41 @@ mod tests {
         };
         let result = apply_compositor_math(texture, 2, 0.0);
         assert_eq!(result.pixels, vec![0, 0, 0, 173]);
+    }
+
+    #[test]
+    fn compositor_lod_is_quantized_and_hysteretic() {
+        assert_eq!(select_compositor_lod(100.0, u32::MAX), 256);
+        assert_eq!(select_compositor_lod(350.0, u32::MAX), 1024);
+        assert_eq!(select_compositor_lod(350.0, 1024), 1024);
+        assert_eq!(select_compositor_lod(100.0, 1024), 256);
+        assert_eq!(
+            select_compositor_lod_for_backend(1.0, 128, RenderDevice::Vulkan),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn timing_metric_tracks_latest_ema_maximum_and_samples() {
+        let mut metric = TimingMetric::default();
+        metric.record(Duration::from_millis(2));
+        metric.record(Duration::from_millis(4));
+        assert_eq!(metric.samples, 2);
+        assert_eq!(metric.latest_ms, 4.0);
+        assert_eq!(metric.maximum_ms, 4.0);
+        assert!((metric.average_ms - 2.2).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn compositor_lod_resize_preserves_aspect_ratio() {
+        let texture = Arc::new(TextureAsset {
+            name: "wide".into(),
+            width: 8,
+            height: 4,
+            pixels: vec![255; 8 * 4 * 4],
+        });
+        let resized = resize_texture_for_lod(&texture, 4);
+        assert_eq!((resized.width, resized.height), (4, 2));
     }
 
     #[test]

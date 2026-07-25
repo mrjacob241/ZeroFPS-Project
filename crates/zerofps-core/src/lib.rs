@@ -259,7 +259,7 @@ pub enum Component {
     Marker { kind: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AttributeKey {
     Visible,
     Enabled,
@@ -272,6 +272,62 @@ pub enum AttributeKey {
     CastShadows,
     CollisionGroup,
     Custom(String),
+}
+
+// Attribute keys are used as JSON object keys in GeometryTree. Serde's default
+// externally-tagged representation for `Custom(String)` is an object, which
+// JSON cannot use as a map key. Keep the historic names for built-in keys and
+// give custom keys an explicitly string-valued representation.
+impl Serialize for AttributeKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Visible => serializer.serialize_str("Visible"),
+            Self::Enabled => serializer.serialize_str("Enabled"),
+            Self::Material => serializer.serialize_str("Material"),
+            Self::MaterialShader => serializer.serialize_str("MaterialShader"),
+            Self::MaterialSmoothNormals => serializer.serialize_str("MaterialSmoothNormals"),
+            Self::MaterialUseImportedOptics => {
+                serializer.serialize_str("MaterialUseImportedOptics")
+            }
+            Self::RenderLayer => serializer.serialize_str("RenderLayer"),
+            Self::Tint => serializer.serialize_str("Tint"),
+            Self::CastShadows => serializer.serialize_str("CastShadows"),
+            Self::CollisionGroup => serializer.serialize_str("CollisionGroup"),
+            Self::Custom(name) => serializer.serialize_str(&format!("Custom:{name}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AttributeKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "Visible" => Ok(Self::Visible),
+            "Enabled" => Ok(Self::Enabled),
+            "Material" => Ok(Self::Material),
+            "MaterialShader" => Ok(Self::MaterialShader),
+            "MaterialSmoothNormals" => Ok(Self::MaterialSmoothNormals),
+            "MaterialUseImportedOptics" => Ok(Self::MaterialUseImportedOptics),
+            "RenderLayer" => Ok(Self::RenderLayer),
+            "Tint" => Ok(Self::Tint),
+            "CastShadows" => Ok(Self::CastShadows),
+            "CollisionGroup" => Ok(Self::CollisionGroup),
+            _ => value
+                .strip_prefix("Custom:")
+                .map(|name| Self::Custom(name.to_owned()))
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom(format!(
+                        "unknown geometry attribute key `{value}`"
+                    ))
+                }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-eframe.workspace = true
+eframe = { workspace = true, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
 egui.workspace = true
+egui-wgpu = "0.31"
 image.workspace = true
 rfd.workspace = true
 serde.workspace = true
@@ -15,6 +16,9 @@ zerofps-core = { path = "../zerofps-core" }
 zerofps-assets = { path = "../zerofps-assets" }
 zerofps-formats = { path = "../zerofps-formats" }
 zerofps-telemetry = { path = "../zerofps-telemetry" }
+pollster = "0.4"
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "zerofps-editor"

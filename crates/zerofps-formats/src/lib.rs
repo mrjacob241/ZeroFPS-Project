@@ -6,6 +6,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Component as PathComponent, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use zerofps_core::{
@@ -119,7 +120,7 @@ pub fn save_zfp(
     files: &[BundleAsset],
 ) -> Result<(), FormatError> {
     let path = path.as_ref();
-    project.validate()?;
+    let manifest = project.to_json()?;
     let mut names = BTreeSet::new();
     for file in files {
         validate_archive_path(&file.archive_path)?;
@@ -130,20 +131,67 @@ pub fn save_zfp(
             )));
         }
     }
-    let output = File::create(path)?;
-    let mut archive = zip::ZipWriter::new(output);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .unix_permissions(0o644);
-    archive.start_file(ARCHIVE_MANIFEST, options)?;
-    archive.write_all(project.to_json()?.as_bytes())?;
-
     for file in files {
-        archive.start_file(&file.archive_path, options)?;
-        let mut source = File::open(&file.source)?;
-        std::io::copy(&mut source, &mut archive)?;
+        File::open(&file.source)?;
     }
-    archive.finish()?;
+    let temporary = temporary_archive_path(path);
+    let result = (|| {
+        let output = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let mut archive = zip::ZipWriter::new(output);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        archive.start_file(ARCHIVE_MANIFEST, options)?;
+        archive.write_all(manifest.as_bytes())?;
+        for file in files {
+            archive.start_file(&file.archive_path, options)?;
+            let mut source = File::open(&file.source)?;
+            std::io::copy(&mut source, &mut archive)?;
+        }
+        let output = archive.finish()?;
+        output.sync_all()?;
+        verify_zfp_archive(&temporary)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn temporary_archive_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project.zfp");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{filename}.{}.{nonce}.tmp", std::process::id()))
+}
+
+fn verify_zfp_archive(path: &Path) -> Result<(), FormatError> {
+    let mut archive = zip::ZipArchive::new(File::open(path)?)?;
+    let mut manifest = String::new();
+    {
+        archive
+            .by_name(ARCHIVE_MANIFEST)
+            .map_err(|_| {
+                FormatError::InvalidArchive("temporary archive is missing scene.json".into())
+            })?
+            .read_to_string(&mut manifest)?;
+    }
+    ProjectFile::from_json(&manifest)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        while entry.read(&mut buffer)? != 0 {}
+    }
     Ok(())
 }
 
@@ -438,6 +486,35 @@ mod tests {
     }
 
     #[test]
+    fn zfp_round_trip_supports_imported_model_custom_attributes() {
+        let root = std::env::temp_dir().join(format!(
+            "zerofps-zfp-custom-attribute-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("model-only.zfp");
+        let mut project = sample_project();
+        let model = project.scene.geometry.roots()[0];
+        project
+            .scene
+            .geometry
+            .set_attribute(
+                model,
+                AttributeKey::Custom("mesh.autofix".into()),
+                AttributeDeclaration::Value(Attribute::Bool(true)),
+            )
+            .unwrap();
+
+        save_zfp(&archive, &project, &[]).unwrap();
+        let loaded = load_zfp(&archive, root.join("cache")).unwrap();
+        assert_eq!(
+            loaded.project.to_json().unwrap(),
+            project.to_json().unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn zfp_rejects_escaping_paths() {
         let file = BundleAsset {
             source: PathBuf::from("unused"),
@@ -461,5 +538,27 @@ mod tests {
             save_zfp(path, &sample_project(), &[duplicate(), duplicate()]),
             Err(FormatError::InvalidArchive(_))
         ));
+    }
+
+    #[test]
+    fn failed_zfp_save_preserves_existing_destination() {
+        let root = std::env::temp_dir().join(format!("zerofps-atomic-save-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("existing.zfp");
+        fs::write(&destination, b"previous project bytes").unwrap();
+        let missing = BundleAsset {
+            source: root.join("missing.glb"),
+            archive_path: "assets/missing.glb".into(),
+        };
+        assert!(save_zfp(&destination, &sample_project(), &[missing]).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous project bytes");
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -268,6 +268,7 @@ pub fn autofix_mesh(source: &MeshAsset) -> (MeshAsset, MeshAutofixReport) {
             indices: repair_indices,
         });
     }
+    orient_strongly_inverted_winding(&mut mesh);
     regenerate_vertex_normals(&mut mesh);
     (
         mesh,
@@ -277,6 +278,70 @@ pub fn autofix_mesh(source: &MeshAsset) -> (MeshAsset, MeshAutofixReport) {
             added_triangles,
         },
     )
+}
+
+/// Some public mesh files (including the Bunny fixture) contain a consistently
+/// reversed winding and no normals. Only flip when the evidence is strong so
+/// concave shapes and ordinary local winding defects are left untouched.
+fn orient_strongly_inverted_winding(mesh: &mut MeshAsset) -> bool {
+    if mesh.vertices.is_empty() {
+        return false;
+    }
+    let mut center = [0.0_f32; 3];
+    for vertex in &mesh.vertices {
+        for axis in 0..3 {
+            center[axis] += vertex.position[axis] / mesh.vertices.len() as f32;
+        }
+    }
+    let mut inward = 0usize;
+    let mut usable = 0usize;
+    for triangle in mesh
+        .primitives
+        .iter()
+        .flat_map(|primitive| primitive.indices.chunks_exact(3))
+    {
+        let positions = [
+            mesh.vertices[triangle[0] as usize].position,
+            mesh.vertices[triangle[1] as usize].position,
+            mesh.vertices[triangle[2] as usize].position,
+        ];
+        let ab = subtract3(positions[1], positions[0]);
+        let ac = subtract3(positions[2], positions[0]);
+        let face = cross3(ab, ac);
+        // EPSILON would reject valid faces in small models such as Bunny.
+        if dot3(face, face) <= f32::MIN_POSITIVE {
+            continue;
+        }
+        let face_center = [0, 1, 2]
+            .map(|axis| (positions[0][axis] + positions[1][axis] + positions[2][axis]) / 3.0);
+        inward += usize::from(dot3(face, subtract3(face_center, center)) < 0.0);
+        usable += 1;
+    }
+    if usable == 0 || inward * 4 <= usable * 3 {
+        return false;
+    }
+    for primitive in &mut mesh.primitives {
+        for triangle in primitive.indices.chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+    }
+    true
+}
+
+fn subtract3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+fn cross3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ]
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 }
 
 fn triangulate_boundary(vertices: &[Vertex], boundary: &[u32]) -> Option<Vec<u32>> {
