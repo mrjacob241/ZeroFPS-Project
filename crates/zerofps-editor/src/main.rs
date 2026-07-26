@@ -170,6 +170,15 @@ impl PaintedMask {
         }
     }
 
+    fn uniform(width: u32, height: u32, value: u8) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![value; (width * height) as usize],
+            revision: 1,
+        }
+    }
+
     fn texture(&self, heatmap_preview: bool) -> TextureAsset {
         let mut rgba = Vec::with_capacity(self.pixels.len() * 4);
         for &value in &self.pixels {
@@ -551,7 +560,7 @@ impl NodeSettings {
                 formulas: ["0".into(), "0".into(), "0".into()],
                 scale: 1.0,
                 blend: 1.0,
-                mode: 0,
+                mode: 1,
             },
             24 => Self::Simulator {
                 object_index: 0,
@@ -2941,7 +2950,9 @@ impl EditorApp {
                             .get(&format!("compositor.node.{id}.velocity_blend"))
                             .and_then(|value| value.parse().ok())
                             .unwrap_or(1.0),
-                        mode: get_usize(&format!("compositor.node.{id}.velocity_mode")),
+                        // Simulator velocity injection is always additive;
+                        // normalize old Set/Approach projects to Add.
+                        mode: 1,
                     },
                     24 => NodeSettings::Simulator {
                         object_index: get_usize(&format!("compositor.node.{id}.object_index")),
@@ -3822,18 +3833,25 @@ impl EditorApp {
                     return;
                 };
                 changed |= ui
-                    .add(egui::Slider::new(stiffness, 0.0..=1.0).text("Edge stiffness"))
+                    .add(egui::Slider::new(stiffness, 0.0..=1.0).text("Stretch stiffness"))
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(bend_stiffness, 0.0..=1.0).text("Bend stiffness"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(damping, 0.0..=0.2).text("Damping"))
+                    .add(egui::Slider::new(damping, 0.0..=0.95).text("Energy dissipation"))
+                    .on_hover_text(
+                        "Fraction of particle velocity removed each fixed tick. \
+                         Stiffness stores and returns elastic energy; this control dissipates it.",
+                    )
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(iterations, 1..=16).text("Iterations"))
                     .changed();
-                ui.small("Triangle edges are springs; second-ring edges resist bending.");
+                ui.small(
+                    "Triangle edges resist stretch; second-ring springs resist bending. \
+                     Dissipation removes oscillation energy.",
+                );
             }
             22 => {
                 let pos = self
@@ -3897,14 +3915,8 @@ impl EditorApp {
                 changed |= ui
                     .add(egui::Slider::new(blend, 0.0..=1.0).text("Blend"))
                     .changed();
-                let modes = ["Set", "Add", "Approach"];
-                egui::ComboBox::from_id_salt(("velocity_mode", node_id))
-                    .selected_text(modes[(*mode).min(2)])
-                    .show_ui(ui, |ui| {
-                        for (index, label) in modes.iter().enumerate() {
-                            changed |= ui.selectable_value(mode, index, *label).changed();
-                        }
-                    });
+                *mode = 1;
+                ui.small("Advection: x ← x + dt·(x′ + V(p)); V does not become momentum.");
                 if !formulas
                     .iter()
                     .all(|formula| evaluate_force_formula(formula, 0.3, 0.4, 0.5, 0.6).is_ok())
@@ -5991,7 +6003,7 @@ impl EditorApp {
                         forces,
                         velocities,
                         velocity_blend,
-                        velocity_mode,
+                        _velocity_mode,
                         gravity,
                         time_scale,
                     )) = node_dynamics
@@ -6001,11 +6013,10 @@ impl EditorApp {
                         let simulation_dt = dt * time_scale.clamp(0.0, 4.0);
                         if simulation_dt > f32::EPSILON {
                             if let Some(velocities) = velocities.as_deref() {
-                                cloth.apply_velocity_field(
+                                cloth.advect_velocity_field(
                                     simulation_dt,
                                     velocities,
                                     velocity_blend,
-                                    velocity_mode,
                                 );
                             }
                             cloth.step_with_fields(
@@ -6037,10 +6048,6 @@ impl EditorApp {
         &self,
         object_index: usize,
     ) -> Option<(usize, usize, Option<usize>, Option<usize>, Option<usize>)> {
-        let spring = self.compositor_nodes.iter().find(|node| {
-            node.object_index == object_index
-                && matches!(node.settings, NodeSettings::SpringMesh { .. })
-        })?;
         let output = self.compositor_nodes.iter().find(|node| {
             node.object_index == object_index
                 && matches!(node.settings, NodeSettings::ObjectMesh { .. })
@@ -6053,14 +6060,6 @@ impl EditorApp {
                     .iter()
                     .any(|&(from, _, to, input)| from == node.id && to == output.id && input == 0)
         });
-        if !has_simulator_output
-            && self
-                .compositor_links
-                .iter()
-                .any(|&(from, _, to, input)| from == spring.id && to == output.id && input == 0)
-        {
-            return Some((spring.id, output.id, None, None, None));
-        }
         if let Some(simulator) = self.compositor_nodes.iter().find(|node| {
             node.object_index == object_index
                 && matches!(node.settings, NodeSettings::Simulator { .. })
@@ -6069,45 +6068,89 @@ impl EditorApp {
                     .iter()
                     .any(|&(from, _, to, input)| from == node.id && to == output.id && input == 0)
         }) {
-            let velocity_id = self
+            let incoming = self
                 .compositor_links
                 .iter()
-                .find_map(|&(from, _, to, input)| {
-                    (to == simulator.id && input == 0).then_some(from)
-                })?;
-            let force_id = self
-                .compositor_links
-                .iter()
-                .find_map(|&(from, _, to, input)| {
-                    (to == simulator.id && input == 1).then_some(from)
-                })?;
-            let velocity_ok = self.compositor_nodes.iter().any(|node| {
-                node.id == velocity_id
-                    && matches!(node.settings, NodeSettings::VelocityField { .. })
+                .filter_map(|&(from, _, to, _)| (to == simulator.id).then_some(from))
+                .collect::<Vec<_>>();
+            let velocity_id = incoming.iter().copied().find(|source| {
+                self.compositor_nodes.iter().any(|node| {
+                    node.id == *source
+                        && node.object_index == object_index
+                        && matches!(node.settings, NodeSettings::VelocityField { .. })
+                })
             });
-            let force_ok = self.compositor_nodes.iter().any(|node| {
-                node.id == force_id && matches!(node.settings, NodeSettings::ForceField { .. })
+            let force_id = incoming.iter().copied().find(|source| {
+                self.compositor_nodes.iter().any(|node| {
+                    node.id == *source
+                        && node.object_index == object_index
+                        && matches!(node.settings, NodeSettings::ForceField { .. })
+                })
             });
-            let force_inputs_ok = [0, 1, 2].into_iter().all(|input| {
+            if velocity_id.is_none() && force_id.is_none() {
+                return None;
+            }
+            let spring_id = if let Some(force_id) = force_id {
                 self.compositor_links
                     .iter()
-                    .any(|&(from, _, to, target_input)| {
-                        to == force_id && target_input == input && (input != 2 || from == spring.id)
+                    .find_map(|&(from, _, to, input)| {
+                        (to == force_id && input == 2).then_some(from)
+                    })?
+            } else {
+                self.compositor_nodes
+                    .iter()
+                    .find(|node| {
+                        node.object_index == object_index
+                            && matches!(node.settings, NodeSettings::SpringMesh { .. })
                     })
+                    .map(|node| node.id)?
+            };
+            let force_ok = force_id.is_none_or(|force_id| {
+                self.compositor_nodes.iter().any(|node| {
+                    node.id == force_id
+                        && node.object_index == object_index
+                        && matches!(node.settings, NodeSettings::ForceField { .. })
+                })
             });
-            let velocity_input_ok = self
-                .compositor_links
-                .iter()
-                .any(|&(_, _, to, input)| to == velocity_id && input == 0);
-            if velocity_ok && force_ok && force_inputs_ok && velocity_input_ok {
+            let spring_ok = self.compositor_nodes.iter().any(|node| {
+                node.id == spring_id
+                    && node.object_index == object_index
+                    && matches!(node.settings, NodeSettings::SpringMesh { .. })
+            });
+            let force_inputs_ok = force_id.is_none_or(|force_id| {
+                [0, 1].into_iter().all(|input| {
+                    self.compositor_links
+                        .iter()
+                        .any(|&(from, _, to, target_input)| {
+                            to == force_id
+                                && target_input == input
+                                && self.compositor_nodes.iter().any(|node| {
+                                    node.id == from && node.object_index == object_index
+                                })
+                        })
+                })
+            });
+            if force_ok && spring_ok && force_inputs_ok {
                 return Some((
-                    spring.id,
+                    spring_id,
                     output.id,
-                    Some(force_id),
-                    Some(velocity_id),
+                    force_id,
+                    velocity_id,
                     Some(simulator.id),
                 ));
             }
+        }
+        let spring = self.compositor_nodes.iter().find(|node| {
+            node.object_index == object_index
+                && matches!(node.settings, NodeSettings::SpringMesh { .. })
+        })?;
+        if !has_simulator_output
+            && self
+                .compositor_links
+                .iter()
+                .any(|&(from, _, to, input)| from == spring.id && to == output.id && input == 0)
+        {
+            return Some((spring.id, output.id, None, None, None));
         }
         let force =
             self.compositor_nodes.iter().find(|node| {
@@ -6178,19 +6221,20 @@ impl EditorApp {
         let texture_id = self
             .compositor_links
             .iter()
-            .find_map(|&(from, _, to, input)| (to == mass_id && input == 0).then_some(from))?;
-        let texture_node = self
-            .compositor_nodes
-            .iter()
-            .find(|node| node.id == texture_id)?;
-        let NodeSettings::PaintedMask {
-            object_index: texture_object,
-        } = texture_node.settings
-        else {
-            return None;
-        };
-        let mask_object = self.object_node_id(texture_object)?;
-        let mask = self.painted_masks.get(&mask_object)?;
+            .find_map(|&(from, _, to, input)| (to == mass_id && input == 0).then_some(from));
+        let mass_mask = texture_id
+            .and_then(|texture_id| {
+                self.compositor_nodes
+                    .iter()
+                    .find_map(|node| match node.settings {
+                        NodeSettings::PaintedMask { object_index } if node.id == texture_id => {
+                            Some(object_index)
+                        }
+                        _ => None,
+                    })
+            })
+            .and_then(|texture_object| self.object_node_id(texture_object))
+            .and_then(|mask_object| self.painted_masks.get(&mask_object));
         let path = self.object_asset_path(object_index)?;
         let mesh = self
             .imported_assets
@@ -6198,9 +6242,16 @@ impl EditorApp {
             .find(|asset| asset.path == path)
             .map(|asset| &asset.mesh)?;
         let transform = self.scene.tree.node(id).ok()?.global_transform();
+        let uniform_mass;
+        let mass_source = if let Some(mask) = mass_mask {
+            mask
+        } else {
+            uniform_mass = PaintedMask::uniform(1, 1, 255);
+            &uniform_mass
+        };
         let masses = area_weighted_particle_masses(
             mesh,
-            mask,
+            mass_source,
             transform.scale,
             base_density,
             scale,
@@ -6225,7 +6276,7 @@ impl EditorApp {
         let mut settings = self.dynamics_settings.clone();
         settings.stretch_compliance = 10.0_f32.powf(-2.0 - 5.0 * stiffness.clamp(0.0, 1.0));
         settings.bend_compliance = 10.0_f32.powf(-1.0 - 4.0 * bend_stiffness.clamp(0.0, 1.0));
-        settings.damping = damping.clamp(0.0, 0.2);
+        settings.damping = damping.clamp(0.0, 0.95);
         settings.iterations = iterations.clamp(1, 16);
         let forces = force_id.and_then(|force_id| {
             let force_node = self
@@ -6244,24 +6295,13 @@ impl EditorApp {
                 .compositor_links
                 .iter()
                 .find_map(|&(from, _, to, input)| (to == force_id && input == 0).then_some(from))?;
-            let strength_node = self
-                .compositor_nodes
-                .iter()
-                .find(|node| node.id == strength_id)?;
-            let NodeSettings::PaintedMask {
-                object_index: strength_object,
-            } = strength_node.settings
-            else {
-                return None;
-            };
-            let strength_mask = self
-                .painted_masks
-                .get(&self.object_node_id(strength_object)?)?;
             Some(
                 mesh.vertices
                     .iter()
                     .map(|vertex| {
-                        let strength = sample_painted_mask(strength_mask, vertex.uv);
+                        let strength = self
+                            .sample_scalar_graph_at_uv(strength_id, vertex.uv, 0)
+                            .unwrap_or(0.0);
                         CoreVec3::new(
                             evaluate_force_formula(
                                 &formulas[0],
@@ -6292,6 +6332,11 @@ impl EditorApp {
                     .collect(),
             )
         });
+        let forces = if simulator_id.is_some() && force_id.is_none() {
+            Some(vec![CoreVec3::ZERO; mesh.vertices.len()])
+        } else {
+            forces
+        };
         let (velocities, velocity_blend, velocity_mode) = velocity_id
             .and_then(|velocity_id| {
                 let node = self
@@ -6308,31 +6353,33 @@ impl EditorApp {
                 else {
                     return None;
                 };
-                let strength_id =
-                    self.compositor_links
-                        .iter()
-                        .find_map(|&(from, _, to, input)| {
-                            (to == velocity_id && input == 0).then_some(from)
-                        })?;
-                let strength_object =
-                    self.compositor_nodes
-                        .iter()
-                        .find_map(|node| match node.settings {
-                            NodeSettings::PaintedMask { object_index }
-                                if node.id == strength_id =>
-                            {
-                                Some(object_index)
-                            }
-                            _ => None,
-                        })?;
                 let strength_mask = self
-                    .painted_masks
-                    .get(&self.object_node_id(strength_object)?)?;
+                    .compositor_links
+                    .iter()
+                    .find_map(|&(from, _, to, input)| {
+                        (to == velocity_id && input == 0).then_some(from)
+                    })
+                    .and_then(|strength_id| {
+                        self.compositor_nodes
+                            .iter()
+                            .find_map(|node| match node.settings {
+                                NodeSettings::PaintedMask { object_index }
+                                    if node.id == strength_id =>
+                                {
+                                    Some(object_index)
+                                }
+                                _ => None,
+                            })
+                    })
+                    .and_then(|strength_object| self.object_node_id(strength_object))
+                    .and_then(|object_id| self.painted_masks.get(&object_id));
                 let values = mesh
                     .vertices
                     .iter()
                     .map(|vertex| {
-                        let strength = sample_painted_mask(strength_mask, vertex.uv);
+                        let strength = strength_mask
+                            .map(|mask| sample_painted_mask(mask, vertex.uv))
+                            .unwrap_or(1.0);
                         CoreVec3::new(
                             evaluate_force_formula(
                                 &formulas[0],
@@ -6364,6 +6411,15 @@ impl EditorApp {
                 Some((Some(values), blend.clamp(0.0, 1.0), mode.min(2)))
             })
             .unwrap_or((None, 1.0, 0));
+        let (velocities, velocity_blend, velocity_mode) =
+            if simulator_id.is_some() && velocity_id.is_none() {
+                // A disconnected velocity socket is the additive identity. Using
+                // Add rather than Set is important: a zero Set field would erase
+                // motion produced by forces, gravity, and spring constraints.
+                (Some(vec![CoreVec3::ZERO; mesh.vertices.len()]), 1.0, 1)
+            } else {
+                (velocities, velocity_blend, velocity_mode)
+            };
         let (gravity, time_scale) = simulator_id
             .and_then(|simulator_id| {
                 self.compositor_nodes
@@ -6388,6 +6444,36 @@ impl EditorApp {
             gravity,
             time_scale,
         ))
+    }
+
+    fn sample_scalar_graph_at_uv(&self, node_id: usize, uv: [f32; 2], depth: usize) -> Option<f32> {
+        if depth > 64 {
+            return None;
+        }
+        let node = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == node_id)?;
+        match &node.settings {
+            NodeSettings::PaintedMask { object_index } => {
+                let object_id = self.object_node_id(*object_index)?;
+                self.painted_masks
+                    .get(&object_id)
+                    .map(|mask| sample_painted_mask(mask, uv))
+            }
+            NodeSettings::ConstantValue { value, .. } => Some(*value),
+            NodeSettings::Remap { points, mode, .. } => {
+                let source = self
+                    .compositor_links
+                    .iter()
+                    .find_map(|&(from, _, to, input)| {
+                        (to == node_id && input == 0).then_some(from)
+                    })?;
+                let value = self.sample_scalar_graph_at_uv(source, uv, depth + 1)?;
+                Some(compositor_graph::remap_value(value, points, *mode == 1))
+            }
+            _ => None,
+        }
     }
 
     fn reset_dynamics(&mut self) {

@@ -396,7 +396,7 @@ fn arithmetic(left: f32, right: f32, operation: usize) -> f32 {
     }
 }
 
-fn remap_value(value: f32, points: &[[f32; 2]], bezier: bool) -> f32 {
+pub(crate) fn remap_value(value: f32, points: &[[f32; 2]], bezier: bool) -> f32 {
     if points.is_empty() {
         return value;
     }

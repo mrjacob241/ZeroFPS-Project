@@ -292,7 +292,6 @@ impl ClothState {
         let triangles = mesh
             .primitives
             .iter()
-            .filter(|primitive| primitive.name.to_ascii_lowercase().contains("cloth"))
             .flat_map(|primitive| {
                 primitive.indices.chunks_exact(3).map(|triangle| {
                     [
@@ -570,6 +569,26 @@ impl ClothState {
         }
     }
 
+    /// Applies `x <- x + dt * V(p)` without adding `V(p)` to the persistent
+    /// particle momentum encoded by the Verlet position pair.
+    pub fn advect_velocity_field(&mut self, dt: f32, velocities: &[Vec3], blend: f32) {
+        let dt = finite_or(dt, 1.0 / 60.0).max(0.0);
+        let blend = finite_or(blend, 1.0).clamp(0.0, 1.0);
+        for (index, particle) in self.particles.iter_mut().enumerate() {
+            if particle.inverse_mass <= 0.0 {
+                continue;
+            }
+            let field_velocity = velocities
+                .get(index)
+                .copied()
+                .map(|value| finite_vec3_or(value, Vec3::ZERO))
+                .unwrap_or(Vec3::ZERO);
+            let displacement = field_velocity * (dt * blend);
+            particle.position = particle.position + displacement;
+            particle.previous = particle.previous + displacement;
+        }
+    }
+
     fn solve_collisions(&mut self) {
         for particle in &mut self.particles {
             if particle.inverse_mass <= 0.0 {
@@ -742,6 +761,70 @@ mod tests {
         assert_eq!(cloth.particles[0].previous, pinned_previous);
         let velocity = (cloth.particles[1].position - cloth.particles[1].previous) / 0.25;
         assert!((velocity.x - 3.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn additive_velocity_field_accumulates_once_per_tick() {
+        let mesh = grid();
+        let field = MeshScalarField::mobility_for_mesh(&mesh);
+        let mut cloth = ClothState::new(&mesh, &field, ClothSettings::default());
+        let velocities = vec![Vec3::new(2.0, -1.0, 0.5); mesh.vertices.len()];
+        let dt = 0.25;
+        cloth.apply_velocity_field(dt, &velocities, 1.0, 1);
+        cloth.apply_velocity_field(dt, &velocities, 1.0, 1);
+        let velocity = (cloth.particles[1].position - cloth.particles[1].previous) / dt;
+        assert!((velocity.x - 4.0).abs() < 1.0e-6);
+        assert!((velocity.y + 2.0).abs() < 1.0e-6);
+        assert!((velocity.z - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn velocity_field_advects_without_becoming_particle_momentum() {
+        let mesh = grid();
+        let field = MeshScalarField::mobility_for_mesh(&mesh);
+        let mut cloth = ClothState::new(&mesh, &field, ClothSettings::default());
+        let velocities = vec![Vec3::new(2.0, -1.0, 0.5); mesh.vertices.len()];
+        let dt = 0.25;
+        let before = cloth.particles[1].position;
+        let momentum_before = cloth.particles[1].position - cloth.particles[1].previous;
+        cloth.advect_velocity_field(dt, &velocities, 1.0);
+        let displacement = cloth.particles[1].position - before;
+        let momentum_after = cloth.particles[1].position - cloth.particles[1].previous;
+        assert!((displacement.x - 0.5).abs() < 1.0e-6);
+        assert!((displacement.y + 0.25).abs() < 1.0e-6);
+        assert!((displacement.z - 0.125).abs() < 1.0e-6);
+        assert_eq!(momentum_after, momentum_before);
+        assert_eq!(
+            cloth.particles[0].position,
+            from_array(mesh.vertices[0].position)
+        );
+    }
+
+    #[test]
+    fn damping_monotonically_reduces_particle_velocity() {
+        let mesh = grid();
+        let field = MeshScalarField::mobility_for_mesh(&mesh);
+        let mut undamped_settings = ClothSettings::default();
+        undamped_settings.damping = 0.0;
+        let mut damped_settings = undamped_settings.clone();
+        damped_settings.damping = 0.5;
+        let mut undamped = ClothState::new(&mesh, &field, undamped_settings);
+        let mut damped = ClothState::new(&mesh, &field, damped_settings);
+        let initial = vec![Vec3::new(1.0, 0.0, 0.0); mesh.vertices.len()];
+        let dt = 1.0 / 60.0;
+        undamped.apply_velocity_field(dt, &initial, 1.0, 0);
+        damped.apply_velocity_field(dt, &initial, 1.0, 0);
+        let wind = WindField {
+            enabled: false,
+            ..WindField::default()
+        };
+        undamped.step_with_fields(dt, 0.0, &wind, None, false);
+        damped.step_with_fields(dt, 0.0, &wind, None, false);
+        let undamped_speed =
+            (undamped.particles[1].position - undamped.particles[1].previous).length() / dt;
+        let damped_speed =
+            (damped.particles[1].position - damped.particles[1].previous).length() / dt;
+        assert!(damped_speed < undamped_speed);
     }
 
     #[test]
