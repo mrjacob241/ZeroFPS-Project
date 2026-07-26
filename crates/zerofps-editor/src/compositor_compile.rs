@@ -137,7 +137,13 @@ impl Compiler<'_> {
             .ok_or(GraphCompileError::MissingNode(socket.0))?;
         let output_count = if matches!(&settings, NodeSettings::ColorDecoder) {
             4
-        } else if matches!(&settings, NodeSettings::Output { .. } | NodeSettings::Debug) {
+        } else if matches!(
+            &settings,
+            NodeSettings::Output { .. }
+                | NodeSettings::Debug
+                | NodeSettings::ObjectTransform { .. }
+                | NodeSettings::ObjectMesh { .. }
+        ) {
             0
         } else {
             1
@@ -197,6 +203,21 @@ impl Compiler<'_> {
                             .insert(source_key, Arc::clone(&texture));
                         texture
                     };
+                self.add_source(GraphSource::Texture(resize_texture_for_lod(
+                    &texture, self.lod,
+                )))
+            }
+            NodeSettings::PaintedMask { object_index } => {
+                let object = self
+                    .app
+                    .object_node_id(object_index)
+                    .ok_or_else(|| source_error(socket.0, "painted object is unavailable"))?;
+                let texture = self
+                    .app
+                    .painted_masks
+                    .get(&object)
+                    .map(|mask| Arc::new(mask.texture(false)))
+                    .ok_or_else(|| source_error(socket.0, "object has no painted texture"))?;
                 self.add_source(GraphSource::Texture(resize_texture_for_lod(
                     &texture, self.lod,
                 )))
@@ -317,7 +338,14 @@ impl Compiler<'_> {
                 }
                 GraphOperation::JoinChannels
             }
-            NodeSettings::Output { .. } => {
+            NodeSettings::Output { .. }
+            | NodeSettings::ObjectTransform { .. }
+            | NodeSettings::ObjectMesh { .. }
+            | NodeSettings::MassDensity { .. }
+            | NodeSettings::SpringMesh { .. }
+            | NodeSettings::ForceField { .. }
+            | NodeSettings::VelocityField { .. }
+            | NodeSettings::Simulator { .. } => {
                 return Err(GraphCompileError::NotOutputNode(socket.0));
             }
         };

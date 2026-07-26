@@ -51,6 +51,16 @@ pub struct Primitive {
     pub indices: Vec<u32>,
 }
 
+/// An auxiliary scalar sampled once per canonical mesh vertex.
+///
+/// Importers use these fields for source data that has no built-in [`Vertex`]
+/// attribute, such as simulation mobility, mass, or stiffness. Values always
+/// follow `MeshAsset::vertices` ordering.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VertexScalarField {
+    pub values: Vec<f32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshAsset {
     pub name: String,
@@ -58,6 +68,7 @@ pub struct MeshAsset {
     pub primitives: Vec<Primitive>,
     pub materials: BTreeMap<String, Material>,
     pub textures: BTreeMap<String, TextureAsset>,
+    pub vertex_scalar_fields: BTreeMap<String, VertexScalarField>,
     pub source: SourceInfo,
     pub warnings: Vec<String>,
 }
@@ -139,6 +150,20 @@ impl MeshAsset {
                     "primitive `{}` references vertex {index} outside {} vertices",
                     primitive.name,
                     self.vertices.len()
+                )));
+            }
+        }
+        for (name, field) in &self.vertex_scalar_fields {
+            if field.values.len() != self.vertices.len() {
+                return Err(ImportError::InvalidData(format!(
+                    "vertex scalar field `{name}` has {} values for {} vertices",
+                    field.values.len(),
+                    self.vertices.len()
+                )));
+            }
+            if field.values.iter().any(|value| !value.is_finite()) {
+                return Err(ImportError::InvalidData(format!(
+                    "vertex scalar field `{name}` contains a non-finite value"
                 )));
             }
         }

@@ -6,8 +6,9 @@
 
 use crate::{
     AxisConvention, Handedness, ImportError, Material, MeshAsset, Primitive, SourceInfo,
-    TextureAsset, Vertex,
+    TextureAsset, Vertex, VertexScalarField,
 };
+use serde_json::Value;
 use std::path::Path;
 
 type Matrix = [[f32; 4]; 4];
@@ -85,8 +86,11 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
     };
     for scene in scenes {
         for node in scene.nodes() {
-            visit_node(node, identity(), &buffers, &mut asset)?;
+            visit_node(node, identity(), &document, &buffers, &mut asset)?;
         }
+    }
+    for field in asset.vertex_scalar_fields.values_mut() {
+        field.values.resize(asset.vertices.len(), 0.0);
     }
     if asset.vertices.is_empty() {
         return Err(ImportError::InvalidData(
@@ -99,10 +103,12 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
 fn visit_node(
     node: ::gltf::Node<'_>,
     parent: Matrix,
+    document: &::gltf::Document,
     buffers: &[::gltf::buffer::Data],
     asset: &mut MeshAsset,
 ) -> Result<(), ImportError> {
     let world = multiply(parent, node.transform().matrix());
+    let vertex_start = asset.vertices.len();
     if let Some(mesh) = node.mesh() {
         for (primitive_index, primitive) in mesh.primitives().enumerate() {
             if primitive.mode() != ::gltf::mesh::Mode::Triangles {
@@ -176,10 +182,68 @@ fn visit_node(
             });
         }
     }
+    if let Some(accessor_index) = zerofps_mobility_accessor(&node, asset) {
+        let values = read_scalar_f32_accessor(document.accessors().nth(accessor_index), buffers)
+            .ok_or_else(|| {
+                ImportError::InvalidData(format!(
+                    "node `{}` references invalid mobility accessor {accessor_index}",
+                    node.name().unwrap_or("<unnamed>")
+                ))
+            })?;
+        let added_vertices = asset.vertices.len() - vertex_start;
+        if values.len() != added_vertices {
+            return Err(ImportError::InvalidData(format!(
+                "node `{}` mobility accessor has {} values for {added_vertices} imported vertices",
+                node.name().unwrap_or("<unnamed>"),
+                values.len()
+            )));
+        }
+        let field = asset
+            .vertex_scalar_fields
+            .entry("dynamics.mobility".into())
+            .or_insert_with(|| VertexScalarField {
+                values: vec![0.0; vertex_start],
+            });
+        field.values.resize(vertex_start, 0.0);
+        field.values.extend(values);
+    }
     for child in node.children() {
-        visit_node(child, world, buffers, asset)?;
+        visit_node(child, world, document, buffers, asset)?;
     }
     Ok(())
+}
+
+fn zerofps_mobility_accessor(node: &::gltf::Node<'_>, asset: &mut MeshAsset) -> Option<usize> {
+    let raw = node.extras().as_ref()?;
+    let extras: Value = match serde_json::from_str(raw.get()) {
+        Ok(value) => value,
+        Err(error) => {
+            asset.warnings.push(format!(
+                "node `{}` has invalid extras JSON: {error}",
+                node.name().unwrap_or("<unnamed>")
+            ));
+            return None;
+        }
+    };
+    extras
+        .get("zerofpsCloth")?
+        .get("mobilityAccessor")?
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+}
+
+fn read_scalar_f32_accessor(
+    accessor: Option<::gltf::Accessor<'_>>,
+    buffers: &[::gltf::buffer::Data],
+) -> Option<Vec<f32>> {
+    let accessor = accessor?;
+    if accessor.dimensions() != ::gltf::accessor::Dimensions::Scalar
+        || accessor.data_type() != ::gltf::accessor::DataType::F32
+    {
+        return None;
+    }
+    ::gltf::accessor::Iter::<f32>::new(accessor, |buffer| Some(&buffers[buffer.index()].0))
+        .map(Iterator::collect)
 }
 
 fn decoded_image(name: String, image: &::gltf::image::Data) -> Result<TextureAsset, ImportError> {
@@ -337,5 +401,24 @@ mod tests {
             dot(normal, transformed_tangent).abs() < 1.0e-6,
             "an imported normal must remain perpendicular to transformed geometry"
         );
+    }
+
+    #[test]
+    fn imports_zerofps_cloth_mobility_as_vertex_field() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../appdata/models/Tripo/flag_model.glb");
+        let asset = import_gltf(&fixture).expect("generated flag fixture should import");
+        let mobility = asset
+            .vertex_scalar_fields
+            .get("dynamics.mobility")
+            .expect("flag cloth mobility field");
+
+        assert_eq!(mobility.values.len(), asset.vertices.len());
+        assert!(mobility.values.iter().all(|value| value.is_finite()));
+        assert!(mobility.values.iter().any(|value| *value == 0.0));
+        assert!(mobility.values.iter().any(|value| *value == 1.0));
+        asset
+            .validate()
+            .expect("imported field should be canonical");
     }
 }

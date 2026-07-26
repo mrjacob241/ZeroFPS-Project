@@ -7,6 +7,7 @@
 mod compositor_compile;
 mod compositor_cpu;
 mod compositor_graph;
+mod dynamics;
 mod vulkan_compositor;
 mod vulkan_runtime;
 mod vulkan_viewport;
@@ -30,6 +31,7 @@ use zerofps_core::{
 use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
 
 use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
+use crate::dynamics::{ClothSettings, ClothState, MeshScalarField, PaintMode, WindField, heatmap};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -146,6 +148,45 @@ enum Tool {
     Move,
     Rotate,
     Scale,
+    FieldPaint,
+    TexturePaint,
+}
+
+#[derive(Clone)]
+struct PaintedMask {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    revision: u64,
+}
+
+impl PaintedMask {
+    fn new(size: u32) -> Self {
+        Self {
+            width: size,
+            height: size,
+            pixels: vec![0; (size * size) as usize],
+            revision: 1,
+        }
+    }
+
+    fn texture(&self, heatmap_preview: bool) -> TextureAsset {
+        let mut rgba = Vec::with_capacity(self.pixels.len() * 4);
+        for &value in &self.pixels {
+            if heatmap_preview {
+                let color = heatmap(value as f32 / 255.0, 0.0, 1.0);
+                rgba.extend(color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0) as u8));
+            } else {
+                rgba.extend([value, value, value, 255]);
+            }
+        }
+        TextureAsset {
+            name: "painted-mask".into(),
+            width: self.width,
+            height: self.height,
+            pixels: rgba,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -351,6 +392,47 @@ enum NodeSettings {
         live_update: bool,
     },
     Debug,
+    PaintedMask {
+        object_index: usize,
+    },
+    MassDensity {
+        object_index: usize,
+        base_density: f32,
+        scale: f32,
+        minimum_mass: f32,
+        normalize: bool,
+        total_mass: f32,
+    },
+    SpringMesh {
+        object_index: usize,
+        stiffness: f32,
+        bend_stiffness: f32,
+        damping: f32,
+        iterations: usize,
+    },
+    ForceField {
+        object_index: usize,
+        formulas: [String; 3],
+        scale: f32,
+    },
+    VelocityField {
+        object_index: usize,
+        formulas: [String; 3],
+        scale: f32,
+        blend: f32,
+        mode: usize,
+    },
+    Simulator {
+        object_index: usize,
+        gravity: bool,
+        time_scale: f32,
+    },
+    ObjectTransform {
+        object_index: usize,
+    },
+    ObjectMesh {
+        object_index: usize,
+    },
 }
 
 impl NodeSettings {
@@ -373,6 +455,14 @@ impl NodeSettings {
             Self::ObjectHandle { .. } => 14,
             Self::Time { .. } => 15,
             Self::Debug => 16,
+            Self::ObjectTransform { .. } => 17,
+            Self::ObjectMesh { .. } => 18,
+            Self::PaintedMask { .. } => 19,
+            Self::MassDensity { .. } => 20,
+            Self::SpringMesh { .. } => 21,
+            Self::ForceField { .. } => 22,
+            Self::VelocityField { .. } => 23,
+            Self::Simulator { .. } => 24,
         }
     }
 
@@ -407,7 +497,10 @@ impl NodeSettings {
                 filter: 0,
                 radius: 3.0,
             },
-            8 => return None,
+            8 => Self::Output {
+                object_index: 0,
+                channel: 0,
+            },
             9 => Self::TextureCombine {
                 mode: 0,
                 operation: 2,
@@ -431,6 +524,40 @@ impl NodeSettings {
                 live_update: true,
             },
             16 => Self::Debug,
+            17 | 18 => return None,
+            19 => Self::PaintedMask { object_index: 0 },
+            20 => Self::MassDensity {
+                object_index: 0,
+                base_density: 0.15,
+                scale: 1.0,
+                minimum_mass: 1.0e-6,
+                normalize: false,
+                total_mass: 1.0,
+            },
+            21 => Self::SpringMesh {
+                object_index: 0,
+                stiffness: 0.85,
+                bend_stiffness: 0.25,
+                damping: 0.025,
+                iterations: 7,
+            },
+            22 => Self::ForceField {
+                object_index: 0,
+                formulas: ["0".into(), "sin(t * 2)".into(), "0".into()],
+                scale: 1.0,
+            },
+            23 => Self::VelocityField {
+                object_index: 0,
+                formulas: ["0".into(), "0".into(), "0".into()],
+                scale: 1.0,
+                blend: 1.0,
+                mode: 0,
+            },
+            24 => Self::Simulator {
+                object_index: 0,
+                gravity: true,
+                time_scale: 1.0,
+            },
             _ => return None,
         })
     }
@@ -438,6 +565,7 @@ impl NodeSettings {
 
 struct CompositorNode {
     id: usize,
+    object_index: usize,
     settings: NodeSettings,
     position: Vec2,
 }
@@ -449,6 +577,7 @@ struct PendingCompositorGraph {
 
 #[derive(Clone, Copy)]
 struct PreviewVertex {
+    source_index: usize,
     local_position: [f32; 3],
     local_normal: [f32; 3],
     position: [f32; 3],
@@ -976,6 +1105,33 @@ struct EditorApp {
     compositor_graph_queue: VecDeque<PendingCompositorGraph>,
     compositor_clock_started: Instant,
     compositor_next_time_tick: Instant,
+    dynamics_fields: HashMap<NodeId, MeshScalarField>,
+    dynamics_cloth: HashMap<NodeId, ClothState>,
+    dynamics_enabled: BTreeSet<NodeId>,
+    dynamics_running: bool,
+    dynamics_single_step: bool,
+    dynamics_time: f32,
+    dynamics_accumulator: f32,
+    dynamics_last_tick: Instant,
+    dynamics_wind: WindField,
+    dynamics_settings: ClothSettings,
+    dynamics_pan: Vec2,
+    dynamics_zoom: f32,
+    dynamics_node_positions: [Vec2; 6],
+    dynamics_dragging_node: Option<(usize, Vec2)>,
+    paint_mode: PaintMode,
+    paint_value: f32,
+    paint_strength: f32,
+    paint_radius_pixels: f32,
+    field_undo: Vec<(NodeId, Vec<f32>)>,
+    field_redo: Vec<(NodeId, Vec<f32>)>,
+    field_stroke_before: Option<(NodeId, Vec<f32>)>,
+    painted_masks: HashMap<NodeId, PaintedMask>,
+    texture_paint_undo: Vec<(NodeId, Vec<u8>)>,
+    texture_paint_redo: Vec<(NodeId, Vec<u8>)>,
+    texture_paint_stroke_before: Option<(NodeId, Vec<u8>)>,
+    texture_paint_last_uv: Option<[f32; 2]>,
+    texture_paint_heatmap: bool,
     advanced: bool,
     show_grid: bool,
     grid_spacing: f32,
@@ -1040,15 +1196,8 @@ impl EditorApp {
             compositor_pan: Vec2::ZERO,
             compositor_zoom: 1.0,
             compositor_selected_node: 0,
-            compositor_nodes: vec![CompositorNode {
-                id: 0,
-                settings: NodeSettings::Output {
-                    object_index: 0,
-                    channel: 0,
-                },
-                position: Vec2::new(300.0, 100.0),
-            }],
-            compositor_next_id: 1,
+            compositor_nodes: Vec::new(),
+            compositor_next_id: 0,
             compositor_image_dialog_target: None,
             compositor_links: Vec::new(),
             compositor_dragging_node: None,
@@ -1077,6 +1226,40 @@ impl EditorApp {
             compositor_graph_queue: VecDeque::new(),
             compositor_clock_started: Instant::now(),
             compositor_next_time_tick: Instant::now(),
+            dynamics_fields: HashMap::new(),
+            dynamics_cloth: HashMap::new(),
+            dynamics_enabled: BTreeSet::new(),
+            dynamics_running: false,
+            dynamics_single_step: false,
+            dynamics_time: 0.0,
+            dynamics_accumulator: 0.0,
+            dynamics_last_tick: Instant::now(),
+            dynamics_wind: WindField::default(),
+            dynamics_settings: ClothSettings::default(),
+            dynamics_pan: Vec2::ZERO,
+            dynamics_zoom: 1.0,
+            dynamics_node_positions: [
+                Vec2::new(20.0, 80.0),
+                Vec2::new(20.0, 300.0),
+                Vec2::new(300.0, 80.0),
+                Vec2::new(300.0, 300.0),
+                Vec2::new(590.0, 170.0),
+                Vec2::new(880.0, 170.0),
+            ],
+            dynamics_dragging_node: None,
+            paint_mode: PaintMode::Replace,
+            paint_value: 1.0,
+            paint_strength: 0.5,
+            paint_radius_pixels: 45.0,
+            field_undo: Vec::new(),
+            field_redo: Vec::new(),
+            field_stroke_before: None,
+            painted_masks: HashMap::new(),
+            texture_paint_undo: Vec::new(),
+            texture_paint_redo: Vec::new(),
+            texture_paint_stroke_before: None,
+            texture_paint_last_uv: None,
+            texture_paint_heatmap: true,
             advanced: false,
             show_grid: true,
             grid_spacing: 1.0,
@@ -1146,6 +1329,7 @@ impl EditorApp {
             let path = result.path;
             match result.asset {
                 Ok(asset) => {
+                    let completed_path = path.clone();
                     let triangle_count = asset.triangle_count();
                     let bounds = mesh_bounds(&asset);
                     let (autofixed_mesh, autofix_report) = autofix_mesh(&asset);
@@ -1196,6 +1380,24 @@ impl EditorApp {
                     self.scene_revision = self.scene_revision.wrapping_add(1);
                     if result.add_to_scene {
                         self.add_asset_to_scene(asset_index);
+                    }
+                    let rebuild: Vec<NodeId> = self
+                        .dynamics_enabled
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            self.scene.tree.node(*id).is_ok_and(|node| {
+                                node.components.iter().any(|component| {
+                                    matches!(
+                                        component,
+                                        Component::Model { asset } if asset == &completed_path
+                                    )
+                                })
+                            })
+                        })
+                        .collect();
+                    for id in rebuild {
+                        let _ = self.enable_dynamics_for(id);
                     }
                 }
                 Err(error) => self.logs.push(LogEntry {
@@ -1335,6 +1537,8 @@ impl EditorApp {
                 .iter()
                 .find(|(target, _)| *target == id)
                 .map(|(_, texture)| texture.clone());
+            let deformation = self.dynamics_cloth.get(&id).map(|cloth| &cloth.snapshot);
+            let field = self.dynamics_fields.get(&id);
             for primitive in &asset.primitives {
                 let material = primitive
                     .material
@@ -1343,11 +1547,15 @@ impl EditorApp {
                 let source_base_color = material
                     .map(|material| material.base_color)
                     .unwrap_or([0.42, 0.64, 0.78, 1.0]);
-                let base_color = if compositor_override.is_some() {
-                    [1.0; 4]
-                } else {
-                    source_base_color
-                };
+                let field_preview = self.active_tool == Tool::FieldPaint && field.is_some();
+                let texture_paint_preview =
+                    self.active_tool == Tool::TexturePaint && self.painted_masks.contains_key(&id);
+                let base_color =
+                    if compositor_override.is_some() || field_preview || texture_paint_preview {
+                        [1.0; 4]
+                    } else {
+                        source_base_color
+                    };
                 let source_texture = {
                     material
                         .and_then(|material| material.base_color_texture.as_ref())
@@ -1355,14 +1563,20 @@ impl EditorApp {
                         .cloned()
                         .map(Arc::new)
                 };
-                let texture = match &compositor_override {
-                    Some(TextureOverride::Cpu(texture)) => Some(Arc::clone(texture)),
+                let painted_preview = texture_paint_preview
+                    .then(|| Arc::new(self.painted_masks[&id].texture(self.texture_paint_heatmap)));
+                let texture = match (&compositor_override, field_preview, painted_preview) {
+                    (_, true, _) => None,
+                    (_, false, Some(texture)) => Some(texture),
+                    (Some(TextureOverride::Cpu(texture)), false, None) => Some(Arc::clone(texture)),
                     _ => source_texture.clone(),
                 };
-                let gpu_texture = match &compositor_override {
-                    Some(TextureOverride::Gpu(texture)) => Some(Arc::clone(texture)),
-                    _ => None,
-                };
+                let gpu_texture =
+                    match (&compositor_override, field_preview || texture_paint_preview) {
+                        (_, true) => None,
+                        (Some(TextureOverride::Gpu(texture)), false) => Some(Arc::clone(texture)),
+                        _ => None,
+                    };
                 let transmission = if use_imported_optics {
                     material
                         .and_then(|material| material.transmission)
@@ -1381,6 +1595,7 @@ impl EditorApp {
                 };
                 for triangle in primitive.indices.chunks_exact(3) {
                     let mut vertices = [PreviewVertex {
+                        source_index: 0,
                         local_position: [0.0; 3],
                         local_normal: [0.0, 0.0, 1.0],
                         position: [0.0; 3],
@@ -1389,27 +1604,43 @@ impl EditorApp {
                         color: [1.0; 4],
                     }; 3];
                     for (destination, index) in vertices.iter_mut().zip(triangle) {
-                        let source_vertex = asset.vertices[*index as usize];
-                        let source = source_vertex.position;
+                        let source_index = *index as usize;
+                        let source_vertex = asset.vertices[source_index];
+                        let source = deformation
+                            .and_then(|snapshot| snapshot.positions.get(source_index))
+                            .copied()
+                            .unwrap_or(source_vertex.position);
                         let local = CoreVec3::new(source[0], source[1], source[2]);
                         let world = transform
                             .rotation
                             .rotate(transform.scale.component_mul(local))
                             + transform.translation;
-                        let local_normal = CoreVec3::new(
-                            source_vertex.normal[0],
-                            source_vertex.normal[1],
-                            source_vertex.normal[2],
-                        );
+                        let source_normal = deformation
+                            .and_then(|snapshot| snapshot.normals.get(source_index))
+                            .copied()
+                            .unwrap_or(source_vertex.normal);
+                        let local_normal =
+                            CoreVec3::new(source_normal[0], source_normal[1], source_normal[2]);
                         let world_normal =
                             transform_normal(local_normal, transform.scale, transform.rotation);
                         *destination = PreviewVertex {
+                            source_index,
                             local_position: source,
-                            local_normal: source_vertex.normal,
+                            local_normal: source_normal,
                             position: [world.x, world.y, world.z],
                             normal: [world_normal.x, world_normal.y, world_normal.z],
                             uv: source_vertex.uv,
-                            color: source_vertex.color,
+                            color: if self.active_tool == Tool::FieldPaint {
+                                field
+                                    .and_then(|field| {
+                                        field.values.get(source_index).map(|value| {
+                                            heatmap(*value, field.display_min, field.display_max)
+                                        })
+                                    })
+                                    .unwrap_or(source_vertex.color)
+                            } else {
+                                source_vertex.color
+                            },
                         };
                     }
                     output.push(PreviewTriangle {
@@ -1747,6 +1978,9 @@ impl EditorApp {
                         self.import_asset(false);
                     }
                 }
+                for id in self.dynamics_enabled.clone() {
+                    let _ = self.enable_dynamics_for(id);
+                }
                 self.project_dirty = false;
                 self.project_has_destination = true;
                 self.project_path = path;
@@ -1820,7 +2054,7 @@ impl EditorApp {
                 "editor.workspace",
                 match self.workspace_tab {
                     WorkspaceTab::Scene => "scene",
-                    WorkspaceTab::Compositing => "compositing",
+                    WorkspaceTab::Compositing => "nodes",
                 }
                 .into(),
             ),
@@ -1840,6 +2074,85 @@ impl EditorApp {
             "compositor.selected".into(),
             self.compositor_selected_node.to_string(),
         );
+        project.project.properties.insert(
+            "dynamics.enabled".into(),
+            self.dynamics_enabled
+                .iter()
+                .map(|id| format!("{}:{}", id.slot, id.generation))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        for (key, value) in [
+            (
+                "dynamics.wind.enabled",
+                self.dynamics_wind.enabled.to_string(),
+            ),
+            ("dynamics.wind.x", self.dynamics_wind.velocity.x.to_string()),
+            ("dynamics.wind.y", self.dynamics_wind.velocity.y.to_string()),
+            ("dynamics.wind.z", self.dynamics_wind.velocity.z.to_string()),
+            (
+                "dynamics.wind.gust_strength",
+                self.dynamics_wind.gust_strength.to_string(),
+            ),
+            (
+                "dynamics.wind.gust_frequency",
+                self.dynamics_wind.gust_frequency.to_string(),
+            ),
+            (
+                "dynamics.wind.turbulence",
+                self.dynamics_wind.turbulence.to_string(),
+            ),
+            (
+                "dynamics.cloth.mass",
+                self.dynamics_settings.particle_mass.to_string(),
+            ),
+            (
+                "dynamics.cloth.stretch",
+                self.dynamics_settings.stretch_compliance.to_string(),
+            ),
+            (
+                "dynamics.cloth.bend",
+                self.dynamics_settings.bend_compliance.to_string(),
+            ),
+            (
+                "dynamics.cloth.damping",
+                self.dynamics_settings.damping.to_string(),
+            ),
+            (
+                "dynamics.cloth.iterations",
+                self.dynamics_settings.iterations.to_string(),
+            ),
+        ] {
+            project.project.properties.insert(key.into(), value);
+        }
+        for (id, field) in &self.dynamics_fields {
+            let value = serde_json::json!({
+                "name": field.name,
+                "values": field.values,
+                "default": field.default,
+                "display_min": field.display_min,
+                "display_max": field.display_max,
+            });
+            project.project.properties.insert(
+                format!("dynamics.field.{}.{}", id.slot, id.generation),
+                value.to_string(),
+            );
+        }
+        for (id, mask) in &self.painted_masks {
+            let prefix = format!("texture_paint.{}.{}", id.slot, id.generation);
+            project
+                .project
+                .properties
+                .insert(format!("{prefix}.width"), mask.width.to_string());
+            project
+                .project
+                .properties
+                .insert(format!("{prefix}.height"), mask.height.to_string());
+            project
+                .project
+                .properties
+                .insert(format!("{prefix}.pixels_r8_hex"), encode_hex(&mask.pixels));
+        }
         let referenced: BTreeSet<String> = project
             .scene
             .geometry
@@ -1884,6 +2197,10 @@ impl EditorApp {
             project.project.properties.insert(
                 format!("compositor.node.{id}.x"),
                 node.position.x.to_string(),
+            );
+            project.project.properties.insert(
+                format!("compositor.node.{id}.graph_object"),
+                node.object_index.to_string(),
             );
             project.project.properties.insert(
                 format!("compositor.node.{id}.y"),
@@ -2093,6 +2410,117 @@ impl EditorApp {
                         live_update.to_string(),
                     );
                 }
+                NodeSettings::PaintedMask { object_index }
+                | NodeSettings::ObjectTransform { object_index }
+                | NodeSettings::ObjectMesh { object_index } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.object_index"),
+                        object_index.to_string(),
+                    );
+                }
+                NodeSettings::MassDensity {
+                    object_index,
+                    base_density,
+                    scale,
+                    minimum_mass,
+                    normalize,
+                    total_mass,
+                } => {
+                    for (suffix, value) in [
+                        ("object_index", object_index.to_string()),
+                        ("base_density", base_density.to_string()),
+                        ("scale", scale.to_string()),
+                        ("minimum_mass", minimum_mass.to_string()),
+                        ("normalize", normalize.to_string()),
+                        ("total_mass", total_mass.to_string()),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{suffix}"), value);
+                    }
+                }
+                NodeSettings::SpringMesh {
+                    object_index,
+                    stiffness,
+                    bend_stiffness,
+                    damping,
+                    iterations,
+                } => {
+                    for (suffix, value) in [
+                        ("object_index", object_index.to_string()),
+                        ("stiffness", stiffness.to_string()),
+                        ("bend_stiffness", bend_stiffness.to_string()),
+                        ("damping", damping.to_string()),
+                        ("iterations", iterations.to_string()),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{suffix}"), value);
+                    }
+                }
+                NodeSettings::ForceField {
+                    object_index,
+                    formulas,
+                    scale,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.object_index"),
+                        object_index.to_string(),
+                    );
+                    for (axis, formula) in ["x", "y", "z"].into_iter().zip(formulas) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.force_{axis}"),
+                            formula.clone(),
+                        );
+                    }
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.force_scale"),
+                        scale.to_string(),
+                    );
+                }
+                NodeSettings::VelocityField {
+                    object_index,
+                    formulas,
+                    scale,
+                    blend,
+                    mode,
+                } => {
+                    for (suffix, value) in [
+                        ("object_index", object_index.to_string()),
+                        ("velocity_scale", scale.to_string()),
+                        ("velocity_blend", blend.to_string()),
+                        ("velocity_mode", mode.to_string()),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{suffix}"), value);
+                    }
+                    for (axis, formula) in ["x", "y", "z"].into_iter().zip(formulas) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.velocity_{axis}"),
+                            formula.clone(),
+                        );
+                    }
+                }
+                NodeSettings::Simulator {
+                    object_index,
+                    gravity,
+                    time_scale,
+                } => {
+                    for (suffix, value) in [
+                        ("object_index", object_index.to_string()),
+                        ("simulator_gravity", gravity.to_string()),
+                        ("simulator_time_scale", time_scale.to_string()),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{suffix}"), value);
+                    }
+                }
                 NodeSettings::Debug => {}
             }
         }
@@ -2146,7 +2574,8 @@ impl EditorApp {
         };
         self.workspace_tab = match properties.get("editor.workspace").map(String::as_str) {
             Some("scene") => WorkspaceTab::Scene,
-            Some("compositing") => WorkspaceTab::Compositing,
+            Some("nodes" | "compositing") => WorkspaceTab::Compositing,
+            Some("dynamics") => WorkspaceTab::Compositing,
             _ => self.workspace_tab,
         };
         self.render_device = match properties
@@ -2158,6 +2587,139 @@ impl EditorApp {
             Some("vulkan") => RenderDevice::Vulkan,
             _ => self.render_device,
         };
+        self.dynamics_wind.enabled = properties
+            .get("dynamics.wind.enabled")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(self.dynamics_wind.enabled);
+        self.dynamics_wind.velocity = CoreVec3::new(
+            number("dynamics.wind.x").unwrap_or(self.dynamics_wind.velocity.x),
+            number("dynamics.wind.y").unwrap_or(self.dynamics_wind.velocity.y),
+            number("dynamics.wind.z").unwrap_or(self.dynamics_wind.velocity.z),
+        );
+        self.dynamics_wind.gust_strength =
+            number("dynamics.wind.gust_strength").unwrap_or(self.dynamics_wind.gust_strength);
+        self.dynamics_wind.gust_frequency =
+            number("dynamics.wind.gust_frequency").unwrap_or(self.dynamics_wind.gust_frequency);
+        self.dynamics_wind.turbulence =
+            number("dynamics.wind.turbulence").unwrap_or(self.dynamics_wind.turbulence);
+        self.dynamics_settings.particle_mass =
+            number("dynamics.cloth.mass").unwrap_or(self.dynamics_settings.particle_mass);
+        self.dynamics_settings.stretch_compliance =
+            number("dynamics.cloth.stretch").unwrap_or(self.dynamics_settings.stretch_compliance);
+        self.dynamics_settings.bend_compliance =
+            number("dynamics.cloth.bend").unwrap_or(self.dynamics_settings.bend_compliance);
+        self.dynamics_settings.damping =
+            number("dynamics.cloth.damping").unwrap_or(self.dynamics_settings.damping);
+        self.dynamics_settings.iterations = properties
+            .get("dynamics.cloth.iterations")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(self.dynamics_settings.iterations);
+        self.dynamics_fields.clear();
+        for (key, encoded) in properties {
+            let Some(identity) = key.strip_prefix("dynamics.field.") else {
+                continue;
+            };
+            let Some((slot, generation)) = identity.split_once('.') else {
+                continue;
+            };
+            let (Ok(slot), Ok(generation)) = (slot.parse(), generation.parse()) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(encoded) else {
+                continue;
+            };
+            let Some(values) = value.get("values").and_then(|values| values.as_array()) else {
+                continue;
+            };
+            let values = values
+                .iter()
+                .filter_map(|value| value.as_f64().map(|value| value as f32))
+                .collect::<Vec<_>>();
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                continue;
+            }
+            self.dynamics_fields.insert(
+                NodeId { slot, generation },
+                MeshScalarField {
+                    name: value
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .unwrap_or("dynamics.mobility")
+                        .into(),
+                    values,
+                    default: value
+                        .get("default")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0) as f32,
+                    display_min: value
+                        .get("display_min")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0) as f32,
+                    display_max: value
+                        .get("display_max")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(1.0) as f32,
+                    revision: 1,
+                },
+            );
+        }
+        self.dynamics_enabled = properties
+            .get("dynamics.enabled")
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .filter_map(|identity| {
+                let (slot, generation) = identity.split_once(':')?;
+                Some(NodeId {
+                    slot: slot.parse().ok()?,
+                    generation: generation.parse().ok()?,
+                })
+            })
+            .collect();
+        self.painted_masks.clear();
+        for (key, encoded) in properties {
+            let Some(identity) = key
+                .strip_prefix("texture_paint.")
+                .and_then(|value| value.strip_suffix(".pixels_r8_hex"))
+            else {
+                continue;
+            };
+            let Some((slot, generation)) = identity.split_once('.') else {
+                continue;
+            };
+            let (Ok(slot), Ok(generation)) = (slot.parse(), generation.parse()) else {
+                continue;
+            };
+            let prefix = format!("texture_paint.{slot}.{generation}");
+            let Some(width) = properties
+                .get(&format!("{prefix}.width"))
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| (1..=4096).contains(value))
+            else {
+                continue;
+            };
+            let Some(height) = properties
+                .get(&format!("{prefix}.height"))
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| (1..=4096).contains(value))
+            else {
+                continue;
+            };
+            let Some(pixels) =
+                decode_hex(encoded).filter(|pixels| pixels.len() == (width * height) as usize)
+            else {
+                continue;
+            };
+            self.painted_masks.insert(
+                NodeId { slot, generation },
+                PaintedMask {
+                    width,
+                    height,
+                    pixels,
+                    revision: 1,
+                },
+            );
+        }
+        self.dynamics_cloth.clear();
         let unsigned = |key: &str| {
             properties
                 .get(key)
@@ -2311,26 +2873,110 @@ impl EditorApp {
                             .unwrap_or(true),
                     },
                     16 => NodeSettings::Debug,
+                    17 => NodeSettings::ObjectTransform {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                    },
+                    18 => NodeSettings::ObjectMesh {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                    },
+                    19 => NodeSettings::PaintedMask {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                    },
+                    20 => NodeSettings::MassDensity {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        base_density: properties
+                            .get(&format!("compositor.node.{id}.base_density"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.15),
+                        scale: properties
+                            .get(&format!("compositor.node.{id}.scale"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                        minimum_mass: properties
+                            .get(&format!("compositor.node.{id}.minimum_mass"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0e-6),
+                        normalize: properties
+                            .get(&format!("compositor.node.{id}.normalize"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(false),
+                        total_mass: properties
+                            .get(&format!("compositor.node.{id}.total_mass"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                    },
+                    21 => NodeSettings::SpringMesh {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        stiffness: get_f32(&format!("compositor.node.{id}.stiffness")),
+                        bend_stiffness: get_f32(&format!("compositor.node.{id}.bend_stiffness")),
+                        damping: get_f32(&format!("compositor.node.{id}.damping")),
+                        iterations: get_usize(&format!("compositor.node.{id}.iterations")).max(1),
+                    },
+                    22 => NodeSettings::ForceField {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        formulas: ["x", "y", "z"].map(|axis| {
+                            properties
+                                .get(&format!("compositor.node.{id}.force_{axis}"))
+                                .cloned()
+                                .unwrap_or_else(|| "0".into())
+                        }),
+                        scale: properties
+                            .get(&format!("compositor.node.{id}.force_scale"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                    },
+                    23 => NodeSettings::VelocityField {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        formulas: ["x", "y", "z"].map(|axis| {
+                            properties
+                                .get(&format!("compositor.node.{id}.velocity_{axis}"))
+                                .cloned()
+                                .unwrap_or_else(|| "0".into())
+                        }),
+                        scale: properties
+                            .get(&format!("compositor.node.{id}.velocity_scale"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                        blend: properties
+                            .get(&format!("compositor.node.{id}.velocity_blend"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                        mode: get_usize(&format!("compositor.node.{id}.velocity_mode")),
+                    },
+                    24 => NodeSettings::Simulator {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        gravity: properties
+                            .get(&format!("compositor.node.{id}.simulator_gravity"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(true),
+                        time_scale: properties
+                            .get(&format!("compositor.node.{id}.simulator_time_scale"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                    },
                     _ => continue,
                 };
                 loaded_nodes.push(CompositorNode {
                     id,
+                    object_index: properties
+                        .get(&format!("compositor.node.{id}.graph_object"))
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or_else(|| match &settings {
+                            NodeSettings::ObjectTexture { object_index, .. }
+                            | NodeSettings::Output { object_index, .. }
+                            | NodeSettings::ObjectHandle { object_index, .. }
+                            | NodeSettings::PaintedMask { object_index }
+                            | NodeSettings::MassDensity { object_index, .. }
+                            | NodeSettings::SpringMesh { object_index, .. }
+                            | NodeSettings::ForceField { object_index, .. }
+                            | NodeSettings::VelocityField { object_index, .. }
+                            | NodeSettings::Simulator { object_index, .. }
+                            | NodeSettings::ObjectTransform { object_index }
+                            | NodeSettings::ObjectMesh { object_index } => *object_index,
+                            _ => 0,
+                        }),
                     settings,
                     position: Vec2::new(x, y),
-                });
-            }
-            // Ensure Output node (kind 8) is present
-            if !loaded_nodes
-                .iter()
-                .any(|n| matches!(n.settings, NodeSettings::Output { .. }))
-            {
-                loaded_nodes.push(CompositorNode {
-                    id: 0,
-                    settings: NodeSettings::Output {
-                        object_index: 0,
-                        channel: 0,
-                    },
-                    position: Vec2::new(300.0, 100.0),
                 });
             }
             self.compositor_nodes = loaded_nodes;
@@ -2378,6 +3024,33 @@ impl EditorApp {
             .any(|key| key.starts_with("compositor.link."))
         {
             self.compositor_links = stored_links;
+        }
+        if !properties.keys().any(|key| key.ends_with(".graph_object")) {
+            let legacy_outputs = self
+                .compositor_nodes
+                .iter()
+                .filter_map(|node| match node.settings {
+                    NodeSettings::Output { object_index, .. } => Some((node.id, object_index)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (output_id, object_index) in legacy_outputs {
+                let mut pending = vec![output_id];
+                let mut visited = BTreeSet::new();
+                while let Some(node_id) = pending.pop() {
+                    if !visited.insert(node_id) {
+                        continue;
+                    }
+                    if let Some(node) = self.compositor_nodes.iter_mut().find(|n| n.id == node_id) {
+                        node.object_index = object_index;
+                    }
+                    pending.extend(
+                        self.compositor_links
+                            .iter()
+                            .filter_map(|&(from, _, to, _)| (to == node_id).then_some(from)),
+                    );
+                }
+            }
         }
     }
 
@@ -2525,9 +3198,8 @@ impl EditorApp {
                         }
                     });
                 ui.label("Curve");
-                // Use bezier_editor for Bézier mode; for Polyline fall back to the same widget
                 if points.len() == 4 {
-                    changed |= bezier_editor(ui, points);
+                    changed |= remap_curve_editor(ui, points, *mode == 1);
                 } else {
                     // For non-standard point counts show basic info
                     ui.small(format!("{} control points", points.len()));
@@ -2674,7 +3346,7 @@ impl EditorApp {
                         .map(String::as_str)
                         .unwrap_or("Object unavailable"),
                 );
-                ui.small("Output nodes are created and assigned by the scene.");
+                ui.small("This texture output is assigned to the current object.");
                 let channels = [
                     "Base Color",
                     "Normal",
@@ -2998,6 +3670,273 @@ impl EditorApp {
                     }
                 }
             }
+            17 => {
+                let object_index = self
+                    .compositor_nodes
+                    .iter()
+                    .find_map(|node| match node.settings {
+                        NodeSettings::ObjectTransform { object_index } if node.id == node_id => {
+                            Some(object_index)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if let Some(id) = self.object_node_id(object_index)
+                    && let Ok(node) = self.scene.tree.node(id)
+                {
+                    let transform = node.local_transform();
+                    let euler = transform.rotation.to_euler_xyz();
+                    ui.small(format!(
+                        "Position  {:.3}, {:.3}, {:.3}",
+                        transform.translation.x, transform.translation.y, transform.translation.z
+                    ));
+                    ui.small(format!(
+                        "Rotation  {:.1}°, {:.1}°, {:.1}°",
+                        euler.x.to_degrees(),
+                        euler.y.to_degrees(),
+                        euler.z.to_degrees()
+                    ));
+                    ui.small(format!(
+                        "Scale     {:.3}, {:.3}, {:.3}",
+                        transform.scale.x, transform.scale.y, transform.scale.z
+                    ));
+                }
+                ui.small("Inputs override the object's authored transform.");
+            }
+            18 => {
+                let object_index = self
+                    .compositor_nodes
+                    .iter()
+                    .find_map(|node| match node.settings {
+                        NodeSettings::ObjectMesh { object_index } if node.id == node_id => {
+                            Some(object_index)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                ui.label("Final object geometry");
+                ui.small(
+                    self.object_asset_path(object_index)
+                        .unwrap_or("No mesh asset assigned"),
+                );
+                ui.small("A connected mesh will replace this object's rendered geometry.");
+            }
+            19 => {
+                let object_index = self
+                    .compositor_nodes
+                    .iter()
+                    .find_map(|node| match node.settings {
+                        NodeSettings::PaintedMask { object_index } if node.id == node_id => {
+                            Some(object_index)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if let Some(object) = self.object_node_id(object_index)
+                    && let Some(mask) = self.painted_masks.get(&object)
+                {
+                    ui.label("Scalar painted texture");
+                    ui.monospace(format!("{} × {} · R8", mask.width, mask.height));
+                    ui.small("Output range: 0.0 … 1.0");
+                } else {
+                    ui.weak("No painted texture yet.");
+                }
+                if ui.button("Open Texture Painter").clicked()
+                    && let Some(object) = self.object_node_id(object_index)
+                {
+                    self.scene.selected = Some(object);
+                    self.ensure_painted_texture(object);
+                    self.active_tool = Tool::TexturePaint;
+                    self.workspace_tab = WorkspaceTab::Scene;
+                    self.scene_revision = self.scene_revision.wrapping_add(1);
+                }
+            }
+            20 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::MassDensity {
+                    ref mut base_density,
+                    ref mut scale,
+                    ref mut minimum_mass,
+                    ref mut normalize,
+                    ref mut total_mass,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Surface density (kg/m²)");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(base_density)
+                            .speed(0.01)
+                            .range(0.0..=10_000.0),
+                    )
+                    .changed();
+                ui.label("Texture scale factor");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(scale)
+                            .speed(0.01)
+                            .range(0.0..=10_000.0),
+                    )
+                    .changed();
+                ui.label("Minimum particle mass (kg)");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(minimum_mass)
+                            .speed(0.000_001)
+                            .range(0.000_001..=1.0),
+                    )
+                    .changed();
+                changed |= ui.checkbox(normalize, "Normalize total mass").changed();
+                if *normalize {
+                    ui.label("Total mass (kg)");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(total_mass)
+                                .speed(0.01)
+                                .range(0.000_001..=10_000.0),
+                        )
+                        .changed();
+                }
+                ui.small("Density Texture is sampled at every vertex UV.");
+            }
+            21 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::SpringMesh {
+                    ref mut stiffness,
+                    ref mut bend_stiffness,
+                    ref mut damping,
+                    ref mut iterations,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                changed |= ui
+                    .add(egui::Slider::new(stiffness, 0.0..=1.0).text("Edge stiffness"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(bend_stiffness, 0.0..=1.0).text("Bend stiffness"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(damping, 0.0..=0.2).text("Damping"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(iterations, 1..=16).text("Iterations"))
+                    .changed();
+                ui.small("Triangle edges are springs; second-ring edges resist bending.");
+            }
+            22 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::ForceField {
+                    ref mut formulas,
+                    ref mut scale,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Cartesian force formulas (N)");
+                for (axis, formula) in ["Fx", "Fy", "Fz"].into_iter().zip(formulas.iter_mut()) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(axis);
+                        changed |= ui.text_edit_singleline(formula).changed();
+                    });
+                }
+                changed |= ui
+                    .add(egui::DragValue::new(scale).speed(0.01).prefix("Scale "))
+                    .changed();
+                let valid = formulas
+                    .iter()
+                    .all(|formula| evaluate_force_formula(formula, 0.3, 0.4, 0.5, 0.6).is_ok());
+                if valid {
+                    ui.small("Variables: x, y, z, t · functions: sin, cos, abs, sqrt");
+                } else {
+                    ui.colored_label(Color32::from_rgb(235, 91, 91), "Invalid force formula");
+                }
+            }
+            23 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::VelocityField {
+                    ref mut formulas,
+                    ref mut scale,
+                    ref mut blend,
+                    ref mut mode,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Cartesian velocity formulas (m/s)");
+                for (axis, formula) in ["Vx", "Vy", "Vz"].into_iter().zip(formulas.iter_mut()) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(axis);
+                        changed |= ui.text_edit_singleline(formula).changed();
+                    });
+                }
+                changed |= ui
+                    .add(egui::DragValue::new(scale).speed(0.01).prefix("Scale "))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(blend, 0.0..=1.0).text("Blend"))
+                    .changed();
+                let modes = ["Set", "Add", "Approach"];
+                egui::ComboBox::from_id_salt(("velocity_mode", node_id))
+                    .selected_text(modes[(*mode).min(2)])
+                    .show_ui(ui, |ui| {
+                        for (index, label) in modes.iter().enumerate() {
+                            changed |= ui.selectable_value(mode, index, *label).changed();
+                        }
+                    });
+                if !formulas
+                    .iter()
+                    .all(|formula| evaluate_force_formula(formula, 0.3, 0.4, 0.5, 0.6).is_ok())
+                {
+                    ui.colored_label(Color32::from_rgb(235, 91, 91), "Invalid velocity formula");
+                }
+            }
+            24 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Simulator {
+                    ref mut gravity,
+                    ref mut time_scale,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                changed |= ui.checkbox(gravity, "World gravity").changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(time_scale)
+                            .range(0.0..=4.0)
+                            .speed(0.01)
+                            .prefix("Time scale "),
+                    )
+                    .changed();
+                ui.small("Connect Velocity Field and Force Field, then connect this node to Object Mesh.");
+            }
             _ => {}
         }
         if open_browse {
@@ -3100,6 +4039,7 @@ impl EditorApp {
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         let previous_workspace = self.workspace_tab;
+        let previous_tool = self.active_tool;
         egui::TopBottomPanel::top("top_bar")
             .exact_height(70.0)
             .frame(panel_frame(Color32::from_rgb(25, 27, 34)))
@@ -3265,7 +4205,7 @@ impl EditorApp {
                     ui.selectable_value(
                         &mut self.workspace_tab,
                         WorkspaceTab::Compositing,
-                        "Compositing",
+                        "Nodes",
                     );
                     ui.separator();
                     if self.workspace_tab == WorkspaceTab::Scene {
@@ -3273,11 +4213,58 @@ impl EditorApp {
                         tool_button(ui, &mut self.active_tool, Tool::Move, "W", "Move");
                         tool_button(ui, &mut self.active_tool, Tool::Rotate, "E", "Rotate");
                         tool_button(ui, &mut self.active_tool, Tool::Scale, "R", "Scale");
+                        tool_button(
+                            ui,
+                            &mut self.active_tool,
+                            Tool::FieldPaint,
+                            "P",
+                            "Field Paint",
+                        );
                         ui.separator();
                         ui.toggle_value(&mut self.snap, "⌗ Snap");
                         ui.toggle_value(&mut self.show_grid, "Grid");
-                    } else {
-                        ui.label(RichText::new("Node Graph").weak().small());
+                        ui.separator();
+                        if ui
+                            .button(if self.dynamics_running {
+                                "Ⅱ Simulation"
+                            } else {
+                                "▶ Simulation"
+                            })
+                            .on_hover_text("Run or pause the Scene dynamics graphs")
+                            .clicked()
+                        {
+                            self.dynamics_running = !self.dynamics_running;
+                            self.dynamics_single_step = false;
+                            self.dynamics_accumulator = 0.0;
+                            self.dynamics_last_tick = Instant::now();
+                        }
+                        if ui
+                            .add_enabled(!self.dynamics_running, egui::Button::new("Step"))
+                            .on_hover_text("Advance one fixed 1/60 s simulation step")
+                            .clicked()
+                        {
+                            self.dynamics_single_step = true;
+                        }
+                        if ui.button("Reset Sim").clicked() {
+                            self.dynamics_running = false;
+                            self.dynamics_single_step = false;
+                            self.reset_dynamics();
+                        }
+                        let graph_count = self
+                            .scene
+                            .tree
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| self.spring_graph_nodes(*index).is_some())
+                            .count();
+                        ui.label(
+                            RichText::new(format!("{:.2}s · {graph_count}", self.dynamics_time))
+                                .weak()
+                                .small(),
+                        )
+                        .on_hover_text("Simulation time · executable object graphs");
+                    } else if self.workspace_tab == WorkspaceTab::Compositing {
+                        ui.label(RichText::new("Object Graph").weak().small());
                         if ui.button("Frame All").clicked() {
                             self.compositor_pan = Vec2::ZERO;
                             self.compositor_zoom = 1.0;
@@ -3338,6 +4325,12 @@ impl EditorApp {
             && self.workspace_tab == WorkspaceTab::Scene
         {
             self.apply_compositor();
+        }
+        if previous_tool != self.active_tool {
+            self.scene_revision = self.scene_revision.wrapping_add(1);
+            if previous_tool == Tool::TexturePaint {
+                self.apply_compositor();
+            }
         }
     }
 
@@ -3575,6 +4568,216 @@ impl EditorApp {
                                     }
                                     inherited_property(ui, "Visibility", "Visible", "Environment");
                                     inherited_property(ui, "Layer", "Default", "Project");
+                                });
+                            egui::CollapsingHeader::new(RichText::new("Texture Painting").strong())
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    if model_asset.is_none() {
+                                        ui.weak("Assign a UV-mapped mesh before texture painting.");
+                                        return;
+                                    }
+                                    ui.small("Open painting from a Painted Texture node in Nodes.");
+                                    if let Some(mask) = self.painted_masks.get(&id) {
+                                        ui.small(format!(
+                                            "{} × {} R8 mask · revision {}",
+                                            mask.width, mask.height, mask.revision
+                                        ));
+                                        ui.small("0 = black · 1 = white");
+                                    }
+                                    if self.active_tool == Tool::TexturePaint {
+                                        ui.checkbox(
+                                            &mut self.texture_paint_heatmap,
+                                            "Heatmap preview",
+                                        );
+                                        egui::ComboBox::from_id_salt(("texture_paint_mode", id))
+                                            .selected_text(self.paint_mode.label())
+                                            .show_ui(ui, |ui| {
+                                                for mode in PaintMode::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.paint_mode,
+                                                        mode,
+                                                        mode.label(),
+                                                    );
+                                                }
+                                            });
+                                        ui.add(
+                                            egui::Slider::new(&mut self.paint_value, 0.0..=1.0)
+                                                .text("Value"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(&mut self.paint_strength, 0.0..=1.0)
+                                                .text("Strength"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.paint_radius_pixels,
+                                                4.0..=180.0,
+                                            )
+                                            .text("Radius px"),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.texture_paint_undo.is_empty(),
+                                                    egui::Button::new("Undo stroke"),
+                                                )
+                                                .clicked()
+                                                && let Some((target, before)) =
+                                                    self.texture_paint_undo.pop()
+                                            {
+                                                if let Some(mask) =
+                                                    self.painted_masks.get_mut(&target)
+                                                {
+                                                    self.texture_paint_redo
+                                                        .push((target, mask.pixels.clone()));
+                                                    mask.pixels = before;
+                                                    mask.revision = mask.revision.wrapping_add(1);
+                                                    self.scene_revision =
+                                                        self.scene_revision.wrapping_add(1);
+                                                }
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !self.texture_paint_redo.is_empty(),
+                                                    egui::Button::new("Redo stroke"),
+                                                )
+                                                .clicked()
+                                                && let Some((target, after)) =
+                                                    self.texture_paint_redo.pop()
+                                            {
+                                                if let Some(mask) =
+                                                    self.painted_masks.get_mut(&target)
+                                                {
+                                                    self.texture_paint_undo
+                                                        .push((target, mask.pixels.clone()));
+                                                    mask.pixels = after;
+                                                    mask.revision = mask.revision.wrapping_add(1);
+                                                    self.scene_revision =
+                                                        self.scene_revision.wrapping_add(1);
+                                                }
+                                            }
+                                        });
+                                        if ui.button("Finish Painting and Apply Graph").clicked() {
+                                            self.active_tool = Tool::Select;
+                                            self.scene_revision =
+                                                self.scene_revision.wrapping_add(1);
+                                            self.apply_compositor();
+                                        }
+                                        ui.small("Overlapping UV islands share painted pixels.");
+                                    }
+                                });
+                            egui::CollapsingHeader::new(RichText::new("Dynamics Fields").strong())
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    if model_asset.is_none() {
+                                        ui.weak("Assign a mesh before enabling dynamics.");
+                                        return;
+                                    }
+                                    let mut enabled = self.dynamics_enabled.contains(&id);
+                                    if ui
+                                        .checkbox(&mut enabled, "Enable cloth deformation")
+                                        .changed()
+                                    {
+                                        if enabled {
+                                            if let Err(message) = self.enable_dynamics_for(id) {
+                                                self.logs.push(LogEntry {
+                                                    level: "DYNAMICS",
+                                                    color: Color32::from_rgb(235, 91, 91),
+                                                    message,
+                                                });
+                                            }
+                                        } else {
+                                            self.dynamics_enabled.remove(&id);
+                                            self.dynamics_cloth.remove(&id);
+                                            self.scene_revision =
+                                                self.scene_revision.wrapping_add(1);
+                                            self.project_dirty = true;
+                                        }
+                                    }
+                                    if let Some(field) = self.dynamics_fields.get(&id) {
+                                        ui.separator();
+                                        ui.strong(&field.name);
+                                        ui.small(format!(
+                                            "{} vertex values · revision {}",
+                                            field.values.len(),
+                                            field.revision
+                                        ));
+                                        let minimum = field
+                                            .values
+                                            .iter()
+                                            .copied()
+                                            .fold(f32::INFINITY, f32::min);
+                                        let maximum = field
+                                            .values
+                                            .iter()
+                                            .copied()
+                                            .fold(f32::NEG_INFINITY, f32::max);
+                                        ui.monospace(format!("Range {minimum:.3} … {maximum:.3}"));
+                                        if ui.button("Enter Field Paint mode").clicked() {
+                                            self.active_tool = Tool::FieldPaint;
+                                        }
+                                    }
+                                    if self.active_tool == Tool::FieldPaint {
+                                        ui.separator();
+                                        ui.strong("Brush");
+                                        egui::ComboBox::from_id_salt(("field_paint_mode", id))
+                                            .selected_text(self.paint_mode.label())
+                                            .show_ui(ui, |ui| {
+                                                for mode in PaintMode::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.paint_mode,
+                                                        mode,
+                                                        mode.label(),
+                                                    );
+                                                }
+                                            });
+                                        ui.add(
+                                            egui::Slider::new(&mut self.paint_value, 0.0..=1.0)
+                                                .text("Value"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(&mut self.paint_strength, 0.0..=1.0)
+                                                .text("Strength"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.paint_radius_pixels,
+                                                4.0..=180.0,
+                                            )
+                                            .text("Radius px"),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.field_undo.is_empty(),
+                                                    egui::Button::new("Undo stroke"),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some((target, values)) =
+                                                    self.field_undo.pop()
+                                                {
+                                                    if let Some(field) =
+                                                        self.dynamics_fields.get_mut(&target)
+                                                    {
+                                                        self.field_redo
+                                                            .push((target, field.values.clone()));
+                                                        field.values = values;
+                                                        field.revision =
+                                                            field.revision.wrapping_add(1);
+                                                        if let Some(cloth) =
+                                                            self.dynamics_cloth.get_mut(&target)
+                                                        {
+                                                            cloth.sync_mobility(field);
+                                                        }
+                                                        self.scene_revision =
+                                                            self.scene_revision.wrapping_add(1);
+                                                    }
+                                                }
+                                            }
+                                            ui.small("Red=fixed · green=free");
+                                        });
+                                    }
                                 });
                             egui::CollapsingHeader::new(RichText::new("Material").strong())
                                 .default_open(true)
@@ -3910,13 +5113,53 @@ impl EditorApp {
     }
 
     fn activate_compositor_node(&mut self, kind: usize) {
-        let Some(settings) = NodeSettings::default_for_kind(kind) else {
+        let Some(mut settings) = NodeSettings::default_for_kind(kind) else {
             return;
         };
+        let object_index = self.selected_object_index().unwrap_or(0);
+        match &mut settings {
+            NodeSettings::ObjectTexture {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::PaintedMask {
+                object_index: target,
+            }
+            | NodeSettings::MassDensity {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::SpringMesh {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::ForceField {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::VelocityField {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::Simulator {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::ObjectHandle {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::Output {
+                object_index: target,
+                ..
+            } => *target = object_index,
+            _ => {}
+        }
         let id = self.compositor_next_id;
         self.compositor_next_id += 1;
         self.compositor_nodes.push(CompositorNode {
             id,
+            object_index,
             settings,
             position: Vec2::ZERO,
         });
@@ -3930,14 +5173,23 @@ impl EditorApp {
 
     fn sync_compositor_outputs(&mut self) {
         let object_count = self.scene.tree.iter().count();
-        let mut seen = BTreeSet::new();
+        let mut seen_transform = BTreeSet::new();
+        let mut seen_mesh = BTreeSet::new();
         let removed_ids: BTreeSet<usize> = self
             .compositor_nodes
             .iter()
             .filter_map(|node| match node.settings {
-                NodeSettings::Output { object_index, .. }
-                    if object_index >= object_count || !seen.insert(object_index) =>
+                NodeSettings::ObjectTransform { object_index }
+                    if object_index >= object_count || !seen_transform.insert(object_index) =>
                 {
+                    Some(node.id)
+                }
+                NodeSettings::ObjectMesh { object_index }
+                    if object_index >= object_count || !seen_mesh.insert(object_index) =>
+                {
+                    Some(node.id)
+                }
+                NodeSettings::Output { object_index, .. } if object_index >= object_count => {
                     Some(node.id)
                 }
                 _ => None,
@@ -3952,20 +5204,26 @@ impl EditorApp {
         }
 
         for object_index in 0..object_count {
-            if seen.contains(&object_index) {
-                continue;
-            }
-            let id = self.compositor_next_id;
-            self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
-            self.compositor_nodes.push(CompositorNode {
-                id,
-                settings: NodeSettings::Output {
+            if !seen_transform.contains(&object_index) {
+                let id = self.compositor_next_id;
+                self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+                self.compositor_nodes.push(CompositorNode {
+                    id,
                     object_index,
-                    channel: 0,
-                },
-                position: Vec2::new(360.0, 80.0 + object_index as f32 * 250.0),
-            });
-            seen.insert(object_index);
+                    settings: NodeSettings::ObjectTransform { object_index },
+                    position: Vec2::new(80.0, 80.0),
+                });
+            }
+            if !seen_mesh.contains(&object_index) {
+                let id = self.compositor_next_id;
+                self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+                self.compositor_nodes.push(CompositorNode {
+                    id,
+                    object_index,
+                    settings: NodeSettings::ObjectMesh { object_index },
+                    position: Vec2::new(420.0, 80.0),
+                });
+            }
         }
         if !self
             .compositor_nodes
@@ -4029,6 +5287,15 @@ impl EditorApp {
 
     fn object_node_id(&self, object_index: usize) -> Option<NodeId> {
         self.scene.tree.iter().nth(object_index).map(|(id, _)| id)
+    }
+
+    fn selected_object_index(&self) -> Option<usize> {
+        let selected = self.scene.selected?;
+        self.scene
+            .tree
+            .iter()
+            .enumerate()
+            .find_map(|(index, (id, _))| (id == selected).then_some(index))
     }
 
     fn projected_object_extent(&self, object_index: usize) -> Option<f32> {
@@ -4176,6 +5443,17 @@ impl EditorApp {
                     .cloned()
                     .map(Arc::new)
                     .ok_or_else(|| format!("texture `{texture_name}` is unavailable"))?;
+                Ok(resize_texture_for_lod(&source, fallback_lod))
+            }
+            NodeSettings::PaintedMask { object_index } => {
+                let object = self
+                    .object_node_id(object_index)
+                    .ok_or("Painted Texture object is unavailable")?;
+                let source = self
+                    .painted_masks
+                    .get(&object)
+                    .map(|mask| Arc::new(mask.texture(false)))
+                    .ok_or("Object has no painted texture")?;
                 Ok(resize_texture_for_lod(&source, fallback_lod))
             }
             NodeSettings::ImageAsset { path } => {
@@ -4342,6 +5620,16 @@ impl EditorApp {
             NodeSettings::Debug => {
                 let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
                 self.evaluate_compositor_node(from_id, from_out, visiting)
+            }
+            NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. } => {
+                Err("object output nodes cannot be evaluated as textures".into())
+            }
+            NodeSettings::MassDensity { .. }
+            | NodeSettings::SpringMesh { .. }
+            | NodeSettings::ForceField { .. }
+            | NodeSettings::VelocityField { .. }
+            | NodeSettings::Simulator { .. } => {
+                Err("particle dynamics nodes cannot be evaluated as textures".into())
             }
         };
         visiting.remove(&(node_id, output));
@@ -4621,11 +5909,778 @@ impl EditorApp {
         }
     }
 
+    fn enable_dynamics_for(&mut self, id: NodeId) -> Result<(), String> {
+        let path = self
+            .scene
+            .tree
+            .node(id)
+            .ok()
+            .and_then(|node| {
+                node.components
+                    .iter()
+                    .find_map(|component| match component {
+                        Component::Model { asset } => Some(asset.as_str()),
+                        _ => None,
+                    })
+            })
+            .ok_or_else(|| "Selected object has no mesh".to_owned())?;
+        let mesh = self
+            .imported_assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .map(|asset| &asset.mesh)
+            .ok_or_else(|| "Selected mesh asset is not loaded".to_owned())?;
+        let field = self
+            .dynamics_fields
+            .entry(id)
+            .or_insert_with(|| MeshScalarField::mobility_for_mesh(mesh))
+            .clone();
+        self.dynamics_cloth.insert(
+            id,
+            ClothState::new(mesh, &field, self.dynamics_settings.clone()),
+        );
+        self.dynamics_enabled.insert(id);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+        Ok(())
+    }
+
+    fn tick_dynamics(&mut self, ctx: &egui::Context) {
+        let graph_objects = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .filter_map(|(object_index, (id, _))| self.spring_graph_nodes(object_index).map(|_| id))
+            .collect::<Vec<_>>();
+        for id in graph_objects {
+            if !self.dynamics_enabled.contains(&id) {
+                let _ = self.enable_dynamics_for(id);
+            }
+        }
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.dynamics_last_tick)
+            .as_secs_f32()
+            .min(0.1);
+        self.dynamics_last_tick = now;
+        if (!self.dynamics_running && !self.dynamics_single_step)
+            || self.dynamics_enabled.is_empty()
+        {
+            return;
+        }
+        let dt = 1.0 / 60.0;
+        if self.dynamics_single_step {
+            self.dynamics_accumulator = dt;
+        } else {
+            self.dynamics_accumulator += elapsed;
+        }
+        let mut stepped = false;
+        while self.dynamics_accumulator >= dt {
+            self.dynamics_accumulator -= dt;
+            self.dynamics_time += dt;
+            for id in self.dynamics_enabled.clone() {
+                let node_dynamics = self.node_particle_dynamics(id);
+                if let (Some(field), Some(cloth)) = (
+                    self.dynamics_fields.get(&id),
+                    self.dynamics_cloth.get_mut(&id),
+                ) {
+                    if let Some((
+                        masses,
+                        settings,
+                        forces,
+                        velocities,
+                        velocity_blend,
+                        velocity_mode,
+                        gravity,
+                        time_scale,
+                    )) = node_dynamics
+                    {
+                        cloth.settings = settings;
+                        cloth.sync_particle_masses(field, &masses);
+                        let simulation_dt = dt * time_scale.clamp(0.0, 4.0);
+                        if simulation_dt > f32::EPSILON {
+                            if let Some(velocities) = velocities.as_deref() {
+                                cloth.apply_velocity_field(
+                                    simulation_dt,
+                                    velocities,
+                                    velocity_blend,
+                                    velocity_mode,
+                                );
+                            }
+                            cloth.step_with_fields(
+                                simulation_dt,
+                                self.dynamics_time * time_scale,
+                                &self.dynamics_wind,
+                                forces.as_deref(),
+                                gravity,
+                            );
+                        }
+                    } else {
+                        cloth.settings = self.dynamics_settings.clone();
+                        cloth.sync_mobility(field);
+                        cloth.step(dt, self.dynamics_time, &self.dynamics_wind);
+                    }
+                    stepped = true;
+                }
+            }
+        }
+        self.dynamics_single_step = false;
+        if stepped {
+            self.scene_revision = self.scene_revision.wrapping_add(1);
+            ctx.request_repaint();
+        }
+        ctx.request_repaint_after(Duration::from_millis(8));
+    }
+
+    fn spring_graph_nodes(
+        &self,
+        object_index: usize,
+    ) -> Option<(usize, usize, Option<usize>, Option<usize>, Option<usize>)> {
+        let spring = self.compositor_nodes.iter().find(|node| {
+            node.object_index == object_index
+                && matches!(node.settings, NodeSettings::SpringMesh { .. })
+        })?;
+        let output = self.compositor_nodes.iter().find(|node| {
+            node.object_index == object_index
+                && matches!(node.settings, NodeSettings::ObjectMesh { .. })
+        })?;
+        let has_simulator_output = self.compositor_nodes.iter().any(|node| {
+            node.object_index == object_index
+                && matches!(node.settings, NodeSettings::Simulator { .. })
+                && self
+                    .compositor_links
+                    .iter()
+                    .any(|&(from, _, to, input)| from == node.id && to == output.id && input == 0)
+        });
+        if !has_simulator_output
+            && self
+                .compositor_links
+                .iter()
+                .any(|&(from, _, to, input)| from == spring.id && to == output.id && input == 0)
+        {
+            return Some((spring.id, output.id, None, None, None));
+        }
+        if let Some(simulator) = self.compositor_nodes.iter().find(|node| {
+            node.object_index == object_index
+                && matches!(node.settings, NodeSettings::Simulator { .. })
+                && self
+                    .compositor_links
+                    .iter()
+                    .any(|&(from, _, to, input)| from == node.id && to == output.id && input == 0)
+        }) {
+            let velocity_id = self
+                .compositor_links
+                .iter()
+                .find_map(|&(from, _, to, input)| {
+                    (to == simulator.id && input == 0).then_some(from)
+                })?;
+            let force_id = self
+                .compositor_links
+                .iter()
+                .find_map(|&(from, _, to, input)| {
+                    (to == simulator.id && input == 1).then_some(from)
+                })?;
+            let velocity_ok = self.compositor_nodes.iter().any(|node| {
+                node.id == velocity_id
+                    && matches!(node.settings, NodeSettings::VelocityField { .. })
+            });
+            let force_ok = self.compositor_nodes.iter().any(|node| {
+                node.id == force_id && matches!(node.settings, NodeSettings::ForceField { .. })
+            });
+            let force_inputs_ok = [0, 1, 2].into_iter().all(|input| {
+                self.compositor_links
+                    .iter()
+                    .any(|&(from, _, to, target_input)| {
+                        to == force_id && target_input == input && (input != 2 || from == spring.id)
+                    })
+            });
+            let velocity_input_ok = self
+                .compositor_links
+                .iter()
+                .any(|&(_, _, to, input)| to == velocity_id && input == 0);
+            if velocity_ok && force_ok && force_inputs_ok && velocity_input_ok {
+                return Some((
+                    spring.id,
+                    output.id,
+                    Some(force_id),
+                    Some(velocity_id),
+                    Some(simulator.id),
+                ));
+            }
+        }
+        let force =
+            self.compositor_nodes.iter().find(|node| {
+                node.object_index == object_index
+                    && matches!(node.settings, NodeSettings::ForceField { .. })
+                    && self.compositor_links.iter().any(|&(from, _, to, input)| {
+                        from == node.id && to == output.id && input == 0
+                    })
+                    && self.compositor_links.iter().any(|&(from, _, to, input)| {
+                        from == spring.id && to == node.id && input == 2
+                    })
+                    && self
+                        .compositor_links
+                        .iter()
+                        .any(|&(_, _, to, input)| to == node.id && input == 0)
+                    && self
+                        .compositor_links
+                        .iter()
+                        .any(|&(_, _, to, input)| to == node.id && input == 1)
+            })?;
+        Some((spring.id, output.id, Some(force.id), None, None))
+    }
+
+    fn node_particle_dynamics(
+        &self,
+        id: NodeId,
+    ) -> Option<(
+        Vec<f32>,
+        ClothSettings,
+        Option<Vec<CoreVec3>>,
+        Option<Vec<CoreVec3>>,
+        f32,
+        usize,
+        bool,
+        f32,
+    )> {
+        let object_index = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .find_map(|(index, (candidate, _))| (candidate == id).then_some(index))?;
+        let (spring_id, _, force_id, velocity_id, simulator_id) =
+            self.spring_graph_nodes(object_index)?;
+        let mass_id = self
+            .compositor_links
+            .iter()
+            .find_map(|&(from, _, to, input)| {
+                (to == force_id.unwrap_or(spring_id)
+                    && input == if force_id.is_some() { 1 } else { 0 })
+                .then_some(from)
+            })?;
+        let mass_node = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == mass_id)?;
+        let NodeSettings::MassDensity {
+            base_density,
+            scale,
+            minimum_mass,
+            normalize,
+            total_mass,
+            ..
+        } = mass_node.settings
+        else {
+            return None;
+        };
+        let texture_id = self
+            .compositor_links
+            .iter()
+            .find_map(|&(from, _, to, input)| (to == mass_id && input == 0).then_some(from))?;
+        let texture_node = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == texture_id)?;
+        let NodeSettings::PaintedMask {
+            object_index: texture_object,
+        } = texture_node.settings
+        else {
+            return None;
+        };
+        let mask_object = self.object_node_id(texture_object)?;
+        let mask = self.painted_masks.get(&mask_object)?;
+        let path = self.object_asset_path(object_index)?;
+        let mesh = self
+            .imported_assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .map(|asset| &asset.mesh)?;
+        let transform = self.scene.tree.node(id).ok()?.global_transform();
+        let masses = area_weighted_particle_masses(
+            mesh,
+            mask,
+            transform.scale,
+            base_density,
+            scale,
+            minimum_mass,
+            normalize,
+            total_mass,
+        );
+        let spring_node = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == spring_id)?;
+        let NodeSettings::SpringMesh {
+            stiffness,
+            bend_stiffness,
+            damping,
+            iterations,
+            ..
+        } = spring_node.settings
+        else {
+            return None;
+        };
+        let mut settings = self.dynamics_settings.clone();
+        settings.stretch_compliance = 10.0_f32.powf(-2.0 - 5.0 * stiffness.clamp(0.0, 1.0));
+        settings.bend_compliance = 10.0_f32.powf(-1.0 - 4.0 * bend_stiffness.clamp(0.0, 1.0));
+        settings.damping = damping.clamp(0.0, 0.2);
+        settings.iterations = iterations.clamp(1, 16);
+        let forces = force_id.and_then(|force_id| {
+            let force_node = self
+                .compositor_nodes
+                .iter()
+                .find(|node| node.id == force_id)?;
+            let NodeSettings::ForceField {
+                ref formulas,
+                scale,
+                ..
+            } = force_node.settings
+            else {
+                return None;
+            };
+            let strength_id = self
+                .compositor_links
+                .iter()
+                .find_map(|&(from, _, to, input)| (to == force_id && input == 0).then_some(from))?;
+            let strength_node = self
+                .compositor_nodes
+                .iter()
+                .find(|node| node.id == strength_id)?;
+            let NodeSettings::PaintedMask {
+                object_index: strength_object,
+            } = strength_node.settings
+            else {
+                return None;
+            };
+            let strength_mask = self
+                .painted_masks
+                .get(&self.object_node_id(strength_object)?)?;
+            Some(
+                mesh.vertices
+                    .iter()
+                    .map(|vertex| {
+                        let strength = sample_painted_mask(strength_mask, vertex.uv);
+                        CoreVec3::new(
+                            evaluate_force_formula(
+                                &formulas[0],
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
+                                self.dynamics_time,
+                            )
+                            .unwrap_or(0.0),
+                            evaluate_force_formula(
+                                &formulas[1],
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
+                                self.dynamics_time,
+                            )
+                            .unwrap_or(0.0),
+                            evaluate_force_formula(
+                                &formulas[2],
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
+                                self.dynamics_time,
+                            )
+                            .unwrap_or(0.0),
+                        ) * (scale * strength)
+                    })
+                    .collect(),
+            )
+        });
+        let (velocities, velocity_blend, velocity_mode) = velocity_id
+            .and_then(|velocity_id| {
+                let node = self
+                    .compositor_nodes
+                    .iter()
+                    .find(|node| node.id == velocity_id)?;
+                let NodeSettings::VelocityField {
+                    ref formulas,
+                    scale,
+                    blend,
+                    mode,
+                    ..
+                } = node.settings
+                else {
+                    return None;
+                };
+                let strength_id =
+                    self.compositor_links
+                        .iter()
+                        .find_map(|&(from, _, to, input)| {
+                            (to == velocity_id && input == 0).then_some(from)
+                        })?;
+                let strength_object =
+                    self.compositor_nodes
+                        .iter()
+                        .find_map(|node| match node.settings {
+                            NodeSettings::PaintedMask { object_index }
+                                if node.id == strength_id =>
+                            {
+                                Some(object_index)
+                            }
+                            _ => None,
+                        })?;
+                let strength_mask = self
+                    .painted_masks
+                    .get(&self.object_node_id(strength_object)?)?;
+                let values = mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| {
+                        let strength = sample_painted_mask(strength_mask, vertex.uv);
+                        CoreVec3::new(
+                            evaluate_force_formula(
+                                &formulas[0],
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
+                                self.dynamics_time,
+                            )
+                            .unwrap_or(0.0),
+                            evaluate_force_formula(
+                                &formulas[1],
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
+                                self.dynamics_time,
+                            )
+                            .unwrap_or(0.0),
+                            evaluate_force_formula(
+                                &formulas[2],
+                                vertex.position[0],
+                                vertex.position[1],
+                                vertex.position[2],
+                                self.dynamics_time,
+                            )
+                            .unwrap_or(0.0),
+                        ) * (scale * strength)
+                    })
+                    .collect();
+                Some((Some(values), blend.clamp(0.0, 1.0), mode.min(2)))
+            })
+            .unwrap_or((None, 1.0, 0));
+        let (gravity, time_scale) = simulator_id
+            .and_then(|simulator_id| {
+                self.compositor_nodes
+                    .iter()
+                    .find_map(|node| match node.settings {
+                        NodeSettings::Simulator {
+                            gravity,
+                            time_scale,
+                            ..
+                        } if node.id == simulator_id => Some((gravity, time_scale)),
+                        _ => None,
+                    })
+            })
+            .unwrap_or((true, 1.0));
+        Some((
+            masses,
+            settings,
+            forces,
+            velocities,
+            velocity_blend,
+            velocity_mode,
+            gravity,
+            time_scale,
+        ))
+    }
+
+    fn reset_dynamics(&mut self) {
+        self.dynamics_time = 0.0;
+        self.dynamics_accumulator = 0.0;
+        for cloth in self.dynamics_cloth.values_mut() {
+            cloth.reset();
+        }
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    fn paint_selected_field(&mut self, pointer: Pos2, viewport: Rect) {
+        let Some(id) = self.scene.selected else {
+            return;
+        };
+        let Some(presented) = self.presented_view.as_ref() else {
+            return;
+        };
+        let center = viewport.center();
+        let projection_scale = viewport.width().min(viewport.height()) * 0.18 * self.camera_zoom;
+        let mut affected = HashMap::<usize, f32>::new();
+        for triangle in presented.triangles.iter() {
+            if triangle.object_id != id {
+                continue;
+            }
+            for vertex in &triangle.vertices {
+                let Some(screen) = project(
+                    vertex.position,
+                    center,
+                    projection_scale,
+                    self.camera_yaw,
+                    self.camera_pitch,
+                    self.camera_target,
+                    self.projection_mode,
+                    self.grid_spacing,
+                ) else {
+                    continue;
+                };
+                let distance = screen.distance(pointer);
+                if distance <= self.paint_radius_pixels {
+                    let normalized = distance / self.paint_radius_pixels.max(1.0);
+                    let influence = 1.0 - normalized * normalized * (3.0 - 2.0 * normalized);
+                    affected
+                        .entry(vertex.source_index)
+                        .and_modify(|current| *current = current.max(influence))
+                        .or_insert(influence);
+                }
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+        let Some(field) = self.dynamics_fields.get_mut(&id) else {
+            return;
+        };
+        field.paint(
+            affected,
+            self.paint_value,
+            self.paint_strength,
+            self.paint_mode,
+        );
+        if let Some(cloth) = self.dynamics_cloth.get_mut(&id) {
+            cloth.sync_mobility(field);
+        }
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+    }
+
+    fn ensure_painted_texture(&mut self, id: NodeId) {
+        self.painted_masks
+            .entry(id)
+            .or_insert_with(|| PaintedMask::new(512));
+        let Some(object_index) = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .find_map(|(index, (candidate, _))| (candidate == id).then_some(index))
+        else {
+            return;
+        };
+        if self.compositor_nodes.iter().any(|node| {
+            node.object_index == object_index
+                && matches!(node.settings, NodeSettings::PaintedMask { .. })
+        }) {
+            return;
+        }
+        let node_id = self.compositor_next_id;
+        self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+        self.compositor_nodes.push(CompositorNode {
+            id: node_id,
+            object_index,
+            settings: NodeSettings::PaintedMask { object_index },
+            position: Vec2::new(80.0, 330.0),
+        });
+        self.project_dirty = true;
+    }
+
+    fn paint_selected_texture(&mut self, pointer: Pos2, viewport: Rect) {
+        let Some(id) = self.scene.selected else {
+            return;
+        };
+        let Some(presented) = self.presented_view.as_ref() else {
+            return;
+        };
+        let center = viewport.center();
+        let projection_scale = viewport.width().min(viewport.height()) * 0.18 * self.camera_zoom;
+        let (right, up, forward) = camera_basis(self.camera_yaw, self.camera_pitch);
+        let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * self.grid_spacing.max(1.0e-4);
+        let camera_origin = self.camera_target - forward * camera_distance;
+        let screen_x = (pointer.x - center.x) / projection_scale;
+        let screen_y = -(pointer.y - center.y) / projection_scale;
+        let (ray_origin, ray_direction) = match self.projection_mode {
+            ProjectionMode::Perspective => (
+                camera_origin,
+                (forward
+                    + right * (screen_x / camera_distance)
+                    + up * (screen_y / camera_distance))
+                    .normalized(),
+            ),
+            ProjectionMode::Orthographic => (
+                self.camera_target + right * screen_x + up * screen_y - forward * camera_distance,
+                forward,
+            ),
+        };
+        let mut hit: Option<([f32; 2], f32)> = None;
+        for triangle in presented
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.object_id == id)
+        {
+            let points = triangle.vertices.map(|vertex| {
+                CoreVec3::new(vertex.position[0], vertex.position[1], vertex.position[2])
+            });
+            let Some((distance, weights)) = ray_triangle_hit(ray_origin, ray_direction, points)
+            else {
+                continue;
+            };
+            let uv = [
+                (0..3)
+                    .map(|index| triangle.vertices[index].uv[0] * weights[index])
+                    .sum(),
+                (0..3)
+                    .map(|index| triangle.vertices[index].uv[1] * weights[index])
+                    .sum(),
+            ];
+            if hit.map_or(true, |(_, best_distance)| distance < best_distance) {
+                hit = Some((uv, distance));
+            }
+        }
+        let Some((uv, _)) = hit else {
+            return;
+        };
+        let Some(mask) = self.painted_masks.get_mut(&id) else {
+            return;
+        };
+        let radius = (self.paint_radius_pixels / viewport.width().min(viewport.height()).max(1.0)
+            * mask.width.max(mask.height) as f32
+            * 2.0)
+            .clamp(1.0, mask.width.max(mask.height) as f32 * 0.25);
+        let previous = self.texture_paint_last_uv.replace(uv);
+        let interpolation_steps = previous
+            .filter(|previous| {
+                (previous[0] - uv[0]).abs() <= 0.5 && (previous[1] - uv[1]).abs() <= 0.5
+            })
+            .map(|previous| {
+                let delta = Vec2::new(
+                    (uv[0] - previous[0]) * mask.width as f32,
+                    (uv[1] - previous[1]) * mask.height as f32,
+                );
+                (delta.length() / (radius * 0.35).max(1.0)).ceil() as usize
+            })
+            .unwrap_or(1)
+            .clamp(1, 128);
+        let target = (self.paint_value.clamp(0.0, 1.0) * 255.0).round();
+        let smooth_source = (self.paint_mode == PaintMode::Smooth).then(|| mask.pixels.clone());
+        let mut changed = false;
+        for step in 1..=interpolation_steps {
+            let amount_along = step as f32 / interpolation_steps as f32;
+            let sample_uv = previous
+                .map(|previous| {
+                    [
+                        previous[0] + (uv[0] - previous[0]) * amount_along,
+                        previous[1] + (uv[1] - previous[1]) * amount_along,
+                    ]
+                })
+                .unwrap_or(uv);
+            let center_x = sample_uv[0].rem_euclid(1.0) * mask.width as f32;
+            let center_y = sample_uv[1].rem_euclid(1.0) * mask.height as f32;
+            let minimum_x = (center_x - radius).floor().max(0.0) as u32;
+            let maximum_x = (center_x + radius).ceil().min(mask.width as f32 - 1.0) as u32;
+            let minimum_y = (center_y - radius).floor().max(0.0) as u32;
+            let maximum_y = (center_y + radius).ceil().min(mask.height as f32 - 1.0) as u32;
+            for y in minimum_y..=maximum_y {
+                for x in minimum_x..=maximum_x {
+                    let distance = Vec2::new(x as f32 - center_x, y as f32 - center_y).length();
+                    if distance > radius {
+                        continue;
+                    }
+                    let falloff = 1.0 - (distance / radius).powi(2);
+                    let amount = (falloff * self.paint_strength).clamp(0.0, 1.0);
+                    let index = (y * mask.width + x) as usize;
+                    let current = mask.pixels[index] as f32;
+                    let next = match self.paint_mode {
+                        PaintMode::Replace => current + (target - current) * amount,
+                        PaintMode::Add => current + target * amount,
+                        PaintMode::Subtract => current - target * amount,
+                        PaintMode::Erase => {
+                            if amount > 0.01 {
+                                0.0
+                            } else {
+                                current
+                            }
+                        }
+                        PaintMode::Smooth => {
+                            let source = smooth_source.as_ref().expect("smooth snapshot exists");
+                            let mut sum = 0u32;
+                            let mut samples = 0u32;
+                            for sample_y in y.saturating_sub(1)..=(y + 1).min(mask.height - 1) {
+                                for sample_x in x.saturating_sub(1)..=(x + 1).min(mask.width - 1) {
+                                    sum +=
+                                        source[(sample_y * mask.width + sample_x) as usize] as u32;
+                                    samples += 1;
+                                }
+                            }
+                            let average = sum as f32 / samples.max(1) as f32;
+                            current + (average - current) * amount
+                        }
+                    }
+                    .clamp(0.0, 255.0)
+                    .round() as u8;
+                    changed |= next != mask.pixels[index];
+                    mask.pixels[index] = next;
+                }
+            }
+        }
+        if changed {
+            mask.revision = mask.revision.wrapping_add(1);
+            self.scene_revision = self.scene_revision.wrapping_add(1);
+            self.texture_revision = self.texture_revision.wrapping_add(1);
+            self.compositor_eval_cache.clear();
+            self.compositor_gpu_cache.clear();
+            self.project_dirty = true;
+        }
+    }
+
     fn compositing_workspace(&mut self, ctx: &egui::Context) {
+        let Some(object_index) = self.selected_object_index() else {
+            egui::CentralPanel::default()
+                .frame(panel_frame(Color32::from_rgb(18, 20, 26)))
+                .show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Select an object in Scene to edit its node graph.");
+                    });
+                });
+            return;
+        };
+        let object_choices = self
+            .scene
+            .tree
+            .iter()
+            .map(|(id, node)| (id, node.name.clone()))
+            .collect::<Vec<_>>();
+        let visible_ids: BTreeSet<usize> = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| (node.object_index == object_index).then_some(node.id))
+            .collect();
+        if !visible_ids.contains(&self.compositor_selected_node) {
+            self.compositor_selected_node = self
+                .compositor_nodes
+                .iter()
+                .find(|node| {
+                    node.object_index == object_index
+                        && matches!(node.settings, NodeSettings::ObjectMesh { .. })
+                })
+                .or_else(|| {
+                    self.compositor_nodes
+                        .iter()
+                        .find(|node| node.object_index == object_index)
+                })
+                .map(|node| node.id)
+                .unwrap_or(0);
+            self.compositor_pending_output = None;
+            self.compositor_dragging_node = None;
+        }
         let debug_nodes: BTreeSet<usize> = self
             .compositor_nodes
             .iter()
-            .filter_map(|node| matches!(node.settings, NodeSettings::Debug).then_some(node.id))
+            .filter_map(|node| {
+                (node.object_index == object_index && matches!(node.settings, NodeSettings::Debug))
+                    .then_some(node.id)
+            })
             .collect();
         self.compositor_debug_textures
             .retain(|node, _| debug_nodes.contains(node));
@@ -4634,11 +6689,25 @@ impl EditorApp {
             .frame(panel_frame(Color32::from_rgb(18, 20, 26)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Compositing");
+                    let object_name = self
+                        .scene
+                        .tree
+                        .iter()
+                        .nth(object_index)
+                        .map(|(_, node)| node.name.clone())
+                        .unwrap_or_else(|| "Object".into());
+                    ui.strong(format!("Nodes — {object_name}"));
+                    egui::ComboBox::from_id_salt("node_workspace_object")
+                        .selected_text(&object_name)
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &object_choices {
+                                ui.selectable_value(&mut self.scene.selected, Some(*id), name);
+                            }
+                        });
                     ui.separator();
                     ui.menu_button("Add", |ui| {
                         ui.menu_button("Input", |ui| {
-                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time")] {
+                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time"), (19, "Painted Texture")] {
                                 if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
@@ -4663,25 +6732,49 @@ impl EditorApp {
                                 self.activate_compositor_node(7);
                             }
                         });
+                        ui.menu_button("Dynamics", |ui| {
+                            if compositor_add_button(ui, true, "Mass Density") {
+                                self.activate_compositor_node(20);
+                            }
+                            if compositor_add_button(ui, true, "Spring Mesh") {
+                                self.activate_compositor_node(21);
+                            }
+                            if compositor_add_button(ui, true, "Force Field") {
+                                self.activate_compositor_node(22);
+                            }
+                            if compositor_add_button(ui, true, "Velocity Field") {
+                                self.activate_compositor_node(23);
+                            }
+                            if compositor_add_button(ui, true, "Simulator") {
+                                self.activate_compositor_node(24);
+                            }
+                        });
                         ui.menu_button("Utility", |ui| {
                             if compositor_add_button(ui, true, "Debug Preview") {
                                 self.activate_compositor_node(16);
                             }
                         });
+                        ui.menu_button("Output", |ui| {
+                            if compositor_add_button(ui, true, "Object Texture") {
+                                self.activate_compositor_node(8);
+                            }
+                            ui.add_enabled(false, egui::Button::new("Object Transform"));
+                            ui.add_enabled(false, egui::Button::new("Object Mesh"));
+                        });
                         ui.separator();
                         ui.add_enabled(
                             false,
-                            egui::Button::new("Outputs (one per scene object)"),
+                            egui::Button::new("Output targets selected object"),
                         );
                     });
                     ui.menu_button("Node", |ui| {
                         let sel = self.compositor_selected_node;
-                        let can_remove = !self.compositor_nodes.iter().any(|n| n.id == sel && matches!(n.settings, NodeSettings::Output { .. }));
+                        let can_remove = !self.compositor_nodes.iter().any(|n| n.id == sel && matches!(n.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. }));
                         if ui.add_enabled(can_remove, egui::Button::new("Remove from graph")).clicked() {
                             self.compositor_nodes.retain(|n| n.id != sel);
                             self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
                             self.compositor_pending_output = None;
-                            self.compositor_selected_node = self.compositor_nodes.iter().find(|n| matches!(n.settings, NodeSettings::Output { .. })).map(|n| n.id).unwrap_or(0);
+                            self.compositor_selected_node = self.compositor_nodes.iter().find(|n| n.object_index == object_index && matches!(n.settings, NodeSettings::ObjectMesh { .. })).map(|n| n.id).unwrap_or(0);
                             self.project_dirty = true;
                             ui.close_menu();
                         }
@@ -4744,7 +6837,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 17] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 25] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -4753,7 +6846,11 @@ impl EditorApp {
                     ("Sharp Threshold", "Converter", Color32::from_rgb(105, 112, 122)),
                     ("Smooth Threshold", "Converter", Color32::from_rgb(105, 112, 122)),
                     ("Image Filter", "Filter", Color32::from_rgb(92, 128, 92)),
-                    ("Output", "Texture Writer", Color32::from_rgb(128, 113, 72)),
+                    (
+                        "Object Texture",
+                        "Texture Output",
+                        Color32::from_rgb(128, 113, 72),
+                    ),
                     ("Texture Combine", "Converter", Color32::from_rgb(105, 112, 122)),
                     ("Color Space Convert", "Color", Color32::from_rgb(122, 88, 151)),
                     ("Color Decoder", "Color", Color32::from_rgb(122, 88, 151)),
@@ -4762,10 +6859,19 @@ impl EditorApp {
                     ("Object Handle", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Time", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Debug Preview", "Utility", Color32::from_rgb(173, 91, 117)),
+                    ("Object Transform", "Object Output", Color32::from_rgb(128, 113, 72)),
+                    ("Object Mesh", "Object Output", Color32::from_rgb(128, 113, 72)),
+                    ("Painted Texture", "Texture Input", Color32::from_rgb(76, 122, 155)),
+                    ("Mass Density", "Particle Field", Color32::from_rgb(76, 142, 153)),
+                    ("Spring Mesh", "Dynamics", Color32::from_rgb(92, 128, 92)),
+                    ("Force Field", "Dynamics", Color32::from_rgb(151, 95, 76)),
+                    ("Velocity Field", "Dynamics", Color32::from_rgb(70, 145, 135)),
+                    ("Simulator", "Simulation", Color32::from_rgb(166, 124, 57)),
                 ];
-                let node_heights_by_kind: [f32; 17] = [
+                let node_heights_by_kind: [f32; 25] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
-                    175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0,
+                    175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
+                    285.0, 235.0, 245.0, 285.0, 190.0,
                 ];
                 let node_width = 230.0;
 
@@ -4779,12 +6885,20 @@ impl EditorApp {
                 }
 
                 // Build node rects indexed by node_id
-                let node_id_rects: Vec<(usize, Rect)> = self.compositor_nodes.iter().map(|node| {
-                    let kind = node.settings.kind();
-                    let height = node_heights_by_kind[kind];
-                    let rect = Rect::from_min_size(origin + node.position * scale, Vec2::new(node_width, height) * scale);
-                    (node.id, rect)
-                }).collect();
+                let node_id_rects: Vec<(usize, Rect)> = self
+                    .compositor_nodes
+                    .iter()
+                    .filter(|node| node.object_index == object_index)
+                    .map(|node| {
+                        let kind = node.settings.kind();
+                        let height = node_heights_by_kind[kind];
+                        let rect = Rect::from_min_size(
+                            origin + node.position * scale,
+                            Vec2::new(node_width, height) * scale,
+                        );
+                        (node.id, rect)
+                    })
+                    .collect();
                 let rect_by_id: std::collections::HashMap<usize, Rect> = node_id_rects.iter().cloned().collect();
 
                 let output_socket = |node_rect: Rect, kind: usize, out_idx: usize| -> Pos2 {
@@ -4796,6 +6910,9 @@ impl EditorApp {
                         9 => 85.0 + input as f32 * 30.0,
                         11 => 70.0,
                         13 => 75.0 + input as f32 * 22.0,
+                        17 => 74.0 + input as f32 * 26.0,
+                        22 => 74.0 + input as f32 * 26.0,
+                        24 => 74.0 + input as f32 * 26.0,
                         _ => 70.0,
                     };
                     Pos2::new(node_rect.left(), node_rect.top() + y * scale)
@@ -4860,14 +6977,14 @@ impl EditorApp {
                     if !handled {
                         for &(node_id, node_rect) in &node_id_rects {
                             let kind = self.compositor_nodes.iter().find(|n| n.id == node_id).map(|n| n.settings.kind()).unwrap_or(0);
-                            if kind == 8 { continue; }
+                            if matches!(kind, 17 | 18) { continue; }
                             let close_pos = Pos2::new(node_rect.right() - 13.0 * scale, node_rect.top() + 15.0 * scale);
                             if ptr.distance(close_pos) <= 10.0 * scale {
                                 let id_to_remove = node_id;
                                 self.compositor_nodes.retain(|n| n.id != id_to_remove);
                                 self.compositor_links.retain(|&(fid, _, tid, _)| fid != id_to_remove && tid != id_to_remove);
                                 self.compositor_pending_output = None;
-                                self.compositor_selected_node = self.compositor_nodes.iter().find(|n| matches!(n.settings, NodeSettings::Output { .. })).map(|n| n.id).unwrap_or(0);
+                                self.compositor_selected_node = self.compositor_nodes.iter().find(|n| n.object_index == object_index && matches!(n.settings, NodeSettings::ObjectMesh { .. })).map(|n| n.id).unwrap_or(0);
                                 self.project_dirty = true;
                                 handled = true;
                                 break;
@@ -4905,11 +7022,11 @@ impl EditorApp {
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
                     let sel = self.compositor_selected_node;
                     if let Some(node) = self.compositor_nodes.iter().find(|n| n.id == sel) {
-                        if !matches!(node.settings, NodeSettings::Output { .. }) {
+                        if !matches!(node.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. }) {
                             self.compositor_nodes.retain(|n| n.id != sel);
                             self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
                             self.compositor_pending_output = None;
-                            self.compositor_selected_node = self.compositor_nodes.iter().find(|n| matches!(n.settings, NodeSettings::Output { .. })).map(|n| n.id).unwrap_or(0);
+                            self.compositor_selected_node = self.compositor_nodes.iter().find(|n| n.object_index == object_index && matches!(n.settings, NodeSettings::ObjectMesh { .. })).map(|n| n.id).unwrap_or(0);
                             self.project_dirty = true;
                         }
                     }
@@ -4949,7 +7066,7 @@ impl EditorApp {
                     };
                     let kind = node.settings.kind();
                     let (title, kind_label, header_color) = node_specs_by_kind[kind];
-                    let is_output = kind == 8;
+                    let is_output = matches!(kind, 17 | 18);
                     let selected = self.compositor_selected_node == node_id;
                     let cm = if let NodeSettings::TextureCombine { mode, .. } = node.settings { mode } else { 0 };
 
@@ -4979,6 +7096,20 @@ impl EditorApp {
                             painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["A", "B", "Alpha"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
                         } else if kind == 13 {
                             painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["R", "G", "B", "A"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 17 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Position", "Rotation", "Scale"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 18 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Mesh", FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 20 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Density Texture", FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 21 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Particle Mass", FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 22 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Strength Texture", "Mass Field", "Spring Mesh"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 23 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Strength Texture", FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if kind == 24 {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Velocity Field", "Force Field"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
                         }
                     }
 
@@ -5029,7 +7160,15 @@ impl EditorApp {
                     "Converter / Smooth Threshold",
                     "Filter / Image Filter",
                     "Utility / Debug Preview",
-                    "Output / Texture Writer",
+                    "Output / Object Texture",
+                    "Output / Object Transform",
+                    "Output / Object Mesh",
+                    "Input / Painted Texture",
+                    "Dynamics / Mass Density",
+                    "Dynamics / Spring Mesh",
+                    "Dynamics / Force Field",
+                    "Dynamics / Velocity Field",
+                    "Dynamics / Simulator",
                 ].iter().enumerate() {
                     painter.text(palette.left_top() + Vec2::new(12.0, 46.0 + index as f32 * 27.0), Align2::LEFT_TOP, *label, FontId::proportional(12.0), Color32::from_gray(190));
                 }
@@ -5054,7 +7193,281 @@ impl EditorApp {
         }
     }
 
+    fn dynamics_workspace(&mut self, ctx: &egui::Context) {
+        let previous_wind = self.dynamics_wind.clone();
+        let previous_settings = self.dynamics_settings.clone();
+        let object_choices = self
+            .scene
+            .tree
+            .iter()
+            .map(|(id, node)| (id, node.name.clone()))
+            .collect::<Vec<_>>();
+        egui::CentralPanel::default()
+            .frame(panel_frame(Color32::from_rgb(18, 20, 26)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let object_name = self
+                        .scene
+                        .selected
+                        .and_then(|id| self.scene.tree.node(id).ok())
+                        .map(|node| node.name.clone())
+                        .unwrap_or_else(|| "No object selected".into());
+                    ui.strong(format!("Nodes — {object_name}"));
+                    egui::ComboBox::from_id_salt("node_workspace_object")
+                        .selected_text(&object_name)
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &object_choices {
+                                ui.selectable_value(&mut self.scene.selected, Some(*id), name);
+                            }
+                        });
+                    ui.separator();
+                    if ui
+                        .button(if self.dynamics_running {
+                            "Ⅱ Pause"
+                        } else {
+                            "▶ Simulate"
+                        })
+                        .clicked()
+                    {
+                        self.dynamics_running = !self.dynamics_running;
+                        self.dynamics_last_tick = Instant::now();
+                    }
+                    if ui.button("Step").clicked() {
+                        self.dynamics_time += 1.0 / 60.0;
+                        for id in self.dynamics_enabled.clone() {
+                            if let (Some(field), Some(cloth)) = (
+                                self.dynamics_fields.get(&id),
+                                self.dynamics_cloth.get_mut(&id),
+                            ) {
+                                cloth.settings = self.dynamics_settings.clone();
+                                cloth.sync_mobility(field);
+                                cloth.step(1.0 / 60.0, self.dynamics_time, &self.dynamics_wind);
+                            }
+                        }
+                        self.scene_revision = self.scene_revision.wrapping_add(1);
+                    }
+                    if ui.button("Reset").clicked() {
+                        self.reset_dynamics();
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "{:.2} s · {} simulated object(s)",
+                        self.dynamics_time,
+                        self.dynamics_enabled.len()
+                    ));
+                });
+                ui.separator();
+                let available = ui.available_size();
+                let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
+                if response.dragged_by(egui::PointerButton::Middle) {
+                    self.dynamics_pan += response.drag_delta();
+                }
+                if response.hovered() {
+                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        self.dynamics_zoom =
+                            (self.dynamics_zoom * (scroll * 0.0015).exp()).clamp(0.4, 2.2);
+                    }
+                }
+                painter.rect_filled(response.rect, 0.0, Color32::from_rgb(16, 18, 23));
+                let origin = response.rect.min + Vec2::new(50.0, 45.0) + self.dynamics_pan;
+                let scale = self.dynamics_zoom;
+                let node_size = Vec2::new(210.0, 150.0) * scale;
+                let titles = [
+                    (
+                        "Object Geometry",
+                        "Geometry",
+                        Color32::from_rgb(76, 122, 155),
+                    ),
+                    (
+                        "Mobility Field",
+                        "Vertex Scalar",
+                        Color32::from_rgb(122, 88, 151),
+                    ),
+                    (
+                        "Wind Field",
+                        "Spatial Vector",
+                        Color32::from_rgb(76, 142, 153),
+                    ),
+                    ("Collision Set", "Geometry", Color32::from_rgb(151, 95, 76)),
+                    (
+                        "XPBD Cloth Solver",
+                        "Simulation State",
+                        Color32::from_rgb(92, 128, 92),
+                    ),
+                    (
+                        "Geometry Output",
+                        "Deformed Mesh",
+                        Color32::from_rgb(128, 113, 72),
+                    ),
+                ];
+                let rects: Vec<Rect> = self
+                    .dynamics_node_positions
+                    .iter()
+                    .map(|position| Rect::from_min_size(origin + *position * scale, node_size))
+                    .collect();
+                let pointer = ui.input(|input| input.pointer.interact_pos());
+                let pressed =
+                    ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+                if pressed {
+                    if let Some(pointer) = pointer {
+                        for (index, rect) in rects.iter().enumerate().rev() {
+                            let header = Rect::from_min_size(
+                                rect.min,
+                                Vec2::new(rect.width(), 30.0 * scale),
+                            );
+                            if header.contains(pointer) {
+                                self.dynamics_dragging_node = Some((index, pointer - rect.min));
+                                break;
+                            }
+                        }
+                    }
+                }
+                let primary_down =
+                    ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+                if primary_down {
+                    if let (Some(pointer), Some((index, offset))) =
+                        (pointer, self.dynamics_dragging_node)
+                    {
+                        self.dynamics_node_positions[index] = (pointer - offset - origin) / scale;
+                        ctx.request_repaint();
+                    }
+                } else {
+                    self.dynamics_dragging_node = None;
+                }
+                for (from, to) in [(0, 4), (1, 4), (2, 4), (3, 4), (4, 5)] {
+                    let start = rects[from].right_center();
+                    let end = rects[to].left_center();
+                    painter.add(egui::Shape::line(
+                        compositor_link_curve(start, end),
+                        Stroke::new(3.0, Color32::from_rgb(218, 190, 92)),
+                    ));
+                }
+                for (index, rect) in rects.iter().copied().enumerate() {
+                    let (title, kind, color) = titles[index];
+                    painter.rect_filled(rect, 6.0, Color32::from_rgb(36, 39, 48));
+                    let header =
+                        Rect::from_min_size(rect.min, Vec2::new(rect.width(), 30.0 * scale));
+                    painter.rect_filled(header, 6.0, color);
+                    painter.text(
+                        header.left_center() + Vec2::new(9.0 * scale, 0.0),
+                        Align2::LEFT_CENTER,
+                        title,
+                        FontId::proportional(13.0 * scale),
+                        Color32::WHITE,
+                    );
+                    painter.text(
+                        rect.left_top() + Vec2::new(12.0, 48.0) * scale,
+                        Align2::LEFT_TOP,
+                        kind,
+                        FontId::proportional(11.0 * scale),
+                        Color32::from_gray(174),
+                    );
+                    if index != 0 && index != 1 && index != 2 && index != 3 {
+                        painter.circle_filled(
+                            rect.left_center(),
+                            6.0 * scale,
+                            Color32::from_rgb(218, 190, 92),
+                        );
+                    }
+                    if index != 5 {
+                        painter.circle_filled(
+                            rect.right_center(),
+                            6.0 * scale,
+                            Color32::from_rgb(218, 190, 92),
+                        );
+                    }
+                    let detail = match index {
+                        0 => self
+                            .scene
+                            .selected
+                            .and_then(|id| self.scene.tree.node(id).ok())
+                            .map(|node| node.name.as_str())
+                            .unwrap_or("Select a mesh in Scene"),
+                        1 => "dynamics.mobility",
+                        2 => "World-space air velocity",
+                        3 => "Pole capsule + ground",
+                        4 => "Stretch · shear · bend",
+                        _ => "Viewport deformation",
+                    };
+                    painter.text(
+                        rect.left_top() + Vec2::new(12.0, 76.0) * scale,
+                        Align2::LEFT_TOP,
+                        detail,
+                        FontId::proportional(12.0 * scale),
+                        Color32::from_gray(215),
+                    );
+                }
+
+                let controls = Rect::from_min_size(
+                    response.rect.right_top() - Vec2::new(280.0, -12.0),
+                    Vec2::new(265.0, 390.0),
+                );
+                painter.rect_filled(controls, 6.0, Color32::from_rgb(25, 27, 34));
+                let mut controls_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(controls.shrink(12.0))
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                controls_ui.strong("Field & solver properties");
+                controls_ui.checkbox(&mut self.dynamics_wind.enabled, "Wind enabled");
+                controls_ui.add(
+                    egui::DragValue::new(&mut self.dynamics_wind.velocity.x)
+                        .speed(0.1)
+                        .prefix("Wind X "),
+                );
+                controls_ui.add(
+                    egui::DragValue::new(&mut self.dynamics_wind.velocity.y)
+                        .speed(0.1)
+                        .prefix("Wind Y "),
+                );
+                controls_ui.add(
+                    egui::DragValue::new(&mut self.dynamics_wind.velocity.z)
+                        .speed(0.1)
+                        .prefix("Wind Z "),
+                );
+                controls_ui.add(
+                    egui::Slider::new(&mut self.dynamics_wind.gust_strength, 0.0..=2.0)
+                        .text("Gust"),
+                );
+                controls_ui.add(
+                    egui::Slider::new(&mut self.dynamics_wind.turbulence, 0.0..=2.0)
+                        .text("Turbulence"),
+                );
+                controls_ui.separator();
+                controls_ui.add(
+                    egui::Slider::new(&mut self.dynamics_settings.iterations, 1..=16)
+                        .text("Iterations"),
+                );
+                controls_ui.add(
+                    egui::DragValue::new(&mut self.dynamics_settings.stretch_compliance)
+                        .speed(0.000_001)
+                        .prefix("Stretch compliance "),
+                );
+                controls_ui.add(
+                    egui::DragValue::new(&mut self.dynamics_settings.bend_compliance)
+                        .speed(0.000_01)
+                        .prefix("Bend compliance "),
+                );
+                controls_ui.add(
+                    egui::Slider::new(&mut self.dynamics_settings.damping, 0.0..=0.2)
+                        .text("Damping"),
+                );
+                controls_ui.small(
+                    "Edit mobility in Scene → Field Paint. Wind and solver changes apply live.",
+                );
+            });
+        if self.dynamics_wind != previous_wind || self.dynamics_settings != previous_settings {
+            self.project_dirty = true;
+        }
+    }
+
     fn viewport(&mut self, ctx: &egui::Context) {
+        if self.active_tool == Tool::TexturePaint
+            && let Some(id) = self.scene.selected
+        {
+            self.ensure_painted_texture(id);
+        }
         egui::CentralPanel::default()
             .frame(panel_frame(Color32::from_rgb(19, 21, 27)))
             .show(ctx, |ui| {
@@ -5126,6 +7539,88 @@ impl EditorApp {
                     }
                 }
                 let pointer_delta = ui.input(|input| input.pointer.delta());
+                if matches!(self.active_tool, Tool::FieldPaint | Tool::TexturePaint) {
+                    let (pointer, pressed, down, released) = ui.input(|input| {
+                        (
+                            input.pointer.hover_pos(),
+                            input.pointer.button_pressed(egui::PointerButton::Primary),
+                            input.pointer.button_down(egui::PointerButton::Primary),
+                            input.pointer.button_released(egui::PointerButton::Primary),
+                        )
+                    });
+                    if let Some(pointer) = pointer.filter(|point| response.rect.contains(*point)) {
+                        painter.circle_stroke(
+                            pointer,
+                            self.paint_radius_pixels,
+                            Stroke::new(2.0, Color32::from_rgb(255, 220, 96)),
+                        );
+                        if pressed {
+                            if let Some(id) = self.scene.selected {
+                                match self.active_tool {
+                                    Tool::FieldPaint => {
+                                        if let Some(field) = self.dynamics_fields.get(&id) {
+                                            self.field_stroke_before =
+                                                Some((id, field.values.clone()));
+                                        }
+                                    }
+                                    Tool::TexturePaint => {
+                                        self.texture_paint_last_uv = None;
+                                        if let Some(mask) = self.painted_masks.get(&id) {
+                                            self.texture_paint_stroke_before =
+                                                Some((id, mask.pixels.clone()));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if down {
+                            match self.active_tool {
+                                Tool::FieldPaint => {
+                                    self.paint_selected_field(pointer, response.rect)
+                                }
+                                Tool::TexturePaint => {
+                                    self.paint_selected_texture(pointer, response.rect)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if released {
+                        match self.active_tool {
+                            Tool::FieldPaint => {
+                                if let Some((id, before)) = self.field_stroke_before.take() {
+                                    let changed = self
+                                        .dynamics_fields
+                                        .get(&id)
+                                        .is_some_and(|field| field.values != before);
+                                    if changed {
+                                        self.field_undo.push((id, before));
+                                        self.field_redo.clear();
+                                    }
+                                }
+                            }
+                            Tool::TexturePaint => {
+                                self.texture_paint_last_uv = None;
+                                if let Some((id, before)) = self.texture_paint_stroke_before.take()
+                                {
+                                    let changed = self
+                                        .painted_masks
+                                        .get(&id)
+                                        .is_some_and(|mask| mask.pixels != before);
+                                    if changed {
+                                        self.texture_paint_undo.push((id, before));
+                                        self.texture_paint_redo.clear();
+                                        if self.texture_paint_undo.len() > 16 {
+                                            self.texture_paint_undo.remove(0);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let orbit = if response.dragged_by(egui::PointerButton::Secondary) {
                     pointer_delta
                 } else {
@@ -5363,6 +7858,7 @@ impl eframe::App for EditorApp {
         self.poll_vulkan_compositor(ctx);
         self.tick_compositor_time(ctx);
         self.poll_compositor_apply(ctx);
+        self.tick_dynamics(ctx);
         self.poll_build(ctx);
         self.shortcuts(ctx);
         self.top_bar(ctx);
@@ -5426,7 +7922,7 @@ fn compositor_link_curve(start: Pos2, end: Pos2) -> Vec<Pos2> {
         .collect()
 }
 
-fn bezier_editor(ui: &mut egui::Ui, points: &mut [[f32; 2]]) -> bool {
+fn remap_curve_editor(ui: &mut egui::Ui, points: &mut [[f32; 2]], bezier: bool) -> bool {
     let desired = Vec2::new(ui.available_width().max(80.0), 170.0);
     let (response, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
     let rect = response.rect.shrink(8.0);
@@ -5469,36 +7965,42 @@ fn bezier_editor(ui: &mut egui::Ui, points: &mut [[f32; 2]]) -> bool {
         points[index] = [x.clamp(lower, upper), y];
         changed = true;
     }
-    let curve: Vec<_> = (0..=48)
-        .map(|step| {
-            let t = step as f32 / 48.0;
-            let inverse = 1.0 - t;
-            let weights = [
-                inverse.powi(3),
-                3.0 * inverse.powi(2) * t,
-                3.0 * inverse * t.powi(2),
-                t.powi(3),
-            ];
-            to_screen([
-                points
-                    .iter()
-                    .zip(weights)
-                    .map(|(point, weight)| point[0] * weight)
-                    .sum(),
-                points
-                    .iter()
-                    .zip(weights)
-                    .map(|(point, weight)| point[1] * weight)
-                    .sum(),
-            ])
-        })
-        .collect();
+    let curve: Vec<_> = if bezier {
+        (0..=48)
+            .map(|step| {
+                let t = step as f32 / 48.0;
+                let inverse = 1.0 - t;
+                let weights = [
+                    inverse.powi(3),
+                    3.0 * inverse.powi(2) * t,
+                    3.0 * inverse * t.powi(2),
+                    t.powi(3),
+                ];
+                to_screen([
+                    points
+                        .iter()
+                        .zip(weights)
+                        .map(|(point, weight)| point[0] * weight)
+                        .sum(),
+                    points
+                        .iter()
+                        .zip(weights)
+                        .map(|(point, weight)| point[1] * weight)
+                        .sum(),
+                ])
+            })
+            .collect()
+    } else {
+        points.iter().copied().map(to_screen).collect()
+    };
     painter.line(curve, Stroke::new(2.5, Color32::from_rgb(108, 190, 255)));
-    for pair in points.windows(2) {
-        painter.line_segment(
-            [to_screen(pair[0]), to_screen(pair[1])],
-            Stroke::new(1.0, Color32::from_gray(105)),
-        );
+    if bezier {
+        for pair in points.windows(2) {
+            painter.line_segment(
+                [to_screen(pair[0]), to_screen(pair[1])],
+                Stroke::new(1.0, Color32::from_gray(105)),
+            );
+        }
     }
     for (index, point) in points.iter().enumerate() {
         painter.circle_filled(
@@ -5523,6 +8025,296 @@ fn parse_compositor_position(value: &str) -> Option<Vec2> {
     Some(Vec2::new(x.parse().ok()?, y.parse().ok()?))
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> Option<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn barycentric_2d(point: Pos2, triangle: [Pos2; 3]) -> Option<[f32; 3]> {
+    let edge0 = triangle[1] - triangle[0];
+    let edge1 = triangle[2] - triangle[0];
+    let relative = point - triangle[0];
+    let denominator = edge0.x * edge1.y - edge1.x * edge0.y;
+    if !denominator.is_finite() || denominator.abs() < 1.0e-8 {
+        return None;
+    }
+    let weight1 = (relative.x * edge1.y - edge1.x * relative.y) / denominator;
+    let weight2 = (edge0.x * relative.y - relative.x * edge0.y) / denominator;
+    let weight0 = 1.0 - weight1 - weight2;
+    let weights = [weight0, weight1, weight2];
+    (weights
+        .iter()
+        .all(|weight| *weight >= -1.0e-4 && weight.is_finite()))
+    .then_some(weights)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn area_weighted_particle_masses(
+    mesh: &MeshAsset,
+    mask: &PaintedMask,
+    object_scale: CoreVec3,
+    base_density: f32,
+    density_scale: f32,
+    minimum_mass: f32,
+    normalize: bool,
+    total_mass: f32,
+) -> Vec<f32> {
+    let minimum_mass = minimum_mass.max(1.0e-6);
+    let density_factor = base_density.max(0.0) * density_scale.max(0.0);
+    let densities = mesh
+        .vertices
+        .iter()
+        .map(|vertex| sample_painted_mask(mask, vertex.uv) * density_factor)
+        .collect::<Vec<_>>();
+    let mut masses = vec![0.0; mesh.vertices.len()];
+    for triangle in mesh
+        .primitives
+        .iter()
+        .flat_map(|primitive| primitive.indices.chunks_exact(3))
+    {
+        let indices = [
+            triangle[0] as usize,
+            triangle[1] as usize,
+            triangle[2] as usize,
+        ];
+        if indices.iter().any(|index| *index >= mesh.vertices.len()) {
+            continue;
+        }
+        let point = |index: usize| {
+            let position = mesh.vertices[index].position;
+            object_scale.component_mul(CoreVec3::new(position[0], position[1], position[2]))
+        };
+        let area = (point(indices[1]) - point(indices[0]))
+            .cross(point(indices[2]) - point(indices[0]))
+            .length()
+            * 0.5;
+        let density = (densities[indices[0]] + densities[indices[1]] + densities[indices[2]]) / 3.0;
+        let share = (area * density / 3.0).max(0.0);
+        for index in indices {
+            masses[index] += share;
+        }
+    }
+    for mass in &mut masses {
+        *mass = mass.max(minimum_mass);
+    }
+    if normalize {
+        let current_total = masses.iter().sum::<f32>();
+        if current_total > f32::EPSILON {
+            let factor = total_mass.max(minimum_mass) / current_total;
+            for mass in &mut masses {
+                *mass = (*mass * factor).max(minimum_mass);
+            }
+        }
+    }
+    masses
+}
+
+fn sample_painted_mask(mask: &PaintedMask, uv: [f32; 2]) -> f32 {
+    if mask.width == 0 || mask.height == 0 {
+        return 0.0;
+    }
+    let x = (uv[0].rem_euclid(1.0) * mask.width as f32).floor() as usize % mask.width as usize;
+    let y = (uv[1].rem_euclid(1.0) * mask.height as f32).floor() as usize % mask.height as usize;
+    mask.pixels
+        .get(y * mask.width as usize + x)
+        .copied()
+        .unwrap_or(0) as f32
+        / 255.0
+}
+
+fn evaluate_force_formula(formula: &str, x: f32, y: f32, z: f32, t: f32) -> Result<f32, String> {
+    let mut parser = FormulaParser {
+        input: formula.as_bytes(),
+        cursor: 0,
+        variables: [x, y, z, t],
+    };
+    let value = parser.expression()?;
+    parser.whitespace();
+    if parser.cursor != parser.input.len() {
+        return Err("unexpected trailing expression".into());
+    }
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or_else(|| "formula produced a non-finite value".into())
+}
+
+struct FormulaParser<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    variables: [f32; 4],
+}
+
+impl FormulaParser<'_> {
+    fn expression(&mut self) -> Result<f32, String> {
+        let mut value = self.term()?;
+        loop {
+            self.whitespace();
+            if self.consume(b'+') {
+                value += self.term()?;
+            } else if self.consume(b'-') {
+                value -= self.term()?;
+            } else {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn term(&mut self) -> Result<f32, String> {
+        let mut value = self.power()?;
+        loop {
+            self.whitespace();
+            if self.consume(b'*') {
+                value *= self.power()?;
+            } else if self.consume(b'/') {
+                value /= self.power()?;
+            } else {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn power(&mut self) -> Result<f32, String> {
+        let value = self.unary()?;
+        self.whitespace();
+        if self.consume(b'^') {
+            Ok(value.powf(self.power()?))
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn unary(&mut self) -> Result<f32, String> {
+        self.whitespace();
+        if self.consume(b'+') {
+            self.unary()
+        } else if self.consume(b'-') {
+            Ok(-self.unary()?)
+        } else {
+            self.primary()
+        }
+    }
+
+    fn primary(&mut self) -> Result<f32, String> {
+        self.whitespace();
+        if self.consume(b'(') {
+            let value = self.expression()?;
+            self.whitespace();
+            return self
+                .consume(b')')
+                .then_some(value)
+                .ok_or_else(|| "missing closing parenthesis".into());
+        }
+        if self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+        {
+            return self.number();
+        }
+        let identifier = self.identifier()?;
+        match identifier.as_str() {
+            "x" => Ok(self.variables[0]),
+            "y" => Ok(self.variables[1]),
+            "z" => Ok(self.variables[2]),
+            "t" => Ok(self.variables[3]),
+            "pi" => Ok(std::f32::consts::PI),
+            "e" => Ok(std::f32::consts::E),
+            function => {
+                self.whitespace();
+                if !self.consume(b'(') {
+                    return Err(format!("unknown variable `{function}`"));
+                }
+                let argument = self.expression()?;
+                self.whitespace();
+                if !self.consume(b')') {
+                    return Err("missing function parenthesis".into());
+                }
+                match function {
+                    "sin" => Ok(argument.sin()),
+                    "cos" => Ok(argument.cos()),
+                    "abs" => Ok(argument.abs()),
+                    "sqrt" if argument >= 0.0 => Ok(argument.sqrt()),
+                    "sqrt" => Err("sqrt requires a non-negative value".into()),
+                    _ => Err(format!("unknown function `{function}`")),
+                }
+            }
+        }
+    }
+
+    fn number(&mut self) -> Result<f32, String> {
+        let start = self.cursor;
+        while self.input.get(self.cursor).is_some_and(|byte| {
+            byte.is_ascii_digit() || matches!(*byte, b'.' | b'e' | b'E' | b'+' | b'-')
+        }) {
+            if self.cursor > start
+                && matches!(self.input[self.cursor], b'+' | b'-')
+                && !matches!(self.input[self.cursor - 1], b'e' | b'E')
+            {
+                break;
+            }
+            self.cursor += 1;
+        }
+        std::str::from_utf8(&self.input[start..self.cursor])
+            .ok()
+            .and_then(|number| number.parse().ok())
+            .ok_or_else(|| "invalid number".into())
+    }
+
+    fn identifier(&mut self) -> Result<String, String> {
+        let start = self.cursor;
+        while self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        {
+            self.cursor += 1;
+        }
+        (self.cursor > start)
+            .then(|| String::from_utf8_lossy(&self.input[start..self.cursor]).into_owned())
+            .ok_or_else(|| "expected a value".into())
+    }
+
+    fn whitespace(&mut self) {
+        while self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.input.get(self.cursor) == Some(&expected) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
     match kind {
         9 => {
@@ -5533,13 +8325,19 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
             }
         }
         13 => 4,
+        17 => 3,
+        18 => 1,
+        19 => 0,
+        22 => 3,
+        23 => 1,
+        24 => 2,
         _ => 1,
     }
 }
 
 fn compositor_output_count(kind: usize) -> usize {
     match kind {
-        8 | 16 => 0,
+        8 | 16 | 17 | 18 => 0,
         11 => 4,
         _ => 1,
     }
@@ -6863,6 +9661,39 @@ fn ray_triangle_distance(
     (distance > 0.0 && distance.is_finite()).then_some(distance)
 }
 
+fn ray_triangle_hit(
+    origin: CoreVec3,
+    direction: CoreVec3,
+    triangle: [CoreVec3; 3],
+) -> Option<(f32, [f32; 3])> {
+    let edge_ab = triangle[1] - triangle[0];
+    let edge_ac = triangle[2] - triangle[0];
+    let cross = direction.cross(edge_ac);
+    let determinant = edge_ab.dot(cross);
+    if determinant.abs() <= 1.0e-7 {
+        return None;
+    }
+    let inverse = determinant.recip();
+    let origin_offset = origin - triangle[0];
+    let weight_b = origin_offset.dot(cross) * inverse;
+    if !(0.0..=1.0).contains(&weight_b) {
+        return None;
+    }
+    let barycentric_cross = origin_offset.cross(edge_ab);
+    let weight_c = direction.dot(barycentric_cross) * inverse;
+    if weight_c < 0.0 || weight_b + weight_c > 1.0 {
+        return None;
+    }
+    let distance = edge_ac.dot(barycentric_cross) * inverse;
+    let weight_a = 1.0 - weight_b - weight_c;
+    (distance > 0.0
+        && distance.is_finite()
+        && [weight_a, weight_b, weight_c]
+            .iter()
+            .all(|weight| weight.is_finite()))
+    .then_some((distance, [weight_a, weight_b, weight_c]))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_viewport(
     painter: &egui::Painter,
@@ -7635,6 +10466,11 @@ fn clip_polygon_to_near_into(
 
 fn interpolate_preview_vertex(a: PreviewVertex, b: PreviewVertex, amount: f32) -> PreviewVertex {
     PreviewVertex {
+        source_index: if amount < 0.5 {
+            a.source_index
+        } else {
+            b.source_index
+        },
         local_position: interpolate_point(a.local_position, b.local_position, amount),
         local_normal: interpolate_point(a.local_normal, b.local_normal, amount),
         position: interpolate_point(a.position, b.position, amount),
@@ -8145,6 +10981,7 @@ mod tests {
             },
             object_transform: Transform::IDENTITY,
             vertices: positions.map(|position| PreviewVertex {
+                source_index: 0,
                 local_position: position,
                 local_normal: [0.0, 0.0, 1.0],
                 position,
@@ -8534,5 +11371,108 @@ mod tests {
         for (actual, expected) in round_trip.pixels.iter().zip(source.pixels) {
             assert!((*actual as i16 - expected as i16).abs() <= 4);
         }
+    }
+
+    #[test]
+    fn painted_mask_produces_grayscale_texture_values() {
+        let mask = PaintedMask {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 255],
+            revision: 1,
+        };
+        assert_eq!(
+            mask.texture(false).pixels,
+            vec![0, 0, 0, 255, 255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn painted_mask_hex_persistence_is_lossless() {
+        let bytes = vec![0, 1, 15, 16, 127, 128, 254, 255];
+        assert_eq!(decode_hex(&encode_hex(&bytes)), Some(bytes));
+        assert!(decode_hex("abc").is_none());
+        assert!(decode_hex("zz").is_none());
+    }
+
+    #[test]
+    fn density_texture_produces_area_weighted_positive_particle_masses() {
+        let mesh = MeshAsset {
+            vertices: vec![
+                zerofps_assets::Vertex {
+                    position: [0.0, 0.0, 0.0],
+                    uv: [0.0, 0.0],
+                    ..Default::default()
+                },
+                zerofps_assets::Vertex {
+                    position: [1.0, 0.0, 0.0],
+                    uv: [1.0, 0.0],
+                    ..Default::default()
+                },
+                zerofps_assets::Vertex {
+                    position: [0.0, 1.0, 0.0],
+                    uv: [0.0, 1.0],
+                    ..Default::default()
+                },
+            ],
+            primitives: vec![zerofps_assets::Primitive {
+                indices: vec![0, 1, 2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mask = PaintedMask {
+            width: 1,
+            height: 1,
+            pixels: vec![255],
+            revision: 1,
+        };
+        let masses = area_weighted_particle_masses(
+            &mesh,
+            &mask,
+            CoreVec3::ONE,
+            3.0,
+            2.0,
+            1.0e-6,
+            false,
+            1.0,
+        );
+        for mass in masses {
+            assert!((mass - 1.0).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn force_formula_supports_cartesian_time_functions_and_precedence() {
+        let value = evaluate_force_formula("x + 2*y - z + sin(pi*t)", 1.0, 2.0, 0.5, 0.5)
+            .expect("valid force formula");
+        assert!((value - 5.5).abs() < 1.0e-5);
+        assert!(evaluate_force_formula("sqrt(-1)", 0.0, 0.0, 0.0, 0.0).is_err());
+        assert!(evaluate_force_formula("unknown(x)", 0.0, 0.0, 0.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn texture_paint_barycentrics_identify_inside_and_outside_points() {
+        let triangle = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(10.0, 0.0),
+            Pos2::new(0.0, 10.0),
+        ];
+        let weights = barycentric_2d(Pos2::new(2.0, 3.0), triangle).unwrap();
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+        assert!(barycentric_2d(Pos2::new(9.0, 9.0), triangle).is_none());
+    }
+
+    #[test]
+    fn texture_paint_raycast_returns_nearest_hit_weights() {
+        let triangle = [
+            CoreVec3::new(-1.0, 5.0, -1.0),
+            CoreVec3::new(1.0, 5.0, -1.0),
+            CoreVec3::new(0.0, 5.0, 1.0),
+        ];
+        let (distance, weights) = ray_triangle_hit(CoreVec3::ZERO, CoreVec3::Y, triangle).unwrap();
+        assert!((distance - 5.0).abs() < 1.0e-6);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+        assert!(weights.iter().all(|weight| *weight >= 0.0));
     }
 }
