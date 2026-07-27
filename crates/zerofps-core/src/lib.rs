@@ -249,14 +249,35 @@ pub struct NodeId {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Component {
-    Model { asset: String },
-    Camera { field_of_view_degrees: f32 },
-    Light { intensity: f32, color: [f32; 3] },
-    Collider { shape: String },
-    RigidBody { dynamic: bool },
-    Script { source: String },
-    AudioSource { asset: String },
-    Marker { kind: String },
+    Model {
+        asset: String,
+        /// Restrict this instance to one primitive of a hierarchical asset.
+        /// `None` preserves the historic behavior of drawing the whole asset.
+        #[serde(default)]
+        primitive: Option<usize>,
+    },
+    Camera {
+        field_of_view_degrees: f32,
+    },
+    Light {
+        intensity: f32,
+        color: [f32; 3],
+    },
+    Collider {
+        shape: String,
+    },
+    RigidBody {
+        dynamic: bool,
+    },
+    Script {
+        source: String,
+    },
+    AudioSource {
+        asset: String,
+    },
+    Marker {
+        kind: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

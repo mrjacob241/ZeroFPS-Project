@@ -345,6 +345,7 @@ pub fn sample_project() -> ProjectFile {
         model,
         Component::Model {
             asset: "builtin:cube".into(),
+            primitive: None,
         },
     )
     .expect("valid model");

@@ -61,6 +61,38 @@ pub struct VertexScalarField {
     pub values: Vec<f32>,
 }
 
+/// One object in an imported scene hierarchy.
+///
+/// Geometry referenced by `primitives` remains in this node's local space.
+/// Consumers compose `local` through `parent` rather than baking transforms
+/// into vertices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AssetNode {
+    pub name: String,
+    pub parent: Option<usize>,
+    pub children: Vec<usize>,
+    pub local: AssetTransform,
+    pub primitives: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AssetTransform {
+    pub translation: [f32; 3],
+    /// Unit quaternion in `(w, x, y, z)` order.
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+impl Default for AssetTransform {
+    fn default() -> Self {
+        Self {
+            translation: [0.0; 3],
+            rotation: [1.0, 0.0, 0.0, 0.0],
+            scale: [1.0; 3],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshAsset {
     pub name: String,
@@ -69,6 +101,7 @@ pub struct MeshAsset {
     pub materials: BTreeMap<String, Material>,
     pub textures: BTreeMap<String, TextureAsset>,
     pub vertex_scalar_fields: BTreeMap<String, VertexScalarField>,
+    pub nodes: Vec<AssetNode>,
     pub source: SourceInfo,
     pub warnings: Vec<String>,
 }
@@ -150,6 +183,61 @@ impl MeshAsset {
                     "primitive `{}` references vertex {index} outside {} vertices",
                     primitive.name,
                     self.vertices.len()
+                )));
+            }
+        }
+        for (node_index, node) in self.nodes.iter().enumerate() {
+            if node
+                .local
+                .translation
+                .iter()
+                .chain(node.local.rotation.iter())
+                .chain(node.local.scale.iter())
+                .any(|value| !value.is_finite())
+            {
+                return Err(ImportError::InvalidData(format!(
+                    "asset node `{}` contains a non-finite transform",
+                    node.name
+                )));
+            }
+            if let Some(parent) = node.parent {
+                let parent_node = self.nodes.get(parent).ok_or_else(|| {
+                    ImportError::InvalidData(format!(
+                        "asset node `{}` references missing parent {parent}",
+                        node.name
+                    ))
+                })?;
+                if parent == node_index || !parent_node.children.contains(&node_index) {
+                    return Err(ImportError::InvalidData(format!(
+                        "asset node `{}` has an inconsistent parent link",
+                        node.name
+                    )));
+                }
+            }
+            for child in &node.children {
+                if self.nodes.get(*child).and_then(|child| child.parent) != Some(node_index) {
+                    return Err(ImportError::InvalidData(format!(
+                        "asset node `{}` has an inconsistent child link to {child}",
+                        node.name
+                    )));
+                }
+            }
+            for primitive in &node.primitives {
+                if *primitive >= self.primitives.len() {
+                    return Err(ImportError::InvalidData(format!(
+                        "asset node `{}` references missing primitive {primitive}",
+                        node.name
+                    )));
+                }
+            }
+            let mut ancestor = node.parent;
+            for _ in 0..self.nodes.len() {
+                ancestor = ancestor.and_then(|index| self.nodes.get(index)?.parent);
+            }
+            if ancestor.is_some() {
+                return Err(ImportError::InvalidData(format!(
+                    "asset node `{}` belongs to a parent cycle",
+                    node.name
                 )));
             }
         }

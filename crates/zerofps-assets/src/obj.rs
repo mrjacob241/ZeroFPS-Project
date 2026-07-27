@@ -267,6 +267,7 @@ where
         materials,
         textures: BTreeMap::new(),
         vertex_scalar_fields: BTreeMap::new(),
+        nodes: Vec::new(),
         source: SourceInfo {
             format: "obj".into(),
             path: Some(source_name.into()),

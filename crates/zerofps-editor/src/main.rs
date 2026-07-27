@@ -91,6 +91,7 @@ impl EditorScene {
         let component = match kind {
             ObjectKind::Model => Some(Component::Model {
                 asset: "builtin:cube".into(),
+                primitive: None,
             }),
             ObjectKind::Light => Some(Component::Light {
                 intensity: 1.0,
@@ -1399,7 +1400,7 @@ impl EditorApp {
                                 node.components.iter().any(|component| {
                                     matches!(
                                         component,
-                                        Component::Model { asset } if asset == &completed_path
+                                        Component::Model { asset, .. } if asset == &completed_path
                                     )
                                 })
                             })
@@ -1422,37 +1423,113 @@ impl EditorApp {
         let Some(asset) = self.imported_assets.get(asset_index) else {
             return;
         };
+        let asset_path = asset.path.clone();
+        let asset_name = asset.mesh.name.clone();
+        let asset_nodes = asset.mesh.nodes.clone();
+        let primitive_names = asset
+            .mesh
+            .primitives
+            .iter()
+            .map(|primitive| primitive.name.clone())
+            .collect::<Vec<_>>();
         let previous = self.scene.tree.clone();
-        let object_name = std::path::Path::new(&asset.path)
+        let object_name = std::path::Path::new(&asset_path)
             .file_stem()
             .and_then(|name| name.to_str())
-            .unwrap_or(&asset.mesh.name)
+            .unwrap_or(&asset_name)
             .to_owned();
-        let id = self.scene.add(&object_name, ObjectKind::Empty, None);
-        if self
-            .scene
-            .tree
-            .add_component(
+        if asset_nodes.is_empty() {
+            let id = self.scene.add(&object_name, ObjectKind::Empty, None);
+            let _ = self.scene.tree.add_component(
                 id,
                 Component::Model {
-                    asset: asset.path.clone(),
+                    asset: asset_path,
+                    primitive: None,
                 },
-            )
-            .is_ok()
-        {
+            );
             let _ = self.scene.tree.set_attribute(
                 id,
                 mesh_autofix_key(),
                 AttributeDeclaration::Value(Attribute::Bool(true)),
             );
             self.scene.selected = Some(id);
-            self.record_undo(previous);
-            self.logs.push(LogEntry {
-                level: "SCENE",
-                color: Color32::from_rgb(103, 191, 255),
-                message: format!("Added `{object_name}` to the scene"),
-            });
+        } else {
+            let roots = asset_nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| node.parent.is_none().then_some(index))
+                .collect::<Vec<_>>();
+            let wrapper =
+                (roots.len() > 1).then(|| self.scene.add(&object_name, ObjectKind::Empty, None));
+            let mut scene_nodes = Vec::with_capacity(asset_nodes.len());
+            for (node_index, node) in asset_nodes.iter().enumerate() {
+                let parent = node
+                    .parent
+                    .and_then(|parent| scene_nodes.get(parent).copied())
+                    .or(wrapper);
+                let id = self.scene.add(&node.name, ObjectKind::Empty, parent);
+                let local = node.local;
+                let _ = self.scene.tree.set_local_transform(
+                    id,
+                    Transform {
+                        translation: CoreVec3::new(
+                            local.translation[0],
+                            local.translation[1],
+                            local.translation[2],
+                        ),
+                        rotation: Quat {
+                            w: local.rotation[0],
+                            x: local.rotation[1],
+                            y: local.rotation[2],
+                            z: local.rotation[3],
+                        }
+                        .normalized(),
+                        scale: CoreVec3::new(local.scale[0], local.scale[1], local.scale[2]),
+                    },
+                );
+                let _ = self.scene.tree.set_attribute(
+                    id,
+                    AttributeKey::Custom("gltf.node_index".into()),
+                    AttributeDeclaration::Value(Attribute::Integer(node_index as i64)),
+                );
+                for (ordinal, primitive) in node.primitives.iter().copied().enumerate() {
+                    let model_id = if ordinal == 0 {
+                        id
+                    } else {
+                        let name = primitive_names
+                            .get(primitive)
+                            .map(String::as_str)
+                            .unwrap_or("Primitive");
+                        self.scene.add(name, ObjectKind::Empty, Some(id))
+                    };
+                    let _ = self.scene.tree.add_component(
+                        model_id,
+                        Component::Model {
+                            asset: asset_path.clone(),
+                            primitive: Some(primitive),
+                        },
+                    );
+                    let _ = self.scene.tree.set_attribute(
+                        model_id,
+                        mesh_autofix_key(),
+                        AttributeDeclaration::Value(Attribute::Bool(true)),
+                    );
+                }
+                scene_nodes.push(id);
+            }
+            self.scene.selected = wrapper.or_else(|| roots.first().map(|root| scene_nodes[*root]));
         }
+        self.record_undo(previous);
+        self.logs.push(LogEntry {
+            level: "SCENE",
+            color: Color32::from_rgb(103, 191, 255),
+            message: format!(
+                "Added `{object_name}` to the scene{}",
+                (!asset_nodes.is_empty())
+                    .then(|| format!(" as {} linked glTF objects", asset_nodes.len()))
+                    .unwrap_or_default()
+            ),
+        });
     }
 
     fn build_preview_triangles(&self) -> Vec<PreviewTriangle> {
@@ -1461,28 +1538,37 @@ impl EditorApp {
             .tree
             .iter()
             .filter_map(|(_, node)| {
-                let path = node
-                    .components
-                    .iter()
-                    .find_map(|component| match component {
-                        Component::Model { asset } => Some(asset.as_str()),
-                        _ => None,
-                    })?;
+                let (path, primitive) =
+                    node.components
+                        .iter()
+                        .find_map(|component| match component {
+                            Component::Model { asset, primitive } => {
+                                Some((asset.as_str(), *primitive))
+                            }
+                            _ => None,
+                        })?;
                 self.imported_assets
                     .iter()
                     .find(|asset| asset.path == path)
-                    .map(|asset| asset.mesh.triangle_count())
+                    .map(|asset| {
+                        primitive
+                            .and_then(|index| asset.mesh.primitives.get(index))
+                            .map_or_else(
+                                || asset.mesh.triangle_count(),
+                                |primitive| primitive.indices.len() / 3,
+                            )
+                    })
             })
             .sum::<usize>();
         let mut output = Vec::with_capacity(total_scene_triangles);
         for (id, node) in self.scene.tree.iter() {
-            let Some(path) = node
-                .components
-                .iter()
-                .find_map(|component| match component {
-                    Component::Model { asset } => Some(asset.as_str()),
-                    _ => None,
-                })
+            let Some((path, primitive_filter)) =
+                node.components
+                    .iter()
+                    .find_map(|component| match component {
+                        Component::Model { asset, primitive } => Some((asset.as_str(), *primitive)),
+                        _ => None,
+                    })
             else {
                 continue;
             };
@@ -1548,7 +1634,10 @@ impl EditorApp {
                 .map(|(_, texture)| texture.clone());
             let deformation = self.dynamics_cloth.get(&id).map(|cloth| &cloth.snapshot);
             let field = self.dynamics_fields.get(&id);
-            for primitive in &asset.primitives {
+            for (primitive_index, primitive) in asset.primitives.iter().enumerate() {
+                if primitive_filter.is_some_and(|selected| selected != primitive_index) {
+                    continue;
+                }
                 let material = primitive
                     .material
                     .as_ref()
@@ -1977,7 +2066,7 @@ impl EditorApp {
                     .iter()
                     .flat_map(|(_, node)| node.components.iter())
                     .filter_map(|component| match component {
-                        Component::Model { asset } => Some(asset.clone()),
+                        Component::Model { asset, .. } => Some(asset.clone()),
                         _ => None,
                     })
                     .collect();
@@ -2168,7 +2257,9 @@ impl EditorApp {
             .iter()
             .flat_map(|(_, node)| node.components.iter())
             .filter_map(|component| match component {
-                Component::Model { asset } if !asset.starts_with("builtin:") => Some(asset.clone()),
+                Component::Model { asset, .. } if !asset.starts_with("builtin:") => {
+                    Some(asset.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -4444,7 +4535,7 @@ impl EditorApp {
                                 node.components
                                     .iter()
                                     .find_map(|component| match component {
-                                        Component::Model { asset } => Some(asset.clone()),
+                                        Component::Model { asset, .. } => Some(asset.clone()),
                                         _ => None,
                                     });
                             let mut visible = self.scene.visible(id);
@@ -5291,7 +5382,7 @@ impl EditorApp {
                 node.components
                     .iter()
                     .find_map(|component| match component {
-                        Component::Model { asset } => Some(asset.as_str()),
+                        Component::Model { asset, .. } => Some(asset.as_str()),
                         _ => None,
                     })
             })
@@ -5316,7 +5407,7 @@ impl EditorApp {
             .components
             .iter()
             .find_map(|component| match component {
-                Component::Model { asset } => Some(asset.as_str()),
+                Component::Model { asset, .. } => Some(asset.as_str()),
                 _ => None,
             })?;
         let bounds = self
@@ -5931,7 +6022,7 @@ impl EditorApp {
                 node.components
                     .iter()
                     .find_map(|component| match component {
-                        Component::Model { asset } => Some(asset.as_str()),
+                        Component::Model { asset, .. } => Some(asset.as_str()),
                         _ => None,
                     })
             })
@@ -7894,7 +7985,7 @@ impl EditorApp {
                                     .filter_map(|(_, node)| {
                                         node.components.iter().find_map(|component| match component
                                         {
-                                            Component::Model { asset } => self
+                                            Component::Model { asset, .. } => self
                                                 .imported_assets
                                                 .iter()
                                                 .find(|imported| imported.path == *asset)
@@ -8788,7 +8879,7 @@ fn rewrite_asset_paths<T: AsRef<std::path::Path>>(
             continue;
         };
         for component in &mut node.components {
-            if let Component::Model { asset } = component
+            if let Component::Model { asset, .. } = component
                 && let Some(replacement) = mapping.get(asset)
             {
                 *asset = replacement.as_ref().to_string_lossy().into_owned();
@@ -10638,6 +10729,7 @@ mod tests {
             model,
             Component::Model {
                 asset: "/source/model.glb".into(),
+                primitive: None,
             },
         )
         .unwrap();
@@ -10652,7 +10744,7 @@ mod tests {
         let node = project.scene.geometry.node(model).unwrap();
         assert!(matches!(
             &node.components[0],
-            Component::Model { asset } if asset == "assets/0000/model.glb"
+            Component::Model { asset, .. } if asset == "assets/0000/model.glb"
         ));
 
         project.project.properties.insert(

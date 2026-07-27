@@ -1,17 +1,15 @@
 //! glTF 2.0 / GLB import.
 //!
-//! The first implementation imports the selected/default scene as one
-//! canonical mesh while preserving node transforms, UV0, vertex colors,
-//! material base color, and decoded base-color images.
+//! The selected/default scene is imported as canonical primitive data plus its
+//! original node hierarchy. Vertex data remains node-local so the engine's
+//! geometry tree can compose parent and child transforms.
 
 use crate::{
-    AxisConvention, Handedness, ImportError, Material, MeshAsset, Primitive, SourceInfo,
-    TextureAsset, Vertex, VertexScalarField,
+    AssetNode, AssetTransform, AxisConvention, Handedness, ImportError, Material, MeshAsset,
+    Primitive, SourceInfo, TextureAsset, Vertex, VertexScalarField,
 };
 use serde_json::Value;
 use std::path::Path;
-
-type Matrix = [[f32; 4]; 4];
 
 pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
     let (document, buffers, images) =
@@ -35,7 +33,7 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
             }
             .into(),
             path: Some(path.to_string_lossy().into_owned()),
-            up_axis: AxisConvention::YUp,
+            up_axis: AxisConvention::ZUp,
             handedness: Handedness::Right,
             unit_scale_meters: Some(1.0),
         },
@@ -86,7 +84,7 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
     };
     for scene in scenes {
         for node in scene.nodes() {
-            visit_node(node, identity(), &document, &buffers, &mut asset)?;
+            visit_node(node, None, &document, &buffers, &mut asset)?;
         }
     }
     for field in asset.vertex_scalar_fields.values_mut() {
@@ -102,12 +100,30 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
 
 fn visit_node(
     node: ::gltf::Node<'_>,
-    parent: Matrix,
+    parent: Option<usize>,
     document: &::gltf::Document,
     buffers: &[::gltf::buffer::Data],
     asset: &mut MeshAsset,
 ) -> Result<(), ImportError> {
-    let world = multiply(parent, node.transform().matrix());
+    let node_index = asset.nodes.len();
+    let (translation, rotation, scale) = node.transform().decomposed();
+    asset.nodes.push(AssetNode {
+        name: node
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Node {node_index}")),
+        parent,
+        children: Vec::new(),
+        local: AssetTransform {
+            translation: z_up(translation),
+            rotation: [rotation[3], rotation[0], -rotation[2], rotation[1]],
+            scale: [scale[0], scale[2], scale[1]],
+        },
+        primitives: Vec::new(),
+    });
+    if let Some(parent) = parent {
+        asset.nodes[parent].children.push(node_index);
+    }
     let vertex_start = asset.vertices.len();
     if let Some(mesh) = node.mesh() {
         for (primitive_index, primitive) in mesh.primitives().enumerate() {
@@ -141,11 +157,11 @@ fn visit_node(
                 ImportError::InvalidData("glTF exceeds the u32 vertex index limit".into())
             })?;
             for (index, position) in positions.iter().copied().enumerate() {
-                let position = z_up(transform_point(world, position));
+                let position = z_up(position);
                 let normal = normals
                     .as_ref()
                     .and_then(|values| values.get(index).copied())
-                    .map(|normal| normalize(z_up(transform_normal(world, normal))))
+                    .map(|normal| normalize(z_up(normal)))
                     .unwrap_or([0.0; 3]);
                 asset.vertices.push(Vertex {
                     position,
@@ -175,11 +191,13 @@ fn visit_node(
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("material-{index}"))
             });
+            let canonical_primitive = asset.primitives.len();
             asset.primitives.push(Primitive {
                 name: format!("{}:{primitive_index}", mesh.name().unwrap_or("glTF mesh")),
                 material,
                 indices,
             });
+            asset.nodes[node_index].primitives.push(canonical_primitive);
         }
     }
     if let Some(accessor_index) = zerofps_mobility_accessor(&node, asset) {
@@ -208,7 +226,7 @@ fn visit_node(
         field.values.extend(values);
     }
     for child in node.children() {
-        visit_node(child, world, document, buffers, asset)?;
+        visit_node(child, Some(node_index), document, buffers, asset)?;
     }
     Ok(())
 }
@@ -286,72 +304,6 @@ fn decoded_image(name: String, image: &::gltf::image::Data) -> Result<TextureAss
     })
 }
 
-fn identity() -> Matrix {
-    [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-/// glTF matrices are column-major: result column `c`, row `r`.
-fn multiply(left: Matrix, right: Matrix) -> Matrix {
-    let mut result = [[0.0; 4]; 4];
-    for column in 0..4 {
-        for row in 0..4 {
-            result[column][row] = (0..4)
-                .map(|index| left[index][row] * right[column][index])
-                .sum();
-        }
-    }
-    result
-}
-
-fn transform_point(matrix: Matrix, point: [f32; 3]) -> [f32; 3] {
-    [
-        matrix[0][0] * point[0] + matrix[1][0] * point[1] + matrix[2][0] * point[2] + matrix[3][0],
-        matrix[0][1] * point[0] + matrix[1][1] * point[1] + matrix[2][1] * point[2] + matrix[3][1],
-        matrix[0][2] * point[0] + matrix[1][2] * point[1] + matrix[2][2] * point[2] + matrix[3][2],
-    ]
-}
-
-/// Transform a normal by the inverse transpose of a glTF node's linear
-/// transform. Using the ordinary direction matrix here is only correct for
-/// rotation and uniform scale and makes lighting disagree between objects.
-fn transform_normal(matrix: Matrix, normal: [f32; 3]) -> [f32; 3] {
-    let x = [matrix[0][0], matrix[0][1], matrix[0][2]];
-    let y = [matrix[1][0], matrix[1][1], matrix[1][2]];
-    let z = [matrix[2][0], matrix[2][1], matrix[2][2]];
-    let cofactor_x = cross(y, z);
-    let cofactor_y = cross(z, x);
-    let cofactor_z = cross(x, y);
-    let determinant = dot(x, cofactor_x);
-    if determinant.abs() <= f32::EPSILON {
-        return [0.0; 3];
-    }
-    [
-        (cofactor_x[0] * normal[0] + cofactor_y[0] * normal[1] + cofactor_z[0] * normal[2])
-            / determinant,
-        (cofactor_x[1] * normal[0] + cofactor_y[1] * normal[1] + cofactor_z[1] * normal[2])
-            / determinant,
-        (cofactor_x[2] * normal[0] + cofactor_y[2] * normal[1] + cofactor_z[2] * normal[2])
-            / determinant,
-    ]
-}
-
-fn cross(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
-    [
-        left[1] * right[2] - left[2] * right[1],
-        left[2] * right[0] - left[0] * right[2],
-        left[0] * right[1] - left[1] * right[0],
-    ]
-}
-
-fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
-    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
-}
-
 fn z_up(value: [f32; 3]) -> [f32; 3] {
     [value[0], -value[2], value[1]]
 }
@@ -377,30 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn matrix_hierarchy_applies_parent_before_child() {
-        let mut parent = identity();
-        parent[3][0] = 2.0;
-        let mut child = identity();
-        child[3][1] = 3.0;
-        assert_eq!(
-            transform_point(multiply(parent, child), [0.0; 3]),
-            [2.0, 3.0, 0.0]
-        );
-    }
-
-    #[test]
-    fn node_normal_uses_inverse_transpose_under_non_uniform_scale() {
-        let mut scale = identity();
-        scale[0][0] = 2.0;
-        scale[1][1] = 3.0;
-        scale[2][2] = 4.0;
-        let normal = transform_normal(scale, [1.0, 1.0, 0.0]);
-        let transformed_tangent = [2.0, -3.0, 0.0];
-
-        assert!(
-            dot(normal, transformed_tangent).abs() < 1.0e-6,
-            "an imported normal must remain perpendicular to transformed geometry"
-        );
+    fn quaternion_basis_conversion_keeps_identity() {
+        let gltf_xyzw = [0.0, 0.0, 0.0, 1.0];
+        let engine_wxyz = [gltf_xyzw[3], gltf_xyzw[0], -gltf_xyzw[2], gltf_xyzw[1]];
+        assert_eq!(engine_wxyz, [1.0, 0.0, -0.0, 0.0]);
     }
 
     #[test]
@@ -420,5 +352,35 @@ mod tests {
         asset
             .validate()
             .expect("imported field should be canonical");
+    }
+
+    #[test]
+    fn imports_car_as_a_transform_hierarchy() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../appdata/models/Fast-Driver/low_poly_car.glb");
+        if !fixture.exists() {
+            return;
+        }
+        let asset = import_gltf(&fixture).expect("generated car fixture should import");
+        let car = asset
+            .nodes
+            .iter()
+            .position(|node| node.name == "Car")
+            .expect("Car root node");
+        assert_eq!(asset.nodes[car].parent, None);
+        for name in ["Chassis", "Wheel_FL", "Wheel_FR", "Wheel_RL", "Wheel_RR"] {
+            let index = asset
+                .nodes
+                .iter()
+                .position(|node| node.name == name)
+                .unwrap_or_else(|| panic!("{name} node"));
+            assert_eq!(asset.nodes[index].parent, Some(car), "{name} parent");
+            assert!(asset.nodes[car].children.contains(&index));
+        }
+        assert!(
+            asset.nodes.iter().any(|node| !node.primitives.is_empty()),
+            "mesh primitives must remain owned by their glTF nodes"
+        );
+        asset.validate().expect("hierarchy must be canonical");
     }
 }
