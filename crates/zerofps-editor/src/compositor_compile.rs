@@ -341,6 +341,8 @@ impl Compiler<'_> {
             NodeSettings::Output { .. }
             | NodeSettings::ObjectTransform { .. }
             | NodeSettings::ObjectMesh { .. }
+            | NodeSettings::Position { .. }
+            | NodeSettings::Rotation { .. }
             | NodeSettings::MassDensity { .. }
             | NodeSettings::SpringMesh { .. }
             | NodeSettings::ForceField { .. }

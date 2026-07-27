@@ -23,7 +23,9 @@ use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, FontId, Id, Key, Layout, Pos2, Rect, RichText, Sense,
     Stroke, TextureHandle, TextureId, TextureOptions, Vec2,
 };
-use zerofps_assets::{MeshAsset, MeshAutofixReport, TextureAsset, autofix_mesh, import_file};
+use zerofps_assets::{
+    MeshAsset, MeshAutofixReport, Primitive, TextureAsset, Vertex, autofix_mesh, import_file,
+};
 use zerofps_core::{
     Attribute, AttributeDeclaration, AttributeKey, Component, GeometryTree, NodeId, Quat,
     Transform, Vec3 as CoreVec3,
@@ -55,6 +57,31 @@ enum ObjectKind {
     Light,
     Camera,
     Empty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinPrimitive {
+    Cube,
+    Sphere,
+    Floor,
+}
+
+impl BuiltinPrimitive {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cube => "Cube",
+            Self::Sphere => "Sphere",
+            Self::Floor => "Floor",
+        }
+    }
+
+    fn asset_path(self) -> &'static str {
+        match self {
+            Self::Cube => "builtin:cube",
+            Self::Sphere => "builtin:sphere",
+            Self::Floor => "builtin:floor",
+        }
+    }
 }
 
 impl ObjectKind {
@@ -210,6 +237,7 @@ enum PlayState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
     Assets,
+    Inputs,
     Scripts,
     Console,
     Telemetry,
@@ -395,6 +423,7 @@ enum NodeSettings {
         value: f32,
         minimum: f32,
         maximum: f32,
+        source_handle: Option<usize>,
     },
     Time {
         scale: f32,
@@ -437,6 +466,12 @@ enum NodeSettings {
         gravity: bool,
         time_scale: f32,
     },
+    Position {
+        values: [f32; 3],
+    },
+    Rotation {
+        degrees: [f32; 3],
+    },
     ObjectTransform {
         object_index: usize,
     },
@@ -473,6 +508,8 @@ impl NodeSettings {
             Self::ForceField { .. } => 22,
             Self::VelocityField { .. } => 23,
             Self::Simulator { .. } => 24,
+            Self::Position { .. } => 25,
+            Self::Rotation { .. } => 26,
         }
     }
 
@@ -527,6 +564,7 @@ impl NodeSettings {
                 value: 0.5,
                 minimum: 0.0,
                 maximum: 1.0,
+                source_handle: None,
             },
             15 => Self::Time {
                 scale: 1.0,
@@ -568,6 +606,8 @@ impl NodeSettings {
                 gravity: true,
                 time_scale: 1.0,
             },
+            25 => Self::Position { values: [0.0; 3] },
+            26 => Self::Rotation { degrees: [0.0; 3] },
             _ => return None,
         })
     }
@@ -1299,7 +1339,7 @@ impl EditorApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             asset_import_path: String::new(),
-            imported_assets: Vec::new(),
+            imported_assets: builtin_imported_assets(),
             viewport_mode: ViewportMode::Shaded,
             projection_mode: ProjectionMode::Orthographic,
             viewport_color: None,
@@ -1529,6 +1569,48 @@ impl EditorApp {
                     .then(|| format!(" as {} linked glTF objects", asset_nodes.len()))
                     .unwrap_or_default()
             ),
+        });
+    }
+
+    fn add_builtin_primitive(&mut self, primitive: BuiltinPrimitive) {
+        let path = primitive.asset_path();
+        if !self.imported_assets.iter().any(|asset| asset.path == path) {
+            let mesh = builtin_primitive_mesh(primitive);
+            let bounds = mesh_bounds(&mesh);
+            self.imported_assets.push(ImportedAsset {
+                path: path.into(),
+                autofixed_mesh: mesh.clone(),
+                mesh,
+                autofix_report: MeshAutofixReport::default(),
+                bounds,
+            });
+        }
+
+        let previous = self.scene.tree.clone();
+        let id = self.scene.add(primitive.label(), ObjectKind::Empty, None);
+        self.scene
+            .tree
+            .add_component(
+                id,
+                Component::Model {
+                    asset: path.into(),
+                    primitive: None,
+                },
+            )
+            .expect("fresh primitive object");
+        let _ = self.scene.tree.set_attribute(
+            id,
+            mesh_autofix_key(),
+            AttributeDeclaration::Value(Attribute::Bool(false)),
+        );
+        self.scene.selected = Some(id);
+        self.record_undo(previous);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+        self.logs.push(LogEntry {
+            level: "SCENE",
+            color: Color32::from_rgb(103, 191, 255),
+            message: format!("Added {} primitive", primitive.label()),
         });
     }
 
@@ -2466,6 +2548,7 @@ impl EditorApp {
                     value,
                     minimum,
                     maximum,
+                    source_handle,
                 } => {
                     project.project.properties.insert(
                         format!("compositor.node.{id}.object_index"),
@@ -2491,6 +2574,12 @@ impl EditorApp {
                         format!("compositor.node.{id}.handle_maximum"),
                         maximum.to_string(),
                     );
+                    if let Some(source) = source_handle {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.handle_source"),
+                            source.to_string(),
+                        );
+                    }
                 }
                 NodeSettings::Time {
                     scale,
@@ -2509,6 +2598,22 @@ impl EditorApp {
                         format!("compositor.node.{id}.time_live_update"),
                         live_update.to_string(),
                     );
+                }
+                NodeSettings::Position { values } => {
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(values) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.position_{axis}"),
+                            value.to_string(),
+                        );
+                    }
+                }
+                NodeSettings::Rotation { degrees } => {
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(degrees) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.rotation_{axis}"),
+                            value.to_string(),
+                        );
+                    }
                 }
                 NodeSettings::PaintedMask { object_index }
                 | NodeSettings::ObjectTransform { object_index }
@@ -2957,6 +3062,9 @@ impl EditorApp {
                             .get(&format!("compositor.node.{id}.handle_maximum"))
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(1.0),
+                        source_handle: properties
+                            .get(&format!("compositor.node.{id}.handle_source"))
+                            .and_then(|value| value.parse().ok()),
                     },
                     15 => NodeSettings::Time {
                         scale: properties
@@ -3055,6 +3163,14 @@ impl EditorApp {
                             .get(&format!("compositor.node.{id}.simulator_time_scale"))
                             .and_then(|value| value.parse().ok())
                             .unwrap_or(1.0),
+                    },
+                    25 => NodeSettings::Position {
+                        values: ["x", "y", "z"]
+                            .map(|axis| get_f32(&format!("compositor.node.{id}.position_{axis}"))),
+                    },
+                    26 => NodeSettings::Rotation {
+                        degrees: ["x", "y", "z"]
+                            .map(|axis| get_f32(&format!("compositor.node.{id}.rotation_{axis}"))),
                     },
                     _ => continue,
                 };
@@ -3633,6 +3749,16 @@ impl EditorApp {
                     .iter()
                     .map(|(_, n)| n.name.clone())
                     .collect();
+                let handles = self
+                    .compositor_nodes
+                    .iter()
+                    .filter_map(|node| match &node.settings {
+                        NodeSettings::ObjectHandle { label, .. } if node.id != node_id => (!self
+                            .object_handle_depends_on(node.id, node_id))
+                        .then(|| (node.id, label.clone())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 let pos = self
                     .compositor_nodes
                     .iter()
@@ -3645,6 +3771,7 @@ impl EditorApp {
                     ref mut value,
                     ref mut minimum,
                     ref mut maximum,
+                    ref mut source_handle,
                 } = self.compositor_nodes[pos].settings
                 else {
                     return;
@@ -3681,11 +3808,40 @@ impl EditorApp {
                     changed |= ui.add(egui::DragValue::new(minimum).speed(0.01)).changed();
                     changed |= ui.add(egui::DragValue::new(maximum).speed(0.01)).changed();
                 });
+                ui.label("Copy value from");
+                egui::ComboBox::from_id_salt(("compositor_handle_source", node_id))
+                    .selected_text(
+                        source_handle
+                            .and_then(|source| {
+                                handles
+                                    .iter()
+                                    .find(|(id, _)| *id == source)
+                                    .map(|(_, label)| label.as_str())
+                            })
+                            .unwrap_or("Own value"),
+                    )
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(source_handle, None, "Own value")
+                            .changed();
+                        for (source, source_label) in &handles {
+                            changed |= ui
+                                .selectable_value(
+                                    source_handle,
+                                    Some(*source),
+                                    format!("{source_label}  ·  #{source}"),
+                                )
+                                .changed();
+                        }
+                    });
                 if *maximum < *minimum {
                     std::mem::swap(minimum, maximum);
                     changed = true;
                 }
                 *value = value.clamp(*minimum, *maximum);
+                if source_handle.is_some() {
+                    ui.small("This handle mirrors the selected source live.");
+                }
             }
             15 => {
                 let pos = self
@@ -4040,13 +4196,54 @@ impl EditorApp {
                     .changed();
                 ui.small("Connect Velocity Field and Force Field, then connect this node to Object Mesh.");
             }
+            25 | 26 => {
+                let connected =
+                    [0, 1, 2].map(|axis| self.compositor_input_source(node_id, axis).is_ok());
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let values = match &mut self.compositor_nodes[pos].settings {
+                    NodeSettings::Position { values } => values,
+                    NodeSettings::Rotation { degrees } => degrees,
+                    _ => return,
+                };
+                ui.label(if kind == 25 {
+                    "Position (world units)"
+                } else {
+                    "Euler rotation (degrees)"
+                });
+                for (axis, index) in ["X", "Y", "Z"].into_iter().zip(0..3) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(axis);
+                        let response = ui.add_enabled(
+                            !connected[index],
+                            egui::DragValue::new(&mut values[index]).speed(if kind == 25 {
+                                0.01
+                            } else {
+                                0.25
+                            }),
+                        );
+                        changed |= response.changed();
+                        if connected[index] {
+                            ui.small("input");
+                        }
+                    });
+                }
+                ui.small("A connected scalar overrides only its matching axis.");
+            }
             _ => {}
         }
         if open_browse {
             self.start_compositor_image_import(ui.ctx());
         }
         if changed {
-            self.invalidate_compositor_from(node_id);
+            if kind == 14 {
+                self.invalidate_all_object_handles();
+            } else {
+                self.invalidate_compositor_from(node_id);
+            }
         }
         self.project_dirty |= changed;
     }
@@ -4192,6 +4389,18 @@ impl EditorApp {
                         {
                             self.redo();
                             ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Primitive", |ui| {
+                        for primitive in [
+                            BuiltinPrimitive::Cube,
+                            BuiltinPrimitive::Sphere,
+                            BuiltinPrimitive::Floor,
+                        ] {
+                            if ui.button(primitive.label()).clicked() {
+                                self.add_builtin_primitive(primitive);
+                                ui.close_menu();
+                            }
                         }
                     });
                     for title in ["Scene", "Build", "Window"] {
@@ -4498,7 +4707,6 @@ impl EditorApp {
             .selected
             .and_then(|selected| self.scene.tree.iter().position(|(id, _)| id == selected));
         let mut compositor_handle_changed = false;
-        let mut changed_handle_nodes = Vec::new();
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(300.0)
@@ -5059,6 +5267,7 @@ impl EditorApp {
                                                 value,
                                                 minimum,
                                                 maximum,
+                                                source_handle,
                                             } = &mut node.settings
                                             else {
                                                 continue;
@@ -5068,12 +5277,14 @@ impl EditorApp {
                                             }
                                             ui.label(label.as_str());
                                             let response = if *control == 0 {
-                                                ui.add(
+                                                ui.add_enabled(
+                                                    source_handle.is_none(),
                                                     egui::Slider::new(value, *minimum..=*maximum)
                                                         .show_value(true),
                                                 )
                                             } else {
-                                                ui.add(
+                                                ui.add_enabled(
+                                                    source_handle.is_none(),
                                                     egui::DragValue::new(value)
                                                         .range(*minimum..=*maximum)
                                                         .speed(
@@ -5082,9 +5293,11 @@ impl EditorApp {
                                                         ),
                                                 )
                                             };
+                                            if source_handle.is_some() {
+                                                ui.small("Copied from another Object Handle");
+                                            }
                                             if response.changed() {
                                                 compositor_handle_changed = true;
-                                                changed_handle_nodes.push(node.id);
                                                 self.project_dirty = true;
                                             }
                                         }
@@ -5118,9 +5331,7 @@ impl EditorApp {
             });
         if compositor_handle_changed {
             self.compositor_control_started = Some(Instant::now());
-            for node_id in changed_handle_nodes {
-                self.invalidate_compositor_from(node_id);
-            }
+            self.invalidate_all_object_handles();
             // Vulkan work is coalesced by latest-request workers, so an
             // additional UI debounce only adds visible control latency.
             self.compositor_apply_due = Some(Instant::now());
@@ -5136,6 +5347,7 @@ impl EditorApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     tab(ui, &mut self.bottom_tab, BottomTab::Assets, "Assets");
+                    tab(ui, &mut self.bottom_tab, BottomTab::Inputs, "Inputs");
                     tab(ui, &mut self.bottom_tab, BottomTab::Scripts, "Scripts");
                     tab(ui, &mut self.bottom_tab, BottomTab::Console, "Console");
                     tab(ui, &mut self.bottom_tab, BottomTab::Telemetry, "Telemetry");
@@ -5146,11 +5358,110 @@ impl EditorApp {
                 ui.separator();
                 match self.bottom_tab {
                     BottomTab::Assets => self.assets_panel(ui),
+                    BottomTab::Inputs => self.object_handles_panel(ui),
                     BottomTab::Scripts => scripts_panel(ui),
                     BottomTab::Console => console_panel(ui, &self.logs),
                     BottomTab::Telemetry => telemetry_panel(ui, self.play_state, &self.performance),
                 }
             });
+    }
+
+    fn object_handles_panel(&mut self, ui: &mut egui::Ui) {
+        let handles = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match &node.settings {
+                NodeSettings::ObjectHandle {
+                    object_index,
+                    label,
+                    control,
+                    value,
+                    minimum,
+                    maximum,
+                    source_handle,
+                } => Some((
+                    node.id,
+                    *object_index,
+                    label.clone(),
+                    *control,
+                    *value,
+                    *minimum,
+                    *maximum,
+                    *source_handle,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if handles.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No Object Handles yet. Add one from Nodes → Add → Input.");
+            });
+            return;
+        }
+        let labels = handles
+            .iter()
+            .map(|(id, _, label, ..)| (*id, label.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut writes = Vec::new();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (id, object_index, label, control, value, minimum, maximum, source) in &handles {
+                let object = self
+                    .scene
+                    .tree
+                    .iter()
+                    .nth(*object_index)
+                    .map(|(_, node)| node.name.as_str())
+                    .unwrap_or("Missing object");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(label).strong());
+                    ui.small(format!("{object} · #{id}"));
+                    if let Some(source) = source {
+                        ui.small(format!(
+                            "copies {}",
+                            labels
+                                .get(source)
+                                .map(String::as_str)
+                                .unwrap_or("missing handle")
+                        ));
+                    }
+                });
+                let effective = self.resolve_object_handle_value(*id).unwrap_or(*value);
+                let mut edited = if source.is_some() { effective } else { *value };
+                let response = if *control == 0 {
+                    ui.add_enabled(
+                        source.is_none(),
+                        egui::Slider::new(&mut edited, *minimum..=*maximum).show_value(true),
+                    )
+                } else {
+                    ui.add_enabled(
+                        source.is_none(),
+                        egui::DragValue::new(&mut edited)
+                            .range(*minimum..=*maximum)
+                            .speed(((*maximum - *minimum).abs() / 100.0).max(0.001)),
+                    )
+                };
+                if response.changed() {
+                    writes.push((*id, edited));
+                }
+                ui.separator();
+            }
+        });
+        if !writes.is_empty() {
+            for (id, value) in writes {
+                if let Some(node) = self.compositor_nodes.iter_mut().find(|node| node.id == id)
+                    && let NodeSettings::ObjectHandle {
+                        value: handle_value,
+                        ..
+                    } = &mut node.settings
+                {
+                    *handle_value = value;
+                }
+            }
+            self.invalidate_all_object_handles();
+            self.compositor_control_started = Some(Instant::now());
+            self.compositor_apply_due = Some(Instant::now());
+            self.project_dirty = true;
+        }
     }
 
     fn assets_panel(&mut self, ui: &mut egui::Ui) {
@@ -5390,6 +5701,161 @@ impl EditorApp {
 
     fn object_node_id(&self, object_index: usize) -> Option<NodeId> {
         self.scene.tree.iter().nth(object_index).map(|(id, _)| id)
+    }
+
+    fn resolve_object_handle_value(&self, node_id: usize) -> Option<f32> {
+        resolve_object_handle_value(&self.compositor_nodes, node_id)
+    }
+
+    fn object_handle_depends_on(&self, start: usize, target: usize) -> bool {
+        let mut current = Some(start);
+        let mut visited = BTreeSet::new();
+        while let Some(id) = current {
+            if id == target {
+                return true;
+            }
+            if !visited.insert(id) {
+                return true;
+            }
+            current = self
+                .compositor_nodes
+                .iter()
+                .find(|node| node.id == id)
+                .and_then(|node| match node.settings {
+                    NodeSettings::ObjectHandle { source_handle, .. } => source_handle,
+                    _ => None,
+                });
+        }
+        false
+    }
+
+    fn invalidate_all_object_handles(&mut self) {
+        let handles = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| {
+                matches!(node.settings, NodeSettings::ObjectHandle { .. }).then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        for id in handles {
+            self.invalidate_compositor_from(id);
+        }
+    }
+
+    fn scalar_node_value(
+        &mut self,
+        node_id: usize,
+        output: usize,
+        visiting: &mut BTreeSet<usize>,
+    ) -> Option<f32> {
+        if !visiting.insert(node_id) {
+            return None;
+        }
+        let settings = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == node_id)?
+            .settings
+            .clone();
+        let value = match settings {
+            NodeSettings::ConstantValue { value, .. } => Some(value),
+            NodeSettings::ObjectHandle { .. } => self.resolve_object_handle_value(node_id),
+            NodeSettings::Time { scale, modulus, .. } => Some(scaled_modulated_time(
+                self.compositor_clock_started.elapsed().as_secs_f32(),
+                scale,
+                modulus,
+            )),
+            _ => {
+                let mut texture_visiting = BTreeSet::new();
+                self.evaluate_compositor_node(node_id, output, &mut texture_visiting)
+                    .ok()
+                    .and_then(|texture| texture.pixels.first().copied())
+                    .map(|value| value as f32 / 255.0)
+            }
+        };
+        visiting.remove(&node_id);
+        value.filter(|value| value.is_finite())
+    }
+
+    fn transform_vector_value(&mut self, node_id: usize) -> Option<([f32; 3], bool)> {
+        let settings = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == node_id)?
+            .settings
+            .clone();
+        let mut values = match settings {
+            NodeSettings::Position { values } => values,
+            NodeSettings::Rotation { degrees } => degrees,
+            _ => return None,
+        };
+        let mut driven = false;
+        for axis in 0..3 {
+            if let Ok((source, output)) = self.compositor_input_source(node_id, axis) {
+                let mut visiting = BTreeSet::new();
+                if let Some(value) = self.scalar_node_value(source, output, &mut visiting) {
+                    values[axis] = value;
+                    driven = true;
+                }
+            }
+        }
+        Some((values, driven))
+    }
+
+    fn apply_object_transform_graphs(&mut self) {
+        let outputs = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match node.settings {
+                NodeSettings::ObjectTransform { object_index } => Some((node.id, object_index)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (output_node, object_index) in outputs {
+            let Some(id) = self.object_node_id(object_index) else {
+                continue;
+            };
+            let Ok(node) = self.scene.tree.node(id) else {
+                continue;
+            };
+            let mut transform = node.local_transform();
+            let original = transform;
+            if let Ok((source, _)) = self.compositor_input_source(output_node, 0)
+                && matches!(
+                    self.compositor_nodes
+                        .iter()
+                        .find(|node| node.id == source)
+                        .map(|node| &node.settings),
+                    Some(NodeSettings::Position { .. })
+                )
+                && let Some((position, _)) = self.transform_vector_value(source)
+            {
+                transform.translation = CoreVec3::new(position[0], position[1], position[2]);
+            }
+            if let Ok((source, _)) = self.compositor_input_source(output_node, 1)
+                && matches!(
+                    self.compositor_nodes
+                        .iter()
+                        .find(|node| node.id == source)
+                        .map(|node| &node.settings),
+                    Some(NodeSettings::Rotation { .. })
+                )
+                && let Some((degrees, _)) = self.transform_vector_value(source)
+            {
+                transform.rotation = Quat::from_euler_xyz(CoreVec3::new(
+                    degrees[0].to_radians(),
+                    degrees[1].to_radians(),
+                    degrees[2].to_radians(),
+                ));
+            }
+            if transform != original && self.scene.tree.set_local_transform(id, transform).is_ok() {
+                changed = true;
+            }
+        }
+        if changed {
+            self.scene_revision = self.scene_revision.wrapping_add(1);
+        }
     }
 
     fn selected_object_index(&self) -> Option<usize> {
@@ -5697,7 +6163,10 @@ impl EditorApp {
                 };
                 Ok(Arc::new(join_compositor_channels([&r, &g, &b], Some(&a))))
             }
-            NodeSettings::ObjectHandle { value, .. } => {
+            NodeSettings::ObjectHandle { .. } => {
+                let value = self
+                    .resolve_object_handle_value(node_id)
+                    .ok_or_else(|| "Object Handle copy cycle or missing source".to_owned())?;
                 let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
                 Ok(Arc::new(TextureAsset {
                     name: "compositor-object-handle".into(),
@@ -5724,7 +6193,10 @@ impl EditorApp {
                 let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
                 self.evaluate_compositor_node(from_id, from_out, visiting)
             }
-            NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. } => {
+            NodeSettings::ObjectTransform { .. }
+            | NodeSettings::ObjectMesh { .. }
+            | NodeSettings::Position { .. }
+            | NodeSettings::Rotation { .. } => {
                 Err("object output nodes cannot be evaluated as textures".into())
             }
             NodeSettings::MassDensity { .. }
@@ -6890,6 +7362,14 @@ impl EditorApp {
                                 }
                             }
                         });
+                        ui.menu_button("Transform", |ui| {
+                            if compositor_add_button(ui, true, "XYZ Position") {
+                                self.activate_compositor_node(25);
+                            }
+                            if compositor_add_button(ui, true, "XYZ Rotation") {
+                                self.activate_compositor_node(26);
+                            }
+                        });
                         ui.menu_button("Color", |ui| {
                             for (index, label) in [(3, "Remap"), (10, "Color Space Convert"), (11, "Color Decoder"), (13, "Color Encoder"), (12, "Grayscale")] {
                                 if compositor_add_button(ui, true, label) {
@@ -7014,7 +7494,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 25] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 27] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -7044,11 +7524,14 @@ impl EditorApp {
                     ("Force Field", "Dynamics", Color32::from_rgb(151, 95, 76)),
                     ("Velocity Field", "Dynamics", Color32::from_rgb(70, 145, 135)),
                     ("Simulator", "Simulation", Color32::from_rgb(166, 124, 57)),
+                    ("XYZ Position", "Transform", Color32::from_rgb(91, 118, 166)),
+                    ("XYZ Rotation", "Transform", Color32::from_rgb(91, 118, 166)),
                 ];
-                let node_heights_by_kind: [f32; 25] = [
+                let node_heights_by_kind: [f32; 27] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
                     175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
                     285.0, 235.0, 245.0, 285.0, 190.0,
+                    205.0, 205.0,
                 ];
                 let node_width = 230.0;
 
@@ -7087,7 +7570,7 @@ impl EditorApp {
                         9 => 85.0 + input as f32 * 30.0,
                         11 => 70.0,
                         13 => 75.0 + input as f32 * 22.0,
-                        17 => 74.0 + input as f32 * 26.0,
+                        17 | 25 | 26 => 74.0 + input as f32 * 26.0,
                         22 => 74.0 + input as f32 * 26.0,
                         24 => 74.0 + input as f32 * 26.0,
                         _ => 70.0,
@@ -7287,6 +7770,8 @@ impl EditorApp {
                             painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Strength Texture", FontId::proportional(10.0 * scale), Color32::from_gray(180));
                         } else if kind == 24 {
                             painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Velocity Field", "Force Field"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
+                        } else if matches!(kind, 25 | 26) {
+                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["X", "Y", "Z"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
                         }
                     }
 
@@ -8034,6 +8519,7 @@ impl eframe::App for EditorApp {
         self.sync_compositor_outputs();
         self.poll_vulkan_compositor(ctx);
         self.tick_compositor_time(ctx);
+        self.apply_object_transform_graphs();
         self.poll_compositor_apply(ctx);
         self.tick_dynamics(ctx);
         self.poll_build(ctx);
@@ -8492,6 +8978,32 @@ impl FormulaParser<'_> {
     }
 }
 
+fn resolve_object_handle_value(nodes: &[CompositorNode], node_id: usize) -> Option<f32> {
+    fn resolve(
+        nodes: &[CompositorNode],
+        node_id: usize,
+        visiting: &mut BTreeSet<usize>,
+    ) -> Option<f32> {
+        if !visiting.insert(node_id) {
+            return None;
+        }
+        let value = match &nodes.iter().find(|node| node.id == node_id)?.settings {
+            NodeSettings::ObjectHandle {
+                value,
+                source_handle,
+                ..
+            } => match source_handle {
+                Some(source) => resolve(nodes, *source, visiting),
+                None => Some(*value),
+            },
+            _ => None,
+        };
+        visiting.remove(&node_id);
+        value.filter(|value| value.is_finite())
+    }
+    resolve(nodes, node_id, &mut BTreeSet::new())
+}
+
 fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
     match kind {
         9 => {
@@ -8502,7 +9014,7 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
             }
         }
         13 => 4,
-        17 => 3,
+        17 | 25 | 26 => 3,
         18 => 1,
         19 => 0,
         22 => 3,
@@ -10385,6 +10897,221 @@ fn analytical_projected_line(
     clip_infinite_line_to_rect(cross_homogeneous(first, second), rect)
 }
 
+fn builtin_primitive_mesh(kind: BuiltinPrimitive) -> MeshAsset {
+    match kind {
+        BuiltinPrimitive::Cube => builtin_cube(),
+        BuiltinPrimitive::Sphere => builtin_sphere(24, 16),
+        BuiltinPrimitive::Floor => builtin_floor(),
+    }
+}
+
+fn builtin_imported_assets() -> Vec<ImportedAsset> {
+    [
+        BuiltinPrimitive::Cube,
+        BuiltinPrimitive::Sphere,
+        BuiltinPrimitive::Floor,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let mesh = builtin_primitive_mesh(kind);
+        let bounds = mesh_bounds(&mesh);
+        ImportedAsset {
+            path: kind.asset_path().into(),
+            autofixed_mesh: mesh.clone(),
+            mesh,
+            autofix_report: MeshAutofixReport::default(),
+            bounds,
+        }
+    })
+    .collect()
+}
+
+fn builtin_cube() -> MeshAsset {
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    let mut face = |corners: [[f32; 3]; 4], normal: [f32; 3]| {
+        let start = vertices.len() as u32;
+        for (position, uv) in
+            corners
+                .into_iter()
+                .zip([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+        {
+            vertices.push(Vertex {
+                position,
+                normal,
+                uv,
+                color: [1.0; 4],
+            });
+        }
+        indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+    };
+    face(
+        [
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, -0.5, 0.5],
+        ],
+        [1.0, 0.0, 0.0],
+    );
+    face(
+        [
+            [-0.5, 0.5, -0.5],
+            [-0.5, -0.5, -0.5],
+            [-0.5, -0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+        ],
+        [-1.0, 0.0, 0.0],
+    );
+    face(
+        [
+            [-0.5, 0.5, -0.5],
+            [-0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, -0.5],
+        ],
+        [0.0, 1.0, 0.0],
+    );
+    face(
+        [
+            [-0.5, -0.5, 0.5],
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, -0.5, 0.5],
+        ],
+        [0.0, -1.0, 0.0],
+    );
+    face(
+        [
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+        ],
+        [0.0, 0.0, 1.0],
+    );
+    face(
+        [
+            [-0.5, 0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [-0.5, -0.5, -0.5],
+        ],
+        [0.0, 0.0, -1.0],
+    );
+    canonical_builtin_mesh("Cube", vertices, indices)
+}
+
+fn builtin_sphere(segments: usize, stacks: usize) -> MeshAsset {
+    let mut vertices = Vec::with_capacity(2 + segments * (stacks - 1));
+    vertices.push(Vertex {
+        position: [0.0, 0.0, -0.5],
+        normal: [0.0, 0.0, -1.0],
+        uv: [0.5, 1.0],
+        color: [1.0; 4],
+    });
+    for stack in 1..stacks {
+        let v = stack as f32 / stacks as f32;
+        let latitude = -std::f32::consts::FRAC_PI_2 + v * std::f32::consts::PI;
+        let (z, radius) = latitude.sin_cos();
+        for segment in 0..segments {
+            let u = segment as f32 / segments as f32;
+            let longitude = u * std::f32::consts::TAU;
+            let (y, x) = longitude.sin_cos();
+            let normal = [radius * x, radius * y, z];
+            vertices.push(Vertex {
+                position: normal.map(|value| value * 0.5),
+                normal,
+                uv: [u, 1.0 - v],
+                color: [1.0; 4],
+            });
+        }
+    }
+    let top = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: [0.0, 0.0, 0.5],
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.5, 0.0],
+        color: [1.0; 4],
+    });
+
+    let mut indices = Vec::with_capacity(segments * (stacks - 1) * 6);
+    for segment in 0..segments {
+        let current = 1 + segment as u32;
+        let next = 1 + ((segment + 1) % segments) as u32;
+        indices.extend_from_slice(&[0, next, current]);
+    }
+    for ring in 0..stacks - 2 {
+        for segment in 0..segments {
+            let a = 1 + (ring * segments + segment) as u32;
+            let b = 1 + (ring * segments + (segment + 1) % segments) as u32;
+            let d = 1 + ((ring + 1) * segments + segment) as u32;
+            let c = 1 + ((ring + 1) * segments + (segment + 1) % segments) as u32;
+            indices.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+    let last_ring = 1 + ((stacks - 2) * segments) as u32;
+    for segment in 0..segments {
+        let current = last_ring + segment as u32;
+        let next = last_ring + ((segment + 1) % segments) as u32;
+        indices.extend_from_slice(&[current, next, top]);
+    }
+    canonical_builtin_mesh("Sphere", vertices, indices)
+}
+
+fn builtin_floor() -> MeshAsset {
+    canonical_builtin_mesh(
+        "Floor",
+        vec![
+            Vertex {
+                position: [-5.0, -5.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                color: [1.0; 4],
+            },
+            Vertex {
+                position: [5.0, -5.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [10.0, 0.0],
+                color: [1.0; 4],
+            },
+            Vertex {
+                position: [5.0, 5.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [10.0, 10.0],
+                color: [1.0; 4],
+            },
+            Vertex {
+                position: [-5.0, 5.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 10.0],
+                color: [1.0; 4],
+            },
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+    )
+}
+
+fn canonical_builtin_mesh(name: &str, vertices: Vec<Vertex>, indices: Vec<u32>) -> MeshAsset {
+    MeshAsset {
+        name: name.into(),
+        vertices,
+        primitives: vec![Primitive {
+            name: name.into(),
+            material: None,
+            indices,
+        }],
+        source: zerofps_assets::SourceInfo {
+            format: "ZeroFPS built-in".into(),
+            up_axis: zerofps_assets::AxisConvention::ZUp,
+            handedness: zerofps_assets::Handedness::Right,
+            unit_scale_meters: Some(1.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 fn infer_grid_spacing(asset: &MeshAsset) -> Option<f32> {
     let mut longest_squared = 0.0f32;
     for primitive in &asset.primitives {
@@ -10943,6 +11670,57 @@ mod tests {
     }
 
     #[test]
+    fn builtin_primitives_are_valid_non_degenerate_z_up_meshes() {
+        for (kind, triangles) in [
+            (BuiltinPrimitive::Cube, 12),
+            (BuiltinPrimitive::Sphere, 720),
+            (BuiltinPrimitive::Floor, 2),
+        ] {
+            let mesh = builtin_primitive_mesh(kind);
+            mesh.validate().expect("built-in mesh must be canonical");
+            assert_eq!(mesh.triangle_count(), triangles);
+            assert_eq!(mesh.source.up_axis, zerofps_assets::AxisConvention::ZUp);
+            for primitive in &mesh.primitives {
+                for triangle in primitive.indices.chunks_exact(3) {
+                    let points = [
+                        mesh.vertices[triangle[0] as usize].position,
+                        mesh.vertices[triangle[1] as usize].position,
+                        mesh.vertices[triangle[2] as usize].position,
+                    ];
+                    let ab = CoreVec3::new(
+                        points[1][0] - points[0][0],
+                        points[1][1] - points[0][1],
+                        points[1][2] - points[0][2],
+                    );
+                    let ac = CoreVec3::new(
+                        points[2][0] - points[0][0],
+                        points[2][1] - points[0][1],
+                        points[2][2] - points[0][2],
+                    );
+                    assert!(
+                        ab.cross(ac).length() > 1.0e-6,
+                        "{} contains a degenerate triangle",
+                        kind.label()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_assets_have_stable_non_file_paths() {
+        let assets = builtin_imported_assets();
+        assert_eq!(assets.len(), 3);
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.path.as_str())
+                .collect::<Vec<_>>(),
+            ["builtin:cube", "builtin:sphere", "builtin:floor"]
+        );
+    }
+
+    #[test]
     fn orthographic_grid_segment_matches_direct_projection() {
         let segment = [[-2.0, 1.0, 0.0], [4.0, 1.0, 0.0]];
         let projected = project_segment(
@@ -11398,8 +12176,20 @@ mod tests {
         assert_eq!(compositor_input_count(9, 0), 2);
         assert_eq!(compositor_input_count(9, 1), 3);
         assert_eq!(compositor_input_count(13, 0), 4);
+        assert_eq!(compositor_input_count(25, 0), 3);
+        assert_eq!(compositor_input_count(26, 0), 3);
         assert_eq!(compositor_output_count(11), 4);
+        assert_eq!(compositor_output_count(25), 1);
+        assert_eq!(compositor_output_count(26), 1);
         assert_eq!(compositor_output_count(0), 1);
+        assert!(matches!(
+            NodeSettings::default_for_kind(25),
+            Some(NodeSettings::Position { values }) if values == [0.0; 3]
+        ));
+        assert!(matches!(
+            NodeSettings::default_for_kind(26),
+            Some(NodeSettings::Rotation { degrees }) if degrees == [0.0; 3]
+        ));
         let parent = egui::LayerId::new(egui::Order::Background, Id::new("fixture"));
         assert_eq!(compositor_control_layer(parent, 3).order, parent.order);
         let canvas = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(900.0, 650.0));
@@ -11409,6 +12199,39 @@ mod tests {
         let position = compositor_centered_position(canvas, origin, scale, size);
         let screen_center = origin + (position + size * 0.5) * scale;
         assert_eq!(screen_center, canvas.center());
+    }
+
+    #[test]
+    fn object_handles_copy_live_values_and_reject_cycles() {
+        let handle = |id, value, source_handle| CompositorNode {
+            id,
+            object_index: 0,
+            settings: NodeSettings::ObjectHandle {
+                object_index: 0,
+                label: format!("Handle {id}"),
+                control: 0,
+                value,
+                minimum: -10.0,
+                maximum: 10.0,
+                source_handle,
+            },
+            position: Vec2::ZERO,
+        };
+        let mut nodes = vec![
+            handle(1, 3.5, None),
+            handle(2, 0.0, Some(1)),
+            handle(3, 0.0, Some(2)),
+        ];
+        assert_eq!(resolve_object_handle_value(&nodes, 3), Some(3.5));
+        if let NodeSettings::ObjectHandle { value, .. } = &mut nodes[0].settings {
+            *value = -2.25;
+        }
+        assert_eq!(resolve_object_handle_value(&nodes, 2), Some(-2.25));
+        if let NodeSettings::ObjectHandle { source_handle, .. } = &mut nodes[0].settings {
+            *source_handle = Some(3);
+        }
+        assert_eq!(resolve_object_handle_value(&nodes, 1), None);
+        assert_eq!(resolve_object_handle_value(&nodes, 3), None);
     }
 
     #[test]
