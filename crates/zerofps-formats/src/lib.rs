@@ -394,6 +394,56 @@ mod tests {
     }
 
     #[test]
+    fn collider_settings_round_trip_in_readable_scene_json() {
+        let mut project = sample_project();
+        let root = project.scene.geometry.roots()[0];
+        project
+            .scene
+            .geometry
+            .add_component(
+                root,
+                Component::Collider {
+                    shape: "cylinder".into(),
+                    center: Vec3::new(1.0, 2.0, 3.0),
+                    half_extents: Vec3::new(0.75, 0.75, 1.5),
+                    radius: 0.75,
+                    height: 3.0,
+                    coupling_stiffness: 0.5,
+                    coupling_damping: 1.0,
+                    elasticity_stiffness: 0.5,
+                    elasticity_damping: 1.0,
+                    restitution: 0.0,
+                    force_cutoff: 0.01,
+                    collision_force_cutoff: 0.01,
+                    density: 1_000.0,
+                    mass: 5_301.4375,
+                    automatic_mass: true,
+                    friction: Vec3::new(0.05, 0.8, 0.8),
+                    joint: "engine".into(),
+                },
+            )
+            .unwrap();
+        let json = project.to_json().unwrap();
+        let loaded = ProjectFile::from_json(&json).unwrap();
+        assert_eq!(loaded.to_json().unwrap(), json);
+        assert!(json.contains("\"shape\": \"cylinder\""));
+        assert!(json.contains("\"radius\": 0.75"));
+        assert!(json.contains("\"joint\": \"engine\""));
+
+        let legacy: Component = serde_json::from_str(r#"{"Collider":{"shape":"box"}}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            Component::Collider {
+                half_extents,
+                radius: 0.5,
+                height: 1.0,
+                restitution: 0.0,
+                ..
+            } if half_extents == Vec3::new(0.5, 0.5, 0.5)
+        ));
+    }
+
+    #[test]
     fn rejects_wrong_version_and_empty_names() {
         let mut project = sample_project();
         project.version = 99;

@@ -66,6 +66,81 @@ enum BuiltinPrimitive {
     Floor,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColliderShape {
+    Sphere,
+    Cylinder,
+    Box,
+    Flat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CylinderJoint {
+    #[default]
+    None,
+    Wheel,
+    Engine,
+}
+
+impl CylinderJoint {
+    const ALL: [Self; 3] = [Self::None, Self::Wheel, Self::Engine];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Wheel => "Wheel joint",
+            Self::Engine => "Engine joint",
+        }
+    }
+
+    fn storage_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Wheel => "wheel",
+            Self::Engine => "engine",
+        }
+    }
+
+    fn from_storage(value: &str) -> Self {
+        match value {
+            "wheel" => Self::Wheel,
+            "engine" => Self::Engine,
+            _ => Self::None,
+        }
+    }
+}
+
+impl ColliderShape {
+    const ALL: [Self; 4] = [Self::Sphere, Self::Cylinder, Self::Box, Self::Flat];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sphere => "Sphere",
+            Self::Cylinder => "Cylinder",
+            Self::Box => "Box",
+            Self::Flat => "Flat",
+        }
+    }
+
+    fn storage_name(self) -> &'static str {
+        match self {
+            Self::Sphere => "sphere",
+            Self::Cylinder => "cylinder",
+            Self::Box => "box",
+            Self::Flat => "flat",
+        }
+    }
+
+    fn from_storage(value: &str) -> Self {
+        match value {
+            "sphere" => Self::Sphere,
+            "cylinder" => Self::Cylinder,
+            "flat" => Self::Flat,
+            _ => Self::Box,
+        }
+    }
+}
+
 impl BuiltinPrimitive {
     fn label(self) -> &'static str {
         match self {
@@ -472,6 +547,25 @@ enum NodeSettings {
     Rotation {
         degrees: [f32; 3],
     },
+    ObjectSimulator {
+        object_index: usize,
+        mass: f32,
+        gravity: bool,
+        linear_velocity: [f32; 3],
+        angular_velocity: [f32; 3],
+        linear_damping: f32,
+        angular_damping: f32,
+    },
+    ForceOutput {
+        object_index: usize,
+        force: [f32; 3],
+    },
+    Engine {
+        object_index: usize,
+        throttle: f32,
+        torque: f32,
+        reverse: bool,
+    },
     ObjectTransform {
         object_index: usize,
     },
@@ -510,6 +604,9 @@ impl NodeSettings {
             Self::Simulator { .. } => 24,
             Self::Position { .. } => 25,
             Self::Rotation { .. } => 26,
+            Self::ObjectSimulator { .. } => 27,
+            Self::ForceOutput { .. } => 28,
+            Self::Engine { .. } => 29,
         }
     }
 
@@ -608,9 +705,42 @@ impl NodeSettings {
             },
             25 => Self::Position { values: [0.0; 3] },
             26 => Self::Rotation { degrees: [0.0; 3] },
+            27 => Self::ObjectSimulator {
+                object_index: 0,
+                mass: 1.0,
+                gravity: true,
+                linear_velocity: [0.0; 3],
+                angular_velocity: [0.0; 3],
+                linear_damping: 0.05,
+                angular_damping: 0.05,
+            },
+            28 => return None,
+            29 => Self::Engine {
+                object_index: 0,
+                throttle: 0.0,
+                torque: 100.0,
+                reverse: false,
+            },
             _ => return None,
         })
     }
+}
+
+#[derive(Clone)]
+struct ObjectSimulationState {
+    initial_position: CoreVec3,
+    initial_rotation_degrees: CoreVec3,
+    position: CoreVec3,
+    rotation_degrees: CoreVec3,
+    linear_velocity: CoreVec3,
+    angular_velocity: CoreVec3,
+}
+
+#[derive(Clone, Copy)]
+struct JointSimulationState {
+    base_rotation: Quat,
+    angle_radians: f32,
+    angular_velocity: f32,
 }
 
 struct CompositorNode {
@@ -1157,6 +1287,8 @@ struct EditorApp {
     compositor_next_time_tick: Instant,
     dynamics_fields: HashMap<NodeId, MeshScalarField>,
     dynamics_cloth: HashMap<NodeId, ClothState>,
+    object_simulation_states: HashMap<usize, ObjectSimulationState>,
+    joint_simulation_states: HashMap<NodeId, JointSimulationState>,
     dynamics_enabled: BTreeSet<NodeId>,
     dynamics_running: bool,
     dynamics_single_step: bool,
@@ -1278,6 +1410,8 @@ impl EditorApp {
             compositor_next_time_tick: Instant::now(),
             dynamics_fields: HashMap::new(),
             dynamics_cloth: HashMap::new(),
+            object_simulation_states: HashMap::new(),
+            joint_simulation_states: HashMap::new(),
             dynamics_enabled: BTreeSet::new(),
             dynamics_running: false,
             dynamics_single_step: false,
@@ -1612,6 +1746,69 @@ impl EditorApp {
             color: Color32::from_rgb(103, 191, 255),
             message: format!("Added {} primitive", primitive.label()),
         });
+    }
+
+    fn best_fit_collider(&self, root: NodeId, shape: ColliderShape) -> Component {
+        let bounds = self
+            .collider_subtree_bounds(root)
+            .unwrap_or(([-0.5; 3], [0.5; 3]));
+        fitted_collider_from_bounds(bounds, shape)
+    }
+
+    fn collider_subtree_bounds(&self, root: NodeId) -> Option<([f32; 3], [f32; 3])> {
+        let root_global = self.scene.tree.node(root).ok()?.global_transform();
+        let mut stack = vec![root];
+        let mut minimum = [f32::INFINITY; 3];
+        let mut maximum = [f32::NEG_INFINITY; 3];
+        let mut found = false;
+        while let Some(id) = stack.pop() {
+            let node = self.scene.tree.node(id).ok()?;
+            stack.extend(node.children().iter().copied());
+            let Ok(relative) = root_global.relative_to(node.global_transform()) else {
+                continue;
+            };
+            for component in &node.components {
+                let Component::Model { asset, primitive } = component else {
+                    continue;
+                };
+                let Some(mesh) = self
+                    .imported_assets
+                    .iter()
+                    .find(|candidate| candidate.path == *asset)
+                    .map(|asset| &asset.mesh)
+                else {
+                    continue;
+                };
+                let primitive_indices = primitive
+                    .map(|index| index..index.saturating_add(1))
+                    .unwrap_or(0..mesh.primitives.len());
+                for primitive_index in primitive_indices {
+                    let Some(primitive) = mesh.primitives.get(primitive_index) else {
+                        continue;
+                    };
+                    for index in &primitive.indices {
+                        let Some(vertex) = mesh.vertices.get(*index as usize) else {
+                            continue;
+                        };
+                        let point =
+                            relative
+                                .rotation
+                                .rotate(relative.scale.component_mul(CoreVec3::new(
+                                    vertex.position[0],
+                                    vertex.position[1],
+                                    vertex.position[2],
+                                )))
+                                + relative.translation;
+                        for (axis, value) in [point.x, point.y, point.z].into_iter().enumerate() {
+                            minimum[axis] = minimum[axis].min(value);
+                            maximum[axis] = maximum[axis].max(value);
+                        }
+                        found = true;
+                    }
+                }
+            }
+        }
+        found.then_some((minimum, maximum))
     }
 
     fn build_preview_triangles(&self) -> Vec<PreviewTriangle> {
@@ -2726,6 +2923,73 @@ impl EditorApp {
                             .insert(format!("compositor.node.{id}.{suffix}"), value);
                     }
                 }
+                NodeSettings::ObjectSimulator {
+                    object_index,
+                    mass,
+                    gravity,
+                    linear_velocity,
+                    angular_velocity,
+                    linear_damping,
+                    angular_damping,
+                } => {
+                    for (suffix, value) in [
+                        ("object_index", object_index.to_string()),
+                        ("object_sim_mass", mass.to_string()),
+                        ("object_sim_gravity", gravity.to_string()),
+                        ("object_sim_linear_damping", linear_damping.to_string()),
+                        ("object_sim_angular_damping", angular_damping.to_string()),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{suffix}"), value);
+                    }
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(linear_velocity) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.object_sim_velocity_{axis}"),
+                            value.to_string(),
+                        );
+                    }
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(angular_velocity) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.object_sim_angular_{axis}"),
+                            value.to_string(),
+                        );
+                    }
+                }
+                NodeSettings::ForceOutput {
+                    object_index,
+                    force,
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.object_index"),
+                        object_index.to_string(),
+                    );
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(force) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.force_output_{axis}"),
+                            value.to_string(),
+                        );
+                    }
+                }
+                NodeSettings::Engine {
+                    object_index,
+                    throttle,
+                    torque,
+                    reverse,
+                } => {
+                    for (suffix, value) in [
+                        ("object_index", object_index.to_string()),
+                        ("engine_throttle", throttle.to_string()),
+                        ("engine_torque", torque.to_string()),
+                        ("engine_reverse", reverse.to_string()),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{suffix}"), value);
+                    }
+                }
                 NodeSettings::Debug => {}
             }
         }
@@ -3172,6 +3436,52 @@ impl EditorApp {
                         degrees: ["x", "y", "z"]
                             .map(|axis| get_f32(&format!("compositor.node.{id}.rotation_{axis}"))),
                     },
+                    27 => NodeSettings::ObjectSimulator {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        mass: properties
+                            .get(&format!("compositor.node.{id}.object_sim_mass"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                        gravity: properties
+                            .get(&format!("compositor.node.{id}.object_sim_gravity"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(true),
+                        linear_velocity: ["x", "y", "z"].map(|axis| {
+                            get_f32(&format!("compositor.node.{id}.object_sim_velocity_{axis}"))
+                        }),
+                        angular_velocity: ["x", "y", "z"].map(|axis| {
+                            get_f32(&format!("compositor.node.{id}.object_sim_angular_{axis}"))
+                        }),
+                        linear_damping: properties
+                            .get(&format!("compositor.node.{id}.object_sim_linear_damping"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.05),
+                        angular_damping: properties
+                            .get(&format!("compositor.node.{id}.object_sim_angular_damping"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.05),
+                    },
+                    28 => NodeSettings::ForceOutput {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        force: ["x", "y", "z"].map(|axis| {
+                            get_f32(&format!("compositor.node.{id}.force_output_{axis}"))
+                        }),
+                    },
+                    29 => NodeSettings::Engine {
+                        object_index: get_usize(&format!("compositor.node.{id}.object_index")),
+                        throttle: properties
+                            .get(&format!("compositor.node.{id}.engine_throttle"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.0),
+                        torque: properties
+                            .get(&format!("compositor.node.{id}.engine_torque"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(100.0),
+                        reverse: properties
+                            .get(&format!("compositor.node.{id}.engine_reverse"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(false),
+                    },
                     _ => continue,
                 };
                 loaded_nodes.push(CompositorNode {
@@ -3189,6 +3499,9 @@ impl EditorApp {
                             | NodeSettings::ForceField { object_index, .. }
                             | NodeSettings::VelocityField { object_index, .. }
                             | NodeSettings::Simulator { object_index, .. }
+                            | NodeSettings::ObjectSimulator { object_index, .. }
+                            | NodeSettings::ForceOutput { object_index, .. }
+                            | NodeSettings::Engine { object_index, .. }
                             | NodeSettings::ObjectTransform { object_index }
                             | NodeSettings::ObjectMesh { object_index } => *object_index,
                             _ => 0,
@@ -3433,7 +3746,6 @@ impl EditorApp {
                     points.remove(idx);
                     changed = true;
                 }
-                ui.small("Click curve to add · click point to select · endpoints fixed.");
             }
             4 => {
                 let pos = self
@@ -3482,7 +3794,6 @@ impl EditorApp {
                 };
                 ui.label("Threshold");
                 changed |= ui.add(egui::Slider::new(threshold, 0.0..=1.0)).changed();
-                ui.small("Values below the threshold become 0; values above it become 1.");
             }
             6 => {
                 let pos = self
@@ -3564,7 +3875,6 @@ impl EditorApp {
                         .map(String::as_str)
                         .unwrap_or("Object unavailable"),
                 );
-                ui.small("This texture output is assigned to the current object.");
                 let channels = [
                     "Base Color",
                     "Normal",
@@ -3581,7 +3891,6 @@ impl EditorApp {
                             changed |= ui.selectable_value(channel, index, *ch).changed();
                         }
                     });
-                ui.small("The connected image replaces this texture when the graph is applied.");
             }
             9 => {
                 let (mode, operation, alpha) = {
@@ -3655,12 +3964,6 @@ impl EditorApp {
                     {
                         changed = true;
                     }
-                    if alpha_connected {
-                        ui.small("Driven by the Alpha input socket.");
-                    } else {
-                        ui.small("Fallback used while Alpha is not connected.");
-                    }
-                    ui.small("Result = alpha × A + (1 − alpha) × B");
                 }
                 if changed {
                     let pos = self
@@ -3716,9 +4019,7 @@ impl EditorApp {
                         }
                     });
             }
-            11 => {
-                ui.small("Splits RGBA image into R, G, B, A channels.");
-            }
+            11 => {}
             12 => {
                 let pos = self
                     .compositor_nodes
@@ -3739,9 +4040,7 @@ impl EditorApp {
                         }
                     });
             }
-            13 => {
-                ui.small("Joins R, G, B, A channels into one RGBA image.\nUnconnected RGB default to 0; Alpha defaults to 1.");
-            }
+            13 => {}
             14 => {
                 let objects: Vec<String> = self
                     .scene
@@ -3839,9 +4138,6 @@ impl EditorApp {
                     changed = true;
                 }
                 *value = value.clamp(*minimum, *maximum);
-                if source_handle.is_some() {
-                    ui.small("This handle mirrors the selected source live.");
-                }
             }
             15 => {
                 let pos = self
@@ -3861,8 +4157,10 @@ impl EditorApp {
                 ui.label("Scale factor");
                 changed |= ui.add(egui::DragValue::new(scale).speed(0.01)).changed();
                 ui.label("Modulus");
-                changed |= ui.add(egui::DragValue::new(modulus).speed(0.01)).changed();
-                ui.small("Modulus ≤ 0 disables wrapping.");
+                changed |= ui
+                    .add(egui::DragValue::new(modulus).speed(0.01))
+                    .on_hover_text("Values at or below zero disable wrapping.")
+                    .changed();
                 let value = scaled_modulated_time(
                     self.compositor_clock_started.elapsed().as_secs_f32(),
                     *scale,
@@ -3959,7 +4257,6 @@ impl EditorApp {
                         transform.scale.x, transform.scale.y, transform.scale.z
                     ));
                 }
-                ui.small("Inputs override the object's authored transform.");
             }
             18 => {
                 let object_index = self
@@ -3977,7 +4274,6 @@ impl EditorApp {
                     self.object_asset_path(object_index)
                         .unwrap_or("No mesh asset assigned"),
                 );
-                ui.small("A connected mesh will replace this object's rendered geometry.");
             }
             19 => {
                 let object_index = self
@@ -3995,7 +4291,6 @@ impl EditorApp {
                 {
                     ui.label("Scalar painted texture");
                     ui.monospace(format!("{} × {} · R8", mask.width, mask.height));
-                    ui.small("Output range: 0.0 … 1.0");
                 } else {
                     ui.weak("No painted texture yet.");
                 }
@@ -4061,7 +4356,6 @@ impl EditorApp {
                         )
                         .changed();
                 }
-                ui.small("Density Texture is sampled at every vertex UV.");
             }
             21 => {
                 let pos = self
@@ -4095,10 +4389,6 @@ impl EditorApp {
                 changed |= ui
                     .add(egui::Slider::new(iterations, 1..=16).text("Iterations"))
                     .changed();
-                ui.small(
-                    "Triangle edges resist stretch; second-ring springs resist bending. \
-                     Dissipation removes oscillation energy.",
-                );
             }
             22 => {
                 let pos = self
@@ -4127,9 +4417,7 @@ impl EditorApp {
                 let valid = formulas
                     .iter()
                     .all(|formula| evaluate_force_formula(formula, 0.3, 0.4, 0.5, 0.6).is_ok());
-                if valid {
-                    ui.small("Variables: x, y, z, t · functions: sin, cos, abs, sqrt");
-                } else {
+                if !valid {
                     ui.colored_label(Color32::from_rgb(235, 91, 91), "Invalid force formula");
                 }
             }
@@ -4163,7 +4451,6 @@ impl EditorApp {
                     .add(egui::Slider::new(blend, 0.0..=1.0).text("Blend"))
                     .changed();
                 *mode = 1;
-                ui.small("Advection: x ← x + dt·(x′ + V(p)); V does not become momentum.");
                 if !formulas
                     .iter()
                     .all(|formula| evaluate_force_formula(formula, 0.3, 0.4, 0.5, 0.6).is_ok())
@@ -4194,7 +4481,6 @@ impl EditorApp {
                             .prefix("Time scale "),
                     )
                     .changed();
-                ui.small("Connect Velocity Field and Force Field, then connect this node to Object Mesh.");
             }
             25 | 26 => {
                 let connected =
@@ -4226,12 +4512,116 @@ impl EditorApp {
                             }),
                         );
                         changed |= response.changed();
-                        if connected[index] {
-                            ui.small("input");
-                        }
                     });
                 }
-                ui.small("A connected scalar overrides only its matching axis.");
+            }
+            27 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::ObjectSimulator {
+                    ref mut mass,
+                    ref mut gravity,
+                    ref mut linear_velocity,
+                    ref mut angular_velocity,
+                    ref mut linear_damping,
+                    ref mut angular_damping,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(mass)
+                            .range(0.001..=1_000_000.0)
+                            .prefix("Mass "),
+                    )
+                    .changed();
+                changed |= ui.checkbox(gravity, "World gravity").changed();
+                ui.label("Initial linear velocity (m/s)");
+                for (axis, value) in ["X", "Y", "Z"].into_iter().zip(linear_velocity.iter_mut()) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(axis);
+                        changed |= ui.add(egui::DragValue::new(value).speed(0.05)).changed();
+                    });
+                }
+                ui.label("Initial angular velocity (°/s)");
+                for (axis, value) in ["X", "Y", "Z"].into_iter().zip(angular_velocity.iter_mut()) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(axis);
+                        changed |= ui.add(egui::DragValue::new(value).speed(0.25)).changed();
+                    });
+                }
+                changed |= ui
+                    .add(egui::Slider::new(linear_damping, 0.0..=1.0).text("Linear damping"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(angular_damping, 0.0..=1.0).text("Angular damping"))
+                    .changed();
+            }
+            28 => {
+                let connected =
+                    [0, 1, 2].map(|axis| self.compositor_input_source(node_id, axis).is_ok());
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::ForceOutput { ref mut force, .. } =
+                    self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Force (N)");
+                for (axis, index) in ["X", "Y", "Z"].into_iter().zip(0..3) {
+                    ui.horizontal(|ui| {
+                        ui.monospace(axis);
+                        changed |= ui
+                            .add_enabled(
+                                !connected[index],
+                                egui::DragValue::new(&mut force[index]).speed(0.1),
+                            )
+                            .changed();
+                    });
+                }
+            }
+            29 => {
+                let connected =
+                    [0, 1].map(|input| self.compositor_input_source(node_id, input).is_ok());
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Engine {
+                    ref mut throttle,
+                    ref mut torque,
+                    ref mut reverse,
+                    ..
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                changed |= ui
+                    .add_enabled(
+                        !connected[0],
+                        egui::Slider::new(throttle, -1.0..=1.0).text("Throttle"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add_enabled(
+                        !connected[1],
+                        egui::DragValue::new(torque)
+                            .range(0.0..=10_000_000.0)
+                            .speed(1.0)
+                            .suffix(" N·m"),
+                    )
+                    .changed();
+                changed |= ui.checkbox(reverse, "Reverse direction").changed();
+                ui.small("Drives an Engine cylinder around its local Z axle.");
             }
             _ => {}
         }
@@ -4239,6 +4629,9 @@ impl EditorApp {
             self.start_compositor_image_import(ui.ctx());
         }
         if changed {
+            if kind == 27 {
+                self.object_simulation_states.remove(&node_id);
+            }
             if kind == 14 {
                 self.invalidate_all_object_handles();
             } else {
@@ -4746,6 +5139,11 @@ impl EditorApp {
                                         Component::Model { asset, .. } => Some(asset.clone()),
                                         _ => None,
                                     });
+                            let mut collider_component = node
+                                .components
+                                .iter()
+                                .find(|component| matches!(component, Component::Collider { .. }))
+                                .cloned();
                             let mut visible = self.scene.visible(id);
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut visible, "").changed() {
@@ -4880,6 +5278,379 @@ impl EditorApp {
                                     inherited_property(ui, "Visibility", "Visible", "Environment");
                                     inherited_property(ui, "Layer", "Default", "Project");
                                 });
+                            let mut collider_changed = false;
+                            let mut remove_collider = false;
+                            egui::CollapsingHeader::new(RichText::new("Collider").strong())
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    if collider_component.is_none() {
+                                        ui.small(
+                                            "Colliders are independent from visible mesh geometry.",
+                                        );
+                                        if ui.button("+ Add Collider").clicked() {
+                                            collider_component = Some(
+                                                self.best_fit_collider(id, ColliderShape::Box),
+                                            );
+                                            collider_changed = true;
+                                        }
+                                        return;
+                                    }
+                                    let current_shape = match collider_component.as_ref() {
+                                        Some(Component::Collider { shape, .. }) => {
+                                            ColliderShape::from_storage(shape)
+                                        }
+                                        _ => ColliderShape::Box,
+                                    };
+                                    let mut selected_shape = current_shape;
+                                    ui.label("Shape");
+                                    egui::ComboBox::from_id_salt(("collider_shape", id))
+                                        .selected_text(selected_shape.label())
+                                        .show_ui(ui, |ui| {
+                                            for shape in ColliderShape::ALL {
+                                                ui.selectable_value(
+                                                    &mut selected_shape,
+                                                    shape,
+                                                    shape.label(),
+                                                );
+                                            }
+                                        });
+                                    if selected_shape != current_shape {
+                                        collider_component =
+                                            Some(self.best_fit_collider(id, selected_shape));
+                                        collider_changed = true;
+                                    }
+                                    let Some(Component::Collider {
+                                        center,
+                                        half_extents,
+                                        radius,
+                                        height,
+                                        coupling_stiffness,
+                                        coupling_damping,
+                                        force_cutoff,
+                                        restitution,
+                                        density,
+                                        mass,
+                                        automatic_mass,
+                                        friction,
+                                        joint,
+                                        ..
+                                    }) = collider_component.as_mut()
+                                    else {
+                                        return;
+                                    };
+                                    let mut center_values = [center.x, center.y, center.z];
+                                    if vector_editor(ui, "Center", &mut center_values, 0.01) {
+                                        *center = CoreVec3::new(
+                                            center_values[0],
+                                            center_values[1],
+                                            center_values[2],
+                                        );
+                                        collider_changed = true;
+                                    }
+                                    match selected_shape {
+                                        ColliderShape::Sphere => {
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(radius)
+                                                        .range(0.001..=1_000_000.0)
+                                                        .speed(0.01)
+                                                        .prefix("Radius "),
+                                                )
+                                                .changed()
+                                            {
+                                                *half_extents =
+                                                    CoreVec3::new(*radius, *radius, *radius);
+                                                *height = *radius * 2.0;
+                                                collider_changed = true;
+                                            }
+                                        }
+                                        ColliderShape::Cylinder => {
+                                            let radius_changed = ui
+                                                .add(
+                                                    egui::DragValue::new(radius)
+                                                        .range(0.001..=1_000_000.0)
+                                                        .speed(0.01)
+                                                        .prefix("Radius "),
+                                                )
+                                                .changed();
+                                            let height_changed = ui
+                                                .add(
+                                                    egui::DragValue::new(height)
+                                                        .range(0.001..=1_000_000.0)
+                                                        .speed(0.01)
+                                                        .prefix("Height "),
+                                                )
+                                                .changed();
+                                            if radius_changed || height_changed {
+                                                *half_extents =
+                                                    CoreVec3::new(*radius, *radius, *height * 0.5);
+                                                collider_changed = true;
+                                            }
+                                            ui.small("Cylinder axis: local Z");
+                                            ui.separator();
+                                            ui.label("Rotational joint");
+                                            let current_joint =
+                                                CylinderJoint::from_storage(joint);
+                                            let mut selected_joint = current_joint;
+                                            egui::ComboBox::from_id_salt((
+                                                "cylinder_joint",
+                                                id,
+                                            ))
+                                            .selected_text(selected_joint.label())
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    for candidate in CylinderJoint::ALL {
+                                                        ui.selectable_value(
+                                                            &mut selected_joint,
+                                                            candidate,
+                                                            candidate.label(),
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                            if selected_joint != current_joint {
+                                                *joint =
+                                                    selected_joint.storage_name().into();
+                                                collider_changed = true;
+                                            }
+                                            ui.small(match selected_joint {
+                                                CylinderJoint::None => {
+                                                    "Coupling constrains every rotation axis."
+                                                }
+                                                CylinderJoint::Wheel => {
+                                                    "Local Z axle rotates freely."
+                                                }
+                                                CylinderJoint::Engine => {
+                                                    "Local Z axle is driven by an Engine node."
+                                                }
+                                            });
+                                        }
+                                        ColliderShape::Box => {
+                                            let mut size = [
+                                                half_extents.x * 2.0,
+                                                half_extents.y * 2.0,
+                                                half_extents.z * 2.0,
+                                            ];
+                                            if vector_editor(ui, "Size", &mut size, 0.01) {
+                                                *half_extents = CoreVec3::new(
+                                                    size[0].abs().max(0.001) * 0.5,
+                                                    size[1].abs().max(0.001) * 0.5,
+                                                    size[2].abs().max(0.001) * 0.5,
+                                                );
+                                                collider_changed = true;
+                                            }
+                                        }
+                                        ColliderShape::Flat => {
+                                            let mut size = [
+                                                half_extents.x * 2.0,
+                                                half_extents.y * 2.0,
+                                                half_extents.z * 2.0,
+                                            ];
+                                            if vector_editor(
+                                                ui,
+                                                "Size X/Y/Thickness",
+                                                &mut size,
+                                                0.01,
+                                            ) {
+                                                *half_extents = CoreVec3::new(
+                                                    size[0].abs().max(0.001) * 0.5,
+                                                    size[1].abs().max(0.001) * 0.5,
+                                                    size[2].abs().max(0.001) * 0.5,
+                                                );
+                                                *height = size[2].abs().max(0.001);
+                                                collider_changed = true;
+                                            }
+                                            ui.small("Flat surface lies in local XY");
+                                        }
+                                    }
+                                    ui.separator();
+                                    ui.label("Component mass");
+                                    if ui.checkbox(automatic_mass, "Automatic from volume").changed() {
+                                        collider_changed = true;
+                                    }
+                                    if *automatic_mass {
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(density)
+                                                    .range(0.001..=100_000.0)
+                                                    .speed(1.0)
+                                                    .suffix(" kg/m³"),
+                                            )
+                                            .on_hover_text(
+                                                "Mass density multiplied by estimated collider volume.",
+                                            )
+                                            .changed()
+                                        {
+                                            collider_changed = true;
+                                        }
+                                        let estimated_mass = collider_volume(
+                                            selected_shape,
+                                            *half_extents,
+                                            *radius,
+                                            *height,
+                                        ) * density.max(0.001);
+                                        if (*mass - estimated_mass).abs()
+                                            > estimated_mass.abs().max(1.0) * f32::EPSILON
+                                        {
+                                            *mass = estimated_mass;
+                                            collider_changed = true;
+                                        }
+                                        ui.label(format!("Estimated mass: {:.3} kg", *mass));
+                                    } else if ui
+                                        .add(
+                                            egui::DragValue::new(mass)
+                                                .range(0.001..=100_000_000.0)
+                                                .speed(0.1)
+                                                .suffix(" kg"),
+                                        )
+                                        .changed()
+                                    {
+                                        collider_changed = true;
+                                    }
+                                    ui.separator();
+                                    ui.label("Coupling model");
+                                    ui.label("Spring–damper");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(coupling_stiffness)
+                                                .range(0.0..=100_000_000.0)
+                                                .speed(100.0)
+                                                .prefix("Stiffness "),
+                                        )
+                                        .on_hover_text(
+                                            "Restoring force for displacement from the parent-relative rest transform.",
+                                        )
+                                        .changed()
+                                    {
+                                        collider_changed = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(force_cutoff)
+                                                .range(0.0..=1_000_000.0)
+                                                .speed(0.01)
+                                                .prefix("Force cut "),
+                                        )
+                                        .on_hover_text(
+                                            "Forces and torques below this magnitude are set exactly to zero.",
+                                        )
+                                        .changed()
+                                    {
+                                        collider_changed = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(coupling_damping)
+                                                .range(0.0..=10_000_000.0)
+                                                .speed(10.0)
+                                                .prefix("Damping "),
+                                        )
+                                        .on_hover_text(
+                                            "Damping applied to relative child/parent motion.",
+                                        )
+                                        .changed()
+                                    {
+                                        collider_changed = true;
+                                    }
+                                    ui.separator();
+                                    ui.label("Collision response");
+                                    ui.label("Non-penetrating impulse");
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(restitution, 0.0..=1.0)
+                                                .text("Restitution"),
+                                        )
+                                        .on_hover_text(
+                                            "0 stops inward motion without bouncing; 1 preserves it as a full bounce.",
+                                        )
+                                        .changed()
+                                    {
+                                        collider_changed = true;
+                                    }
+                                    egui::CollapsingHeader::new("Friction")
+                                        .default_open(true)
+                                        .show(ui, |ui| match selected_shape {
+                                            ColliderShape::Sphere => {
+                                                let mut isotropic =
+                                                    (friction.x + friction.y + friction.z) / 3.0;
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut isotropic,
+                                                            0.0..=2.0,
+                                                        )
+                                                        .text("All directions"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    *friction = CoreVec3::new(
+                                                        isotropic, isotropic, isotropic,
+                                                    );
+                                                    collider_changed = true;
+                                                }
+                                            }
+                                            ColliderShape::Cylinder => {
+                                                for (label, value) in [
+                                                    ("Rolling", &mut friction.x),
+                                                    ("Lateral", &mut friction.y),
+                                                    ("Axial", &mut friction.z),
+                                                ] {
+                                                    if ui
+                                                        .add(
+                                                            egui::Slider::new(value, 0.0..=2.0)
+                                                                .text(label),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        collider_changed = true;
+                                                    }
+                                                }
+                                            }
+                                            ColliderShape::Box | ColliderShape::Flat => {
+                                                for (label, value) in [
+                                                    ("Local X", &mut friction.x),
+                                                    ("Local Y", &mut friction.y),
+                                                    ("Local Z", &mut friction.z),
+                                                ] {
+                                                    if ui
+                                                        .add(
+                                                            egui::Slider::new(value, 0.0..=2.0)
+                                                                .text(label),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        collider_changed = true;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Best Fit").clicked() {
+                                            collider_component =
+                                                Some(self.best_fit_collider(id, selected_shape));
+                                            collider_changed = true;
+                                        }
+                                        if ui.button("Remove").clicked() {
+                                            remove_collider = true;
+                                            collider_changed = true;
+                                        }
+                                    });
+                                    ui.small(
+                                        "Changing shape runs Best Fit once; manual values remain \
+                                         untouched afterward.",
+                                    );
+                                });
+                            if collider_changed {
+                                let node = self.scene.tree.node_mut(id).expect("selected node");
+                                node.components.retain(|component| {
+                                    !matches!(component, Component::Collider { .. })
+                                });
+                                if !remove_collider && let Some(collider) = collider_component {
+                                    node.components.push(collider);
+                                }
+                                changed = true;
+                            }
                             egui::CollapsingHeader::new(RichText::new("Texture Painting").strong())
                                 .default_open(true)
                                 .show(ui, |ui| {
@@ -5559,6 +6330,14 @@ impl EditorApp {
                 object_index: target,
                 ..
             }
+            | NodeSettings::ObjectSimulator {
+                object_index: target,
+                ..
+            }
+            | NodeSettings::Engine {
+                object_index: target,
+                ..
+            }
             | NodeSettings::ObjectHandle {
                 object_index: target,
                 ..
@@ -5587,8 +6366,31 @@ impl EditorApp {
 
     fn sync_compositor_outputs(&mut self) {
         let object_count = self.scene.tree.iter().count();
+        let engine_objects = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .filter_map(|(object_index, (_, object))| {
+                object
+                    .components
+                    .iter()
+                    .any(|component| {
+                        matches!(
+                            component,
+                            Component::Collider { shape, joint, .. }
+                                if ColliderShape::from_storage(shape) == ColliderShape::Cylinder
+                                    && CylinderJoint::from_storage(joint)
+                                        == CylinderJoint::Engine
+                        )
+                    })
+                    .then_some(object_index)
+            })
+            .collect::<BTreeSet<_>>();
         let mut seen_transform = BTreeSet::new();
         let mut seen_mesh = BTreeSet::new();
+        let mut seen_force = BTreeSet::new();
+        let mut seen_engine = BTreeSet::new();
         let removed_ids: BTreeSet<usize> = self
             .compositor_nodes
             .iter()
@@ -5600,6 +6402,17 @@ impl EditorApp {
                 }
                 NodeSettings::ObjectMesh { object_index }
                     if object_index >= object_count || !seen_mesh.insert(object_index) =>
+                {
+                    Some(node.id)
+                }
+                NodeSettings::ForceOutput { object_index, .. }
+                    if object_index >= object_count || !seen_force.insert(object_index) =>
+                {
+                    Some(node.id)
+                }
+                NodeSettings::Engine { object_index, .. }
+                    if !engine_objects.contains(&object_index)
+                        || !seen_engine.insert(object_index) =>
                 {
                     Some(node.id)
                 }
@@ -5636,6 +6449,34 @@ impl EditorApp {
                     object_index,
                     settings: NodeSettings::ObjectMesh { object_index },
                     position: Vec2::new(420.0, 80.0),
+                });
+            }
+            if !seen_force.contains(&object_index) {
+                let id = self.compositor_next_id;
+                self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+                self.compositor_nodes.push(CompositorNode {
+                    id,
+                    object_index,
+                    settings: NodeSettings::ForceOutput {
+                        object_index,
+                        force: [0.0; 3],
+                    },
+                    position: Vec2::new(80.0, 340.0),
+                });
+            }
+            if engine_objects.contains(&object_index) && !seen_engine.contains(&object_index) {
+                let id = self.compositor_next_id;
+                self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+                self.compositor_nodes.push(CompositorNode {
+                    id,
+                    object_index,
+                    settings: NodeSettings::Engine {
+                        object_index,
+                        throttle: 0.0,
+                        torque: 100.0,
+                        reverse: false,
+                    },
+                    position: Vec2::new(340.0, 340.0),
                 });
             }
         }
@@ -5821,33 +6662,59 @@ impl EditorApp {
             };
             let mut transform = node.local_transform();
             let original = transform;
-            if let Ok((source, _)) = self.compositor_input_source(output_node, 0)
-                && matches!(
-                    self.compositor_nodes
-                        .iter()
-                        .find(|node| node.id == source)
-                        .map(|node| &node.settings),
-                    Some(NodeSettings::Position { .. })
-                )
-                && let Some((position, _)) = self.transform_vector_value(source)
-            {
-                transform.translation = CoreVec3::new(position[0], position[1], position[2]);
+            if let Ok((source, _)) = self.compositor_input_source(output_node, 0) {
+                match self
+                    .compositor_nodes
+                    .iter()
+                    .find(|node| node.id == source)
+                    .map(|node| &node.settings)
+                {
+                    Some(NodeSettings::Position { .. }) => {
+                        if let Some((position, _)) = self.transform_vector_value(source) {
+                            transform.translation =
+                                CoreVec3::new(position[0], position[1], position[2]);
+                        }
+                    }
+                    Some(NodeSettings::ObjectSimulator { .. }) => {
+                        if let Some(state) = self.object_simulation_states.get(&source) {
+                            transform.translation = state.position;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            if let Ok((source, _)) = self.compositor_input_source(output_node, 1)
-                && matches!(
-                    self.compositor_nodes
-                        .iter()
-                        .find(|node| node.id == source)
-                        .map(|node| &node.settings),
-                    Some(NodeSettings::Rotation { .. })
-                )
-                && let Some((degrees, _)) = self.transform_vector_value(source)
-            {
-                transform.rotation = Quat::from_euler_xyz(CoreVec3::new(
-                    degrees[0].to_radians(),
-                    degrees[1].to_radians(),
-                    degrees[2].to_radians(),
-                ));
+            if let Ok((source, source_output)) = self.compositor_input_source(output_node, 1) {
+                let degrees = match self
+                    .compositor_nodes
+                    .iter()
+                    .find(|node| node.id == source)
+                    .map(|node| &node.settings)
+                {
+                    Some(NodeSettings::Rotation { .. }) => self
+                        .transform_vector_value(source)
+                        .map(|(value, _)| CoreVec3::new(value[0], value[1], value[2])),
+                    Some(NodeSettings::ObjectSimulator { .. }) if source_output == 1 => self
+                        .object_simulation_states
+                        .get(&source)
+                        .map(|state| state.rotation_degrees),
+                    _ => None,
+                };
+                if let Some(degrees) = degrees {
+                    transform.rotation = Quat::from_euler_xyz(CoreVec3::new(
+                        degrees.x.to_radians(),
+                        degrees.y.to_radians(),
+                        degrees.z.to_radians(),
+                    ));
+                }
+            }
+            if let Some(joint) = self.joint_simulation_states.get(&id) {
+                let base_rotation = if self.compositor_input_source(output_node, 1).is_ok() {
+                    transform.rotation
+                } else {
+                    joint.base_rotation
+                };
+                transform.rotation = base_rotation
+                    * Quat::from_euler_xyz(CoreVec3::new(0.0, 0.0, joint.angle_radians));
             }
             if transform != original && self.scene.tree.set_local_transform(id, transform).is_ok() {
                 changed = true;
@@ -6196,7 +7063,10 @@ impl EditorApp {
             NodeSettings::ObjectTransform { .. }
             | NodeSettings::ObjectMesh { .. }
             | NodeSettings::Position { .. }
-            | NodeSettings::Rotation { .. } => {
+            | NodeSettings::Rotation { .. }
+            | NodeSettings::ObjectSimulator { .. }
+            | NodeSettings::ForceOutput { .. }
+            | NodeSettings::Engine { .. } => {
                 Err("object output nodes cannot be evaluated as textures".into())
             }
             NodeSettings::MassDensity { .. }
@@ -6539,8 +7409,23 @@ impl EditorApp {
             .as_secs_f32()
             .min(0.1);
         self.dynamics_last_tick = now;
+        let has_rigid_simulation = self.compositor_nodes.iter().any(|node| {
+            matches!(
+                node.settings,
+                NodeSettings::ObjectSimulator { .. } | NodeSettings::Engine { .. }
+            )
+        }) || self.scene.tree.iter().any(|(_, object)| {
+            object.components.iter().any(|component| {
+                matches!(
+                    component,
+                    Component::Collider { shape, joint, .. }
+                        if ColliderShape::from_storage(shape) == ColliderShape::Cylinder
+                            && CylinderJoint::from_storage(joint) == CylinderJoint::Wheel
+                )
+            })
+        });
         if (!self.dynamics_running && !self.dynamics_single_step)
-            || self.dynamics_enabled.is_empty()
+            || (self.dynamics_enabled.is_empty() && !has_rigid_simulation)
         {
             return;
         }
@@ -6554,6 +7439,8 @@ impl EditorApp {
         while self.dynamics_accumulator >= dt {
             self.dynamics_accumulator -= dt;
             self.dynamics_time += dt;
+            self.step_engine_joints(dt);
+            self.step_object_simulators(dt);
             for id in self.dynamics_enabled.clone() {
                 let node_dynamics = self.node_particle_dynamics(id);
                 if let (Some(field), Some(cloth)) = (
@@ -6605,6 +7492,605 @@ impl EditorApp {
             ctx.request_repaint();
         }
         ctx.request_repaint_after(Duration::from_millis(8));
+    }
+
+    fn step_object_simulators(&mut self, dt: f32) {
+        let simulators = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match node.settings {
+                NodeSettings::ObjectSimulator {
+                    object_index,
+                    mass,
+                    gravity,
+                    linear_velocity,
+                    angular_velocity,
+                    linear_damping,
+                    angular_damping,
+                    ..
+                } => Some((
+                    node.id,
+                    object_index,
+                    mass,
+                    gravity,
+                    linear_velocity,
+                    angular_velocity,
+                    linear_damping,
+                    angular_damping,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let simulator_roots = simulators
+            .iter()
+            .filter_map(|simulator| {
+                self.object_node_id(simulator.1)
+                    .map(|root| (root, simulator.0))
+            })
+            .collect::<HashMap<_, _>>();
+        let state_snapshot = self.object_simulation_states.clone();
+        let mut coupling_forces = HashMap::<usize, CoreVec3>::new();
+        let mut coupling_torques = HashMap::<usize, CoreVec3>::new();
+        for (&child_root, &child_simulator) in &simulator_roots {
+            let Some(child_state) = state_snapshot.get(&child_simulator) else {
+                continue;
+            };
+            let mut ancestor = self
+                .scene
+                .tree
+                .node(child_root)
+                .ok()
+                .and_then(|node| node.parent());
+            let mut parent_simulator = None;
+            while let Some(id) = ancestor {
+                if let Some(simulator) = simulator_roots.get(&id) {
+                    parent_simulator = Some(*simulator);
+                    break;
+                }
+                ancestor = self.scene.tree.node(id).ok().and_then(|node| node.parent());
+            }
+            let Some(parent_simulator) = parent_simulator else {
+                continue;
+            };
+            let (stiffness, damping, cutoff, free_axle) = self
+                .scene
+                .tree
+                .node(child_root)
+                .ok()
+                .and_then(|node| {
+                    let rotation = node.global_transform().rotation;
+                    node.components
+                        .iter()
+                        .find_map(|component| match component {
+                            Component::Collider {
+                                coupling_stiffness,
+                                coupling_damping,
+                                force_cutoff,
+                                shape,
+                                joint,
+                                ..
+                            } => {
+                                let joint = CylinderJoint::from_storage(joint);
+                                let axle = (ColliderShape::from_storage(shape)
+                                    == ColliderShape::Cylinder
+                                    && joint != CylinderJoint::None)
+                                    .then(|| {
+                                        rotation.rotate(CoreVec3::new(0.0, 0.0, 1.0)).normalized()
+                                    });
+                                Some((*coupling_stiffness, *coupling_damping, *force_cutoff, axle))
+                            }
+                            _ => None,
+                        })
+                })
+                .unwrap_or((0.5, 1.0, 0.01, None));
+            let displacement = child_state.position - child_state.initial_position;
+            let force = force_cut_vector(
+                displacement * -stiffness.max(0.0)
+                    + child_state.linear_velocity * -damping.max(0.0),
+                cutoff,
+            );
+            let angular_displacement = (child_state.rotation_degrees
+                - child_state.initial_rotation_degrees)
+                * (std::f32::consts::PI / 180.0);
+            let angular_velocity = child_state.angular_velocity * (std::f32::consts::PI / 180.0);
+            let mut torque = force_cut_vector(
+                angular_displacement * -stiffness.max(0.0) + angular_velocity * -damping.max(0.0),
+                cutoff,
+            );
+            if let Some(axle) = free_axle {
+                // Wheel and engine joints retain parent coupling while leaving
+                // the cylinder's local-Z axle unconstrained.
+                torque = torque - axle * torque.dot(axle);
+            }
+            let child_force = coupling_forces
+                .entry(child_simulator)
+                .or_insert(CoreVec3::ZERO);
+            *child_force = *child_force + force;
+            let parent_force = coupling_forces
+                .entry(parent_simulator)
+                .or_insert(CoreVec3::ZERO);
+            *parent_force = *parent_force - force;
+            let child_torque = coupling_torques
+                .entry(child_simulator)
+                .or_insert(CoreVec3::ZERO);
+            *child_torque = *child_torque + torque;
+            let parent_torque = coupling_torques
+                .entry(parent_simulator)
+                .or_insert(CoreVec3::ZERO);
+            *parent_torque = *parent_torque - torque;
+        }
+        for (
+            node_id,
+            object_index,
+            fallback_mass,
+            gravity,
+            initial_linear,
+            initial_angular,
+            linear_damping,
+            angular_damping,
+        ) in simulators
+        {
+            let Some(root_id) = self.object_node_id(object_index) else {
+                continue;
+            };
+            let authored = self
+                .scene
+                .tree
+                .node(root_id)
+                .ok()
+                .map(|node| node.local_transform())
+                .unwrap_or(Transform::IDENTITY);
+            let initial_position = self
+                .compositor_input_source(node_id, 0)
+                .ok()
+                .and_then(|(source, _)| self.transform_vector_value(source))
+                .map(|(value, _)| CoreVec3::new(value[0], value[1], value[2]))
+                .unwrap_or(authored.translation);
+            let initial_rotation = self
+                .compositor_input_source(node_id, 1)
+                .ok()
+                .and_then(|(source, _)| self.transform_vector_value(source))
+                .map(|(value, _)| CoreVec3::new(value[0], value[1], value[2]))
+                .unwrap_or_else(|| {
+                    let euler = authored.rotation.to_euler_xyz();
+                    CoreVec3::new(
+                        euler.x.to_degrees(),
+                        euler.y.to_degrees(),
+                        euler.z.to_degrees(),
+                    )
+                });
+            let external_force = self.subtree_force(root_id);
+            let body_colliders = self
+                .scene
+                .tree
+                .iter()
+                .filter(|(id, _)| self.node_is_in_subtree(root_id, *id))
+                .filter_map(|(collider_id, node)| {
+                    let transform = node.global_transform();
+                    node.components.iter().find_map(|component| {
+                        let Component::Collider {
+                            center,
+                            half_extents,
+                            restitution,
+                            shape,
+                            friction,
+                            mass,
+                            radius,
+                            joint,
+                            ..
+                        } = component
+                        else {
+                            return None;
+                        };
+                        let world_center = transform.translation
+                            + transform
+                                .rotation
+                                .rotate(transform.scale.component_mul(*center));
+                        let collider_shape = ColliderShape::from_storage(shape);
+                        let extent_z = collider_vertical_extent(
+                            collider_shape,
+                            *half_extents,
+                            transform.scale,
+                            transform.rotation,
+                        );
+                        Some((
+                            collider_id,
+                            world_center,
+                            extent_z,
+                            restitution.clamp(0.0, 1.0),
+                            collider_shape,
+                            transform.rotation,
+                            *friction,
+                            mass.max(0.0),
+                            radius.max(0.001)
+                                * transform.scale.x.abs().max(transform.scale.y.abs()),
+                            CylinderJoint::from_storage(joint),
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let floor_height = self
+                .scene
+                .tree
+                .iter()
+                .filter(|(id, _)| !self.node_is_in_subtree(root_id, *id))
+                .filter_map(|(_, node)| {
+                    node.components
+                        .iter()
+                        .find_map(|component| match component {
+                            Component::Collider { shape, center, .. }
+                                if ColliderShape::from_storage(shape) == ColliderShape::Flat =>
+                            {
+                                let transform = node.global_transform();
+                                let world_center = transform.translation
+                                    + transform
+                                        .rotation
+                                        .rotate(transform.scale.component_mul(*center));
+                                Some(world_center.z)
+                            }
+                            _ => None,
+                        })
+                })
+                .max_by(f32::total_cmp);
+            let body_mass = body_colliders
+                .iter()
+                .map(|(_, _, _, _, _, _, _, mass, _, _)| *mass)
+                .sum::<f32>();
+            let body_mass = if body_mass > 1.0e-6 {
+                body_mass
+            } else {
+                fallback_mass.max(1.0e-6)
+            };
+            let state =
+                self.object_simulation_states
+                    .entry(node_id)
+                    .or_insert(ObjectSimulationState {
+                        initial_position,
+                        initial_rotation_degrees: initial_rotation,
+                        position: initial_position,
+                        rotation_degrees: initial_rotation,
+                        linear_velocity: CoreVec3::new(
+                            initial_linear[0],
+                            initial_linear[1],
+                            initial_linear[2],
+                        ),
+                        angular_velocity: CoreVec3::new(
+                            initial_angular[0],
+                            initial_angular[1],
+                            initial_angular[2],
+                        ),
+                    });
+            state.linear_velocity = state.linear_velocity + external_force * (dt / body_mass);
+            if let Some(force) = coupling_forces.get(&node_id) {
+                state.linear_velocity = state.linear_velocity + *force * (dt / body_mass);
+            }
+            if let Some(torque) = coupling_torques.get(&node_id) {
+                state.angular_velocity = state.angular_velocity
+                    + *torque * (dt * 180.0 / std::f32::consts::PI / body_mass);
+            }
+            if gravity {
+                state.linear_velocity.z -= 9.81 * dt;
+            }
+            if let Some(floor_z) = floor_height {
+                let angular_radians = state.angular_velocity * std::f32::consts::PI / 180.0;
+                let mut contact_force = CoreVec3::ZERO;
+                let mut contact_torque = CoreVec3::ZERO;
+                let mut maximum_penetration = 0.0_f32;
+                let mut contact_restitution = 0.0_f32;
+                const CONTACT_SKIN: f32 = 1.0e-4;
+                let active_contact_count = body_colliders
+                    .iter()
+                    .filter(|(_, center, extent_z, ..)| {
+                        floor_z - (center.z - extent_z) >= -CONTACT_SKIN
+                    })
+                    .count();
+                let (active_contacts, has_active_contact) =
+                    contact_count_for_solver(active_contact_count);
+                let support_load = body_mass * 9.81 / active_contacts;
+                let mut joint_reaction_torques = Vec::<(NodeId, f32, f32)>::new();
+                for (
+                    collider_id,
+                    center,
+                    extent_z,
+                    restitution,
+                    shape,
+                    rotation,
+                    friction,
+                    collider_mass,
+                    radius,
+                    joint,
+                ) in &body_colliders
+                {
+                    let penetration = floor_z - (center.z - extent_z);
+                    if penetration < -CONTACT_SKIN {
+                        continue;
+                    }
+                    maximum_penetration = maximum_penetration.max(penetration.max(0.0));
+                    contact_restitution = contact_restitution.max(*restitution);
+                    let wheel_arm = CoreVec3::new(0.0, 0.0, -*extent_z);
+                    let contact_point = *center + wheel_arm;
+                    let body_arm = contact_point - state.position;
+                    let axle = rotation.rotate(CoreVec3::new(0.0, 0.0, 1.0)).normalized();
+                    let joint_surface_velocity =
+                        if *shape == ColliderShape::Cylinder && *joint != CylinderJoint::None {
+                            self.joint_simulation_states
+                                .get(collider_id)
+                                .map(|state| (axle * state.angular_velocity).cross(wheel_arm))
+                                .unwrap_or(CoreVec3::ZERO)
+                        } else {
+                            CoreVec3::ZERO
+                        };
+                    let contact_velocity = state.linear_velocity
+                        + angular_radians.cross(body_arm)
+                        + joint_surface_velocity;
+                    let tangent = CoreVec3::new(contact_velocity.x, contact_velocity.y, 0.0);
+                    let body_contact_mass = body_mass / active_contacts;
+                    let joint_inertia = (*shape == ColliderShape::Cylinder
+                        && *joint != CylinderJoint::None)
+                        .then(|| (0.5 * collider_mass.max(1.0e-6) * radius.powi(2)).max(1.0e-6));
+                    let effective_contact_mass = joint_inertia
+                        .map(|inertia| {
+                            let rolling = axle.cross(CoreVec3::new(0.0, 0.0, 1.0));
+                            let rolling_weight =
+                                if tangent.length() > 1.0e-6 && rolling.length() > 1.0e-6 {
+                                    tangent
+                                        .normalized()
+                                        .dot(rolling.normalized())
+                                        .powi(2)
+                                        .clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                            coupled_contact_mass(
+                                body_contact_mass,
+                                inertia,
+                                *radius,
+                                rolling_weight,
+                            )
+                        })
+                        .unwrap_or(body_contact_mass);
+                    let friction_force = contact_friction_force(
+                        tangent,
+                        collider_friction_coefficient(*shape, *rotation, *friction, tangent),
+                        support_load,
+                        effective_contact_mass,
+                        dt,
+                    );
+                    contact_force = contact_force + friction_force;
+                    contact_torque = contact_torque + body_arm.cross(friction_force);
+                    if let Some(inertia) = joint_inertia {
+                        joint_reaction_torques.push((
+                            *collider_id,
+                            wheel_arm.cross(friction_force).dot(axle),
+                            inertia,
+                        ));
+                    }
+                }
+                state.linear_velocity = state.linear_velocity + contact_force * (dt / body_mass);
+                let angular_acceleration = contact_torque * (1.0 / body_mass);
+                state.angular_velocity = state.angular_velocity
+                    + angular_acceleration * (dt * 180.0 / std::f32::consts::PI);
+                for (joint_id, torque, inertia) in joint_reaction_torques {
+                    if let Some(joint_state) = self.joint_simulation_states.get_mut(&joint_id) {
+                        joint_state.angular_velocity += torque * dt / inertia;
+                    }
+                }
+                if maximum_penetration > 0.0 {
+                    state.position.z += maximum_penetration;
+                }
+                if has_active_contact && state.linear_velocity.z < 0.0 {
+                    state.linear_velocity.z = resolve_contact_normal_velocity(
+                        state.linear_velocity.z,
+                        contact_restitution,
+                    );
+                }
+            }
+            state.position = state.position + state.linear_velocity * dt;
+            state.rotation_degrees = state.rotation_degrees + state.angular_velocity * dt;
+            state.linear_velocity =
+                state.linear_velocity * (-linear_damping.clamp(0.0, 1.0) * dt).exp();
+            state.angular_velocity =
+                state.angular_velocity * (-angular_damping.clamp(0.0, 1.0) * dt).exp();
+        }
+    }
+
+    fn node_is_in_subtree(&self, root: NodeId, mut candidate: NodeId) -> bool {
+        loop {
+            if candidate == root {
+                return true;
+            }
+            let Some(parent) = self
+                .scene
+                .tree
+                .node(candidate)
+                .ok()
+                .and_then(|node| node.parent())
+            else {
+                return false;
+            };
+            candidate = parent;
+        }
+    }
+
+    fn subtree_force(&mut self, root: NodeId) -> CoreVec3 {
+        let outputs = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match node.settings {
+                NodeSettings::ForceOutput {
+                    object_index,
+                    force,
+                } => self
+                    .object_node_id(object_index)
+                    .filter(|id| self.node_is_in_subtree(root, *id))
+                    .map(|_| (node.id, force)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        outputs
+            .into_iter()
+            .map(|(node_id, mut force)| {
+                for axis in 0..3 {
+                    if let Ok((source, output)) = self.compositor_input_source(node_id, axis) {
+                        let mut visiting = BTreeSet::new();
+                        if let Some(value) = self.scalar_node_value(source, output, &mut visiting) {
+                            force[axis] = value;
+                        }
+                    }
+                }
+                CoreVec3::new(force[0], force[1], force[2])
+            })
+            .fold(CoreVec3::ZERO, |sum, force| sum + force)
+    }
+
+    fn step_engine_joints(&mut self, dt: f32) {
+        let roots = self
+            .scene
+            .tree
+            .iter()
+            .filter_map(|(id, object)| {
+                object
+                    .components
+                    .iter()
+                    .any(|component| {
+                        matches!(
+                            component,
+                            Component::Collider { shape, joint, .. }
+                                if ColliderShape::from_storage(shape) == ColliderShape::Cylinder
+                                    && CylinderJoint::from_storage(joint)
+                                        != CylinderJoint::None
+                        )
+                    })
+                    .then_some(id)
+            })
+            .collect::<BTreeSet<_>>();
+        for root in &roots {
+            let torque = self.object_engine_torque(*root);
+            let Some((base_rotation, axle, inertia, joint)) =
+                self.scene.tree.node(*root).ok().and_then(|object| {
+                    let transform = object.global_transform();
+                    object.components.iter().find_map(|component| {
+                        let Component::Collider {
+                            shape,
+                            joint,
+                            radius,
+                            mass,
+                            ..
+                        } = component
+                        else {
+                            return None;
+                        };
+                        let joint = CylinderJoint::from_storage(joint);
+                        if ColliderShape::from_storage(shape) != ColliderShape::Cylinder
+                            || joint == CylinderJoint::None
+                        {
+                            return None;
+                        }
+                        let axle = transform
+                            .rotation
+                            .rotate(CoreVec3::new(0.0, 0.0, 1.0))
+                            .normalized();
+                        let scaled_radius = radius.max(0.001)
+                            * transform.scale.x.abs().max(transform.scale.y.abs());
+                        let inertia = (0.5 * mass.max(1.0e-6) * scaled_radius.powi(2)).max(1.0e-6);
+                        Some((object.local_transform().rotation, axle, inertia, joint))
+                    })
+                })
+            else {
+                continue;
+            };
+            let state = self
+                .joint_simulation_states
+                .entry(*root)
+                .or_insert(JointSimulationState {
+                    base_rotation,
+                    angle_radians: 0.0,
+                    angular_velocity: 0.0,
+                });
+            let previous_angle = state.angle_radians;
+            match joint {
+                CylinderJoint::Engine => {
+                    state.angular_velocity += torque.dot(axle) * dt / inertia;
+                    state.angle_radians += state.angular_velocity * dt;
+                }
+                CylinderJoint::Wheel => {
+                    // Passive wheels are accelerated by contact reaction
+                    // torque in the general friction solver.
+                    state.angle_radians += state.angular_velocity * dt;
+                }
+                CylinderJoint::None => {}
+            }
+            let angle_delta = state.angle_radians - previous_angle;
+            state.angle_radians = state.angle_radians.rem_euclid(std::f32::consts::TAU);
+            if angle_delta.abs() > f32::EPSILON
+                && let Ok(object) = self.scene.tree.node(*root)
+            {
+                let mut transform = object.local_transform();
+                transform.rotation =
+                    transform.rotation * Quat::from_euler_xyz(CoreVec3::new(0.0, 0.0, angle_delta));
+                let _ = self.scene.tree.set_local_transform(*root, transform);
+            }
+        }
+        self.joint_simulation_states
+            .retain(|root, _| roots.contains(root));
+    }
+
+    fn object_engine_torque(&mut self, root: NodeId) -> CoreVec3 {
+        let engines = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match node.settings {
+                NodeSettings::Engine {
+                    object_index,
+                    throttle,
+                    torque,
+                    reverse,
+                } if self.object_node_id(object_index) == Some(root) => {
+                    Some((node.id, throttle, torque, reverse))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if engines.is_empty() {
+            return CoreVec3::ZERO;
+        }
+        let Ok(object) = self.scene.tree.node(root) else {
+            return CoreVec3::ZERO;
+        };
+        let Some(Component::Collider { shape, joint, .. }) = object
+            .components
+            .iter()
+            .find(|component| matches!(component, Component::Collider { .. }))
+        else {
+            return CoreVec3::ZERO;
+        };
+        if ColliderShape::from_storage(shape) != ColliderShape::Cylinder
+            || CylinderJoint::from_storage(joint) != CylinderJoint::Engine
+        {
+            return CoreVec3::ZERO;
+        }
+        let axle = object
+            .global_transform()
+            .rotation
+            .rotate(CoreVec3::new(0.0, 0.0, 1.0))
+            .normalized();
+        engines
+            .into_iter()
+            .map(|(node_id, mut throttle, mut torque, reverse)| {
+                for (input, value) in [(0, &mut throttle), (1, &mut torque)] {
+                    if let Ok((source, output)) = self.compositor_input_source(node_id, input) {
+                        let mut visiting = BTreeSet::new();
+                        if let Some(resolved) =
+                            self.scalar_node_value(source, output, &mut visiting)
+                        {
+                            *value = resolved;
+                        }
+                    }
+                }
+                let direction = if reverse { -1.0 } else { 1.0 };
+                axle * throttle.clamp(-1.0, 1.0) * torque.max(0.0) * direction
+            })
+            .fold(CoreVec3::ZERO, |sum, torque| sum + torque)
     }
 
     fn spring_graph_nodes(
@@ -7042,6 +8528,40 @@ impl EditorApp {
     fn reset_dynamics(&mut self) {
         self.dynamics_time = 0.0;
         self.dynamics_accumulator = 0.0;
+        for (&simulator_id, state) in &self.object_simulation_states {
+            let object_index = self
+                .compositor_nodes
+                .iter()
+                .find_map(|node| match node.settings {
+                    NodeSettings::ObjectSimulator { object_index, .. }
+                        if node.id == simulator_id =>
+                    {
+                        Some(object_index)
+                    }
+                    _ => None,
+                });
+            if let Some(id) = object_index.and_then(|index| self.object_node_id(index))
+                && let Ok(node) = self.scene.tree.node(id)
+            {
+                let mut transform = node.local_transform();
+                transform.translation = state.initial_position;
+                transform.rotation = Quat::from_euler_xyz(CoreVec3::new(
+                    state.initial_rotation_degrees.x.to_radians(),
+                    state.initial_rotation_degrees.y.to_radians(),
+                    state.initial_rotation_degrees.z.to_radians(),
+                ));
+                let _ = self.scene.tree.set_local_transform(id, transform);
+            }
+        }
+        self.object_simulation_states.clear();
+        for (&id, state) in &self.joint_simulation_states {
+            if let Ok(node) = self.scene.tree.node(id) {
+                let mut transform = node.local_transform();
+                transform.rotation = state.base_rotation;
+                let _ = self.scene.tree.set_local_transform(id, transform);
+            }
+        }
+        self.joint_simulation_states.clear();
         for cloth in self.dynamics_cloth.values_mut() {
             cloth.reset();
         }
@@ -7390,6 +8910,9 @@ impl EditorApp {
                             }
                         });
                         ui.menu_button("Dynamics", |ui| {
+                            if compositor_add_button(ui, true, "Object Simulator") {
+                                self.activate_compositor_node(27);
+                            }
                             if compositor_add_button(ui, true, "Mass Density") {
                                 self.activate_compositor_node(20);
                             }
@@ -7417,6 +8940,8 @@ impl EditorApp {
                             }
                             ui.add_enabled(false, egui::Button::new("Object Transform"));
                             ui.add_enabled(false, egui::Button::new("Object Mesh"));
+                            ui.add_enabled(false, egui::Button::new("Force Output"));
+                            ui.add_enabled(false, egui::Button::new("Engine Joint"));
                         });
                         ui.separator();
                         ui.add_enabled(
@@ -7426,7 +8951,7 @@ impl EditorApp {
                     });
                     ui.menu_button("Node", |ui| {
                         let sel = self.compositor_selected_node;
-                        let can_remove = !self.compositor_nodes.iter().any(|n| n.id == sel && matches!(n.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. }));
+                        let can_remove = !self.compositor_nodes.iter().any(|n| n.id == sel && matches!(n.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. } | NodeSettings::ForceOutput { .. } | NodeSettings::Engine { .. }));
                         if ui.add_enabled(can_remove, egui::Button::new("Remove from graph")).clicked() {
                             self.compositor_nodes.retain(|n| n.id != sel);
                             self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
@@ -7494,7 +9019,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 27] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 30] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -7526,12 +9051,27 @@ impl EditorApp {
                     ("Simulator", "Simulation", Color32::from_rgb(166, 124, 57)),
                     ("XYZ Position", "Transform", Color32::from_rgb(91, 118, 166)),
                     ("XYZ Rotation", "Transform", Color32::from_rgb(91, 118, 166)),
+                    (
+                        "Object Simulator",
+                        "Rigid Dynamics",
+                        Color32::from_rgb(196, 139, 48),
+                    ),
+                    (
+                        "Force Output",
+                        "Object Output",
+                        Color32::from_rgb(151, 95, 76),
+                    ),
+                    (
+                        "Engine Joint",
+                        "Object Output",
+                        Color32::from_rgb(190, 93, 47),
+                    ),
                 ];
-                let node_heights_by_kind: [f32; 27] = [
+                let node_heights_by_kind: [f32; 30] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
                     175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
                     285.0, 235.0, 245.0, 285.0, 190.0,
-                    205.0, 205.0,
+                    205.0, 205.0, 360.0, 210.0, 190.0,
                 ];
                 let node_width = 230.0;
 
@@ -7539,7 +9079,15 @@ impl EditorApp {
                 if let Some(id) = self.compositor_pending_spawn.take() {
                     if let Some(node) = self.compositor_nodes.iter_mut().find(|n| n.id == id) {
                         let kind = node.settings.kind();
-                        let height = node_heights_by_kind[kind];
+                        let combine_mode = match &node.settings {
+                            NodeSettings::TextureCombine { mode, .. } => *mode,
+                            _ => 0,
+                        };
+                        let height = compositor_node_height(
+                            node_heights_by_kind[kind],
+                            kind,
+                            combine_mode,
+                        );
                         node.position = compositor_centered_position(canvas, origin, scale, Vec2::new(node_width, height));
                     }
                 }
@@ -7551,7 +9099,15 @@ impl EditorApp {
                     .filter(|node| node.object_index == object_index)
                     .map(|node| {
                         let kind = node.settings.kind();
-                        let height = node_heights_by_kind[kind];
+                        let combine_mode = match &node.settings {
+                            NodeSettings::TextureCombine { mode, .. } => *mode,
+                            _ => 0,
+                        };
+                        let height = compositor_node_height(
+                            node_heights_by_kind[kind],
+                            kind,
+                            combine_mode,
+                        );
                         let rect = Rect::from_min_size(
                             origin + node.position * scale,
                             Vec2::new(node_width, height) * scale,
@@ -7562,19 +9118,11 @@ impl EditorApp {
                 let rect_by_id: std::collections::HashMap<usize, Rect> = node_id_rects.iter().cloned().collect();
 
                 let output_socket = |node_rect: Rect, kind: usize, out_idx: usize| -> Pos2 {
-                    let base_y = if kind == 11 { 70.0 + out_idx as f32 * 22.0 } else { 70.0 };
+                    let base_y = compositor_output_socket_y(kind, out_idx);
                     Pos2::new(node_rect.right(), node_rect.top() + base_y * scale)
                 };
                 let input_socket = |node_rect: Rect, kind: usize, input: usize| -> Pos2 {
-                    let y = match kind {
-                        9 => 85.0 + input as f32 * 30.0,
-                        11 => 70.0,
-                        13 => 75.0 + input as f32 * 22.0,
-                        17 | 25 | 26 => 74.0 + input as f32 * 26.0,
-                        22 => 74.0 + input as f32 * 26.0,
-                        24 => 74.0 + input as f32 * 26.0,
-                        _ => 70.0,
-                    };
+                    let y = compositor_input_socket_y(kind, input);
                     Pos2::new(node_rect.left(), node_rect.top() + y * scale)
                 };
 
@@ -7637,7 +9185,7 @@ impl EditorApp {
                     if !handled {
                         for &(node_id, node_rect) in &node_id_rects {
                             let kind = self.compositor_nodes.iter().find(|n| n.id == node_id).map(|n| n.settings.kind()).unwrap_or(0);
-                            if matches!(kind, 17 | 18) { continue; }
+                            if matches!(kind, 17 | 18 | 28) { continue; }
                             let close_pos = Pos2::new(node_rect.right() - 13.0 * scale, node_rect.top() + 15.0 * scale);
                             if ptr.distance(close_pos) <= 10.0 * scale {
                                 let id_to_remove = node_id;
@@ -7682,7 +9230,7 @@ impl EditorApp {
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
                     let sel = self.compositor_selected_node;
                     if let Some(node) = self.compositor_nodes.iter().find(|n| n.id == sel) {
-                        if !matches!(node.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. }) {
+                        if !matches!(node.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. } | NodeSettings::ForceOutput { .. }) {
                             self.compositor_nodes.retain(|n| n.id != sel);
                             self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
                             self.compositor_pending_output = None;
@@ -7725,8 +9273,8 @@ impl EditorApp {
                         None => continue,
                     };
                     let kind = node.settings.kind();
-                    let (title, kind_label, header_color) = node_specs_by_kind[kind];
-                    let is_output = matches!(kind, 17 | 18);
+                    let (title, _, header_color) = node_specs_by_kind[kind];
+                    let is_output = matches!(kind, 17 | 18 | 28 | 29);
                     let selected = self.compositor_selected_node == node_id;
                     let cm = if let NodeSettings::TextureCombine { mode, .. } = node.settings { mode } else { 0 };
 
@@ -7743,36 +9291,33 @@ impl EditorApp {
                         painter.line_segment([a, b], Stroke::new(2.0, border));
                     }
                     painter.text(header_rect.left_center() + Vec2::new(9.0 * scale, 0.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0 * scale), Color32::WHITE);
+                    ui.interact(
+                        header_rect,
+                        Id::new(("compositor_node_help", node_id)),
+                        Sense::hover(),
+                    )
+                    .on_hover_text(compositor_node_description(kind));
                     if !is_output {
                         painter.text(Pos2::new(node_rect.right() - 13.0 * scale, node_rect.top() + 15.0 * scale), Align2::CENTER_CENTER, "×", FontId::proportional(16.0 * scale), Color32::from_rgba_unmultiplied(255, 255, 255, 160));
                     }
-                    painter.text(node_rect.left_top() + Vec2::new(10.0, 45.0) * scale, Align2::LEFT_TOP, kind_label, FontId::proportional(11.0 * scale), Color32::from_gray(166));
-
+                    if matches!(kind, 25 | 26 | 28) {
+                        painter.text(
+                            node_rect.left_top() + Vec2::new(10.0, 45.0) * scale,
+                            Align2::LEFT_TOP,
+                            match kind {
+                                25 => "Position",
+                                26 => "Rotation",
+                                _ => "Force",
+                            },
+                            FontId::proportional(11.0 * scale),
+                            Color32::from_gray(180),
+                        );
+                    }
                     // Draw input sockets
                     for input in 0..compositor_input_count(kind, cm) {
                         let pos = input_socket(node_rect, kind, input);
                         painter.circle_filled(pos, 6.0 * scale, Color32::from_rgb(218, 190, 92));
-                        if kind == 9 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["A", "B", "Alpha"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 13 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["R", "G", "B", "A"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 17 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Position", "Rotation", "Scale"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 18 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Mesh", FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 20 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Density Texture", FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 21 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Particle Mass", FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 22 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Strength Texture", "Mass Field", "Spring Mesh"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 23 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, "Strength Texture", FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if kind == 24 {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["Velocity Field", "Force Field"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        } else if matches!(kind, 25 | 26) {
-                            painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, ["X", "Y", "Z"][input], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        }
+                        painter.text(pos + Vec2::new(10.0 * scale, 0.0), Align2::LEFT_CENTER, compositor_input_label(kind, input), FontId::proportional(10.0 * scale), Color32::from_gray(180));
                     }
 
                     // Draw output sockets
@@ -7783,18 +9328,23 @@ impl EditorApp {
                             6.0 * scale,
                             Color32::from_rgb(218, 190, 92),
                         );
-                        if kind == 11 {
-                            painter.text(pos - Vec2::new(10.0 * scale, 0.0), Align2::RIGHT_CENTER, ["R", "G", "B", "A"][out_idx], FontId::proportional(10.0 * scale), Color32::from_gray(180));
-                        }
+                        painter.text(pos - Vec2::new(10.0 * scale, 0.0), Align2::RIGHT_CENTER, compositor_output_label(kind, out_idx), FontId::proportional(10.0 * scale), Color32::from_gray(180));
                     }
 
                     // Draw node controls UI
                     let layer_id = compositor_control_layer(ui.layer_id(), node_id);
                     ui.ctx().set_sublayer(ui.layer_id(), layer_id);
-                    let controls_origin = node_rect.min + Vec2::new(10.0, 62.0) * scale;
+                    let controls_top = compositor_controls_top(kind, cm);
+                    let controls_origin = node_rect.min + Vec2::new(10.0, controls_top) * scale;
                     let transform = egui::emath::TSTransform::from_translation(controls_origin.to_vec2()) * egui::emath::TSTransform::from_scaling(scale);
                     ui.ctx().set_transform_layer(layer_id, transform);
-                    let local_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(node_width - 20.0, node_heights_by_kind[kind] - 70.0));
+                    let local_rect = Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(
+                            node_width - 20.0,
+                            node_rect.height() / scale - controls_top - 10.0,
+                        ),
+                    );
                     let mut controls_ui = ui.new_child(egui::UiBuilder::new().layer_id(layer_id).max_rect(local_rect).layout(Layout::top_down(Align::Min)));
                     controls_ui.set_clip_rect(local_rect);
                     controls_ui.style_mut().spacing.item_spacing.y = 3.0;
@@ -8437,6 +9987,7 @@ impl EditorApp {
                         .or_else(|| self.viewport_color.as_ref().map(TextureHandle::id))
                 };
                 if let Some(presented) = &self.presented_view {
+                    let collider_wireframe = self.selected_collider_wireframe();
                     draw_viewport(
                         &painter,
                         response.rect,
@@ -8446,11 +9997,50 @@ impl EditorApp {
                         &presented.triangles,
                         presented.mode,
                         viewport_texture,
+                        &collider_wireframe,
                     );
                 } else {
                     painter.rect_filled(response.rect, 0.0, Color32::from_rgb(21, 24, 31));
                 }
             });
+    }
+
+    fn selected_collider_wireframe(&self) -> Vec<[[f32; 3]; 2]> {
+        let Some(id) = self.scene.selected else {
+            return Vec::new();
+        };
+        let Ok(node) = self.scene.tree.node(id) else {
+            return Vec::new();
+        };
+        let Some(Component::Collider {
+            shape,
+            center,
+            half_extents,
+            radius,
+            height,
+            ..
+        }) = node
+            .components
+            .iter()
+            .find(|component| matches!(component, Component::Collider { .. }))
+        else {
+            return Vec::new();
+        };
+        let shape = ColliderShape::from_storage(shape);
+        let transform = node.global_transform();
+        collider_wireframe_segments(shape, *center, *half_extents, *radius, *height)
+            .into_iter()
+            .map(|segment| {
+                segment.map(|point| {
+                    let local = CoreVec3::new(point[0], point[1], point[2]);
+                    let world = transform.translation
+                        + transform
+                            .rotation
+                            .rotate(transform.scale.component_mul(local));
+                    [world.x, world.y, world.z]
+                })
+            })
+            .collect()
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
@@ -9006,6 +10596,7 @@ fn resolve_object_handle_value(nodes: &[CompositorNode], node_id: usize) -> Opti
 
 fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
     match kind {
+        0 | 1 | 2 | 14 | 15 | 19 => 0,
         9 => {
             if combine_mode == 1 {
                 3
@@ -9014,21 +10605,137 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
             }
         }
         13 => 4,
-        17 | 25 | 26 => 3,
+        17 | 25 | 26 | 28 => 3,
         18 => 1,
-        19 => 0,
         22 => 3,
         23 => 1,
-        24 => 2,
+        24 | 27 | 29 => 2,
         _ => 1,
     }
 }
 
+fn compositor_input_socket_y(kind: usize, input: usize) -> f32 {
+    match kind {
+        9 => 85.0 + input as f32 * 30.0,
+        13 => 75.0 + input as f32 * 22.0,
+        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 => 74.0 + input as f32 * 26.0,
+        _ => 70.0,
+    }
+}
+
+fn compositor_output_socket_y(kind: usize, output: usize) -> f32 {
+    match kind {
+        11 => 70.0 + output as f32 * 22.0,
+        27 => 74.0 + output as f32 * 26.0,
+        _ => 70.0,
+    }
+}
+
+fn compositor_controls_top(kind: usize, combine_mode: usize) -> f32 {
+    let input_bottom = compositor_input_count(kind, combine_mode)
+        .checked_sub(1)
+        .map(|input| compositor_input_socket_y(kind, input));
+    let output_bottom = compositor_output_count(kind)
+        .checked_sub(1)
+        .map(|output| compositor_output_socket_y(kind, output));
+    input_bottom
+        .into_iter()
+        .chain(output_bottom)
+        .fold(48.0_f32, f32::max)
+        + 22.0
+}
+
+fn compositor_node_height(base_height: f32, kind: usize, combine_mode: usize) -> f32 {
+    base_height + (compositor_controls_top(kind, combine_mode) - 62.0).max(0.0)
+}
+
 fn compositor_output_count(kind: usize) -> usize {
     match kind {
-        8 | 16 | 17 | 18 => 0,
+        8 | 16 | 17 | 18 | 28 | 29 => 0,
         11 => 4,
+        27 => 2,
         _ => 1,
+    }
+}
+
+fn compositor_input_label(kind: usize, input: usize) -> &'static str {
+    match kind {
+        3 => "Value",
+        4 => "Value",
+        5 | 6 => "Value",
+        7 => "Image",
+        8 => "Texture",
+        9 => ["A", "B", "Alpha"][input],
+        10..=12 => "Color",
+        13 => ["R", "G", "B", "A"][input],
+        16 => "Value",
+        17 => ["Position", "Rotation", "Scale"][input],
+        18 => "Mesh",
+        20 => "Density Texture",
+        21 => "Particle Mass",
+        22 => ["Strength Texture", "Mass Field", "Spring Mesh"][input],
+        23 => "Strength Texture",
+        24 => ["Velocity Field", "Force Field"][input],
+        25 | 26 => ["X", "Y", "Z"][input],
+        27 => ["Initial Position", "Initial Rotation"][input],
+        28 => ["X", "Y", "Z"][input],
+        29 => ["Throttle", "Torque"][input],
+        _ => "Input",
+    }
+}
+
+fn compositor_output_label(kind: usize, output: usize) -> &'static str {
+    match kind {
+        11 => ["R", "G", "B", "A"][output],
+        20 => "Mass Field",
+        21 => "Spring Mesh",
+        22 => "Force Field",
+        23 => "Velocity Field",
+        24 => "Mesh",
+        25 => "Position",
+        26 => "Rotation",
+        27 => ["Position", "Rotation"][output],
+        0 | 1 | 7 | 8 | 9 | 10 | 12 | 13 | 19 => "Texture",
+        3 | 4 | 5 | 6 | 14 | 15 => "Value",
+        2 => "Value / Color",
+        16 => "Preview",
+        _ => "Output",
+    }
+}
+
+fn compositor_node_description(kind: usize) -> &'static str {
+    match kind {
+        0 => "Reads a texture channel from a scene object.",
+        1 => "Loads an external image asset.",
+        2 => "Provides a constant scalar or RGB color.",
+        3 => "Remaps values through a polyline or Bézier curve.",
+        4 => "Applies scalar or texture algebra.",
+        5 => "Converts values below the threshold to 0 and values above it to 1.",
+        6 => "Applies a threshold with a smooth transition.",
+        7 => "Applies a selectable image-space filter.",
+        8 => "Overwrites one texture channel on the current object.",
+        9 => "Combines two textures using algebra or alpha mixing.",
+        10 => "Converts between supported color spaces.",
+        11 => "Splits an RGBA texture into four channels.",
+        12 => "Converts a color texture to grayscale.",
+        13 => "Joins four scalar channels into an RGBA texture.",
+        14 => "Exposes a live scalar control in Scene mode.",
+        15 => "Outputs simulation or wall-clock time.",
+        16 => "Displays an intermediate node result.",
+        17 => "Applies position, rotation, and scale to the object.",
+        18 => "Applies the final generated mesh to the object.",
+        19 => "Creates a scalar texture with the in-app mesh painter.",
+        20 => "Converts a density texture into particle masses.",
+        21 => "Creates stretch and bending constraints from a mesh.",
+        22 => "Evaluates a Cartesian force field over mesh particles.",
+        23 => "Evaluates a Cartesian velocity field over mesh particles.",
+        24 => "Runs deformable mesh simulation.",
+        25 => "Builds a position vector from X, Y, and Z values.",
+        26 => "Builds an Euler rotation from X, Y, and Z angles.",
+        27 => "Runs fixed-step rigid position and rotation simulation.",
+        28 => "Collects an object's force and propagates it to simulated ancestors.",
+        29 => "Drives an Engine cylinder around its local Z axle.",
+        _ => "Node",
     }
 }
 
@@ -10393,6 +12100,7 @@ fn draw_viewport(
     triangles: &[PreviewTriangle],
     mode: ViewportMode,
     viewport_texture: Option<TextureId>,
+    collider_wireframe: &[[[f32; 3]; 2]],
 ) {
     let (yaw, pitch, zoom, camera_target, grid_spacing, projection_mode) = camera;
     painter.rect_filled(rect, 0.0, Color32::from_rgb(21, 24, 31));
@@ -10596,6 +12304,21 @@ fn draw_viewport(
                     color,
                 );
             }
+        }
+    }
+    let collider_stroke = Stroke::new(2.0, Color32::from_rgb(255, 210, 48));
+    for &segment in collider_wireframe {
+        if let Some(projected) = project_segment(
+            segment,
+            center,
+            scale,
+            yaw,
+            pitch,
+            camera_target,
+            projection_mode,
+            grid_spacing,
+        ) {
+            painter.line_segment(projected, collider_stroke);
         }
     }
     painter.text(
@@ -11150,6 +12873,280 @@ fn mesh_bounds(asset: &MeshAsset) -> ([f32; 3], [f32; 3]) {
             (minimum, maximum)
         },
     )
+}
+
+fn fitted_collider_from_bounds(bounds: ([f32; 3], [f32; 3]), shape: ColliderShape) -> Component {
+    let center = CoreVec3::new(
+        (bounds.0[0] + bounds.1[0]) * 0.5,
+        (bounds.0[1] + bounds.1[1]) * 0.5,
+        (bounds.0[2] + bounds.1[2]) * 0.5,
+    );
+    let extents = CoreVec3::new(
+        ((bounds.1[0] - bounds.0[0]) * 0.5).max(0.001),
+        ((bounds.1[1] - bounds.0[1]) * 0.5).max(0.001),
+        ((bounds.1[2] - bounds.0[2]) * 0.5).max(0.001),
+    );
+    let (half_extents, radius, height) = match shape {
+        ColliderShape::Sphere => {
+            let radius = extents.x.max(extents.y).max(extents.z);
+            (CoreVec3::new(radius, radius, radius), radius, radius * 2.0)
+        }
+        ColliderShape::Cylinder => {
+            let radius = extents.x.max(extents.y);
+            (
+                CoreVec3::new(radius, radius, extents.z),
+                radius,
+                extents.z * 2.0,
+            )
+        }
+        ColliderShape::Box => (
+            extents,
+            extents.x.max(extents.y).max(extents.z),
+            extents.z * 2.0,
+        ),
+        ColliderShape::Flat => (
+            CoreVec3::new(extents.x, extents.y, 0.005),
+            extents.x.max(extents.y),
+            0.01,
+        ),
+    };
+    let density = 1_000.0;
+    let mass = collider_volume(shape, half_extents, radius, height) * density;
+    let friction = match shape {
+        ColliderShape::Sphere => CoreVec3::new(0.05, 0.05, 0.05),
+        ColliderShape::Cylinder => CoreVec3::new(0.05, 0.8, 0.8),
+        ColliderShape::Box | ColliderShape::Flat => CoreVec3::new(0.8, 0.8, 0.8),
+    };
+    Component::Collider {
+        shape: shape.storage_name().into(),
+        center,
+        half_extents,
+        radius,
+        height,
+        coupling_stiffness: 0.5,
+        coupling_damping: 1.0,
+        elasticity_stiffness: 0.5,
+        elasticity_damping: 1.0,
+        restitution: 0.0,
+        force_cutoff: 0.01,
+        collision_force_cutoff: 0.01,
+        density,
+        mass,
+        automatic_mass: true,
+        friction,
+        joint: CylinderJoint::None.storage_name().into(),
+    }
+}
+
+fn collider_volume(shape: ColliderShape, half_extents: CoreVec3, radius: f32, height: f32) -> f32 {
+    match shape {
+        ColliderShape::Sphere => 4.0 / 3.0 * std::f32::consts::PI * radius.max(0.0).powi(3),
+        ColliderShape::Cylinder => std::f32::consts::PI * radius.max(0.0).powi(2) * height.max(0.0),
+        ColliderShape::Box | ColliderShape::Flat => {
+            8.0 * half_extents.x.max(0.0) * half_extents.y.max(0.0) * half_extents.z.max(0.0)
+        }
+    }
+}
+
+fn collider_vertical_extent(
+    shape: ColliderShape,
+    half_extents: CoreVec3,
+    scale: CoreVec3,
+    rotation: Quat,
+) -> f32 {
+    let scaled = scale.component_mul(half_extents);
+    match shape {
+        ColliderShape::Sphere => scaled.x.abs().max(scaled.y.abs()).max(scaled.z.abs()),
+        ColliderShape::Cylinder => {
+            let axis = rotation.rotate(CoreVec3::new(0.0, 0.0, 1.0)).normalized();
+            let radial_extent = scaled.x.abs().max(scaled.y.abs());
+            let radial_vertical = (1.0 - axis.z * axis.z).max(0.0).sqrt();
+            radial_extent * radial_vertical + scaled.z.abs() * axis.z.abs()
+        }
+        ColliderShape::Box | ColliderShape::Flat => [
+            CoreVec3::new(scaled.x, 0.0, 0.0),
+            CoreVec3::new(0.0, scaled.y, 0.0),
+            CoreVec3::new(0.0, 0.0, scaled.z),
+        ]
+        .into_iter()
+        .map(|axis| rotation.rotate(axis).z.abs())
+        .sum(),
+    }
+}
+
+fn force_cut_scalar(value: f32, cutoff: f32) -> f32 {
+    if value.abs() <= cutoff.max(0.0) {
+        0.0
+    } else {
+        value
+    }
+}
+
+fn force_cut_vector(value: CoreVec3, cutoff: f32) -> CoreVec3 {
+    if value.length() <= cutoff.max(0.0) {
+        CoreVec3::ZERO
+    } else {
+        value
+    }
+}
+
+fn collider_friction_coefficient(
+    shape: ColliderShape,
+    rotation: Quat,
+    friction: CoreVec3,
+    tangent_velocity: CoreVec3,
+) -> f32 {
+    let direction = tangent_velocity.normalized();
+    match shape {
+        ColliderShape::Sphere => friction.x.max(0.0),
+        ColliderShape::Cylinder => {
+            let normal = CoreVec3::new(0.0, 0.0, 1.0);
+            let axis = rotation.rotate(CoreVec3::new(0.0, 0.0, 1.0));
+            let rolling = axis.cross(normal).normalized();
+            if rolling.length() <= 1.0e-6 {
+                friction.x.max(0.0)
+            } else {
+                let rolling_weight = direction.dot(rolling).abs().clamp(0.0, 1.0);
+                let non_rolling = (friction.y.max(0.0) + friction.z.max(0.0)) * 0.5;
+                friction.x.max(0.0) * rolling_weight + non_rolling * (1.0 - rolling_weight)
+            }
+        }
+        ColliderShape::Box | ColliderShape::Flat => {
+            let local = rotation.inverse().rotate(direction);
+            let weights = CoreVec3::new(local.x.abs(), local.y.abs(), local.z.abs());
+            (weights.x * friction.x.max(0.0)
+                + weights.y * friction.y.max(0.0)
+                + weights.z * friction.z.max(0.0))
+                / (weights.x + weights.y + weights.z).max(1.0e-6)
+        }
+    }
+}
+
+fn contact_friction_force(
+    tangent_velocity: CoreVec3,
+    coefficient: f32,
+    normal_force: f32,
+    effective_mass: f32,
+    dt: f32,
+) -> CoreVec3 {
+    let speed = tangent_velocity.length();
+    if speed <= 1.0e-6 || coefficient <= 0.0 || normal_force <= 0.0 {
+        return CoreVec3::ZERO;
+    }
+    let coulomb_limit = coefficient.max(0.0) * normal_force.max(0.0);
+    let stop_force = effective_mass.max(0.0) * speed / dt.max(1.0e-6);
+    tangent_velocity.normalized() * -coulomb_limit.min(stop_force)
+}
+
+fn resolve_contact_normal_velocity(inward_velocity: f32, restitution: f32) -> f32 {
+    if inward_velocity < 0.0 {
+        -inward_velocity * restitution.clamp(0.0, 1.0)
+    } else {
+        inward_velocity
+    }
+}
+
+fn contact_count_for_solver(actual_contacts: usize) -> (f32, bool) {
+    (actual_contacts.max(1) as f32, actual_contacts > 0)
+}
+
+fn coupled_contact_mass(
+    body_mass: f32,
+    joint_inertia: f32,
+    radius: f32,
+    rolling_weight: f32,
+) -> f32 {
+    let body_inverse = 1.0 / body_mass.max(1.0e-6);
+    let joint_inverse =
+        rolling_weight.clamp(0.0, 1.0) * radius.max(0.0).powi(2) / joint_inertia.max(1.0e-6);
+    1.0 / (body_inverse + joint_inverse).max(1.0e-6)
+}
+
+fn collider_wireframe_segments(
+    shape: ColliderShape,
+    center: CoreVec3,
+    half_extents: CoreVec3,
+    radius: f32,
+    height: f32,
+) -> Vec<[[f32; 3]; 2]> {
+    let offset = |point: [f32; 3]| {
+        [
+            point[0] + center.x,
+            point[1] + center.y,
+            point[2] + center.z,
+        ]
+    };
+    if matches!(shape, ColliderShape::Box | ColliderShape::Flat) {
+        let corners = [
+            [-half_extents.x, -half_extents.y, -half_extents.z],
+            [half_extents.x, -half_extents.y, -half_extents.z],
+            [half_extents.x, half_extents.y, -half_extents.z],
+            [-half_extents.x, half_extents.y, -half_extents.z],
+            [-half_extents.x, -half_extents.y, half_extents.z],
+            [half_extents.x, -half_extents.y, half_extents.z],
+            [half_extents.x, half_extents.y, half_extents.z],
+            [-half_extents.x, half_extents.y, half_extents.z],
+        ];
+        return [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ]
+        .into_iter()
+        .map(|(a, b)| [offset(corners[a]), offset(corners[b])])
+        .collect();
+    }
+
+    const SIDES: usize = 32;
+    let mut segments = Vec::new();
+    let circle_point = |plane: usize, angle: f32, axial: f32| {
+        let (sin, cos) = angle.sin_cos();
+        let radial = radius.max(0.0);
+        match plane {
+            0 => offset([radial * cos, radial * sin, axial]),
+            1 => offset([radial * cos, axial, radial * sin]),
+            _ => offset([axial, radial * cos, radial * sin]),
+        }
+    };
+    match shape {
+        ColliderShape::Sphere => {
+            for plane in 0..3 {
+                for side in 0..SIDES {
+                    let a = side as f32 * std::f32::consts::TAU / SIDES as f32;
+                    let b = (side + 1) as f32 * std::f32::consts::TAU / SIDES as f32;
+                    segments.push([circle_point(plane, a, 0.0), circle_point(plane, b, 0.0)]);
+                }
+            }
+        }
+        ColliderShape::Cylinder => {
+            let half_height = height.max(0.0) * 0.5;
+            for axial in [-half_height, half_height] {
+                for side in 0..SIDES {
+                    let a = side as f32 * std::f32::consts::TAU / SIDES as f32;
+                    let b = (side + 1) as f32 * std::f32::consts::TAU / SIDES as f32;
+                    segments.push([circle_point(0, a, axial), circle_point(0, b, axial)]);
+                }
+            }
+            for side in 0..8 {
+                let angle = side as f32 * std::f32::consts::TAU / 8.0;
+                segments.push([
+                    circle_point(0, angle, -half_height),
+                    circle_point(0, angle, half_height),
+                ]);
+            }
+        }
+        ColliderShape::Box | ColliderShape::Flat => unreachable!(),
+    }
+    segments
 }
 
 fn pan_camera_target(
@@ -11721,6 +13718,219 @@ mod tests {
     }
 
     #[test]
+    fn collider_shapes_best_fit_bounds_with_editable_parameters() {
+        let bounds = ([-2.0, -1.0, -0.5], [2.0, 3.0, 1.5]);
+        let collider = |shape| fitted_collider_from_bounds(bounds, shape);
+        let Component::Collider {
+            center,
+            half_extents,
+            ..
+        } = collider(ColliderShape::Box)
+        else {
+            panic!("box collider");
+        };
+        assert_eq!(center, CoreVec3::new(0.0, 1.0, 0.5));
+        assert_eq!(half_extents, CoreVec3::new(2.0, 2.0, 1.0));
+
+        let Component::Collider { radius, .. } = collider(ColliderShape::Sphere) else {
+            panic!("sphere collider");
+        };
+        assert_eq!(radius, 2.0);
+
+        let Component::Collider { radius, height, .. } = collider(ColliderShape::Cylinder) else {
+            panic!("cylinder collider");
+        };
+        assert_eq!((radius, height), (2.0, 2.0));
+
+        let Component::Collider {
+            half_extents,
+            height,
+            ..
+        } = collider(ColliderShape::Flat)
+        else {
+            panic!("flat collider");
+        };
+        assert_eq!(half_extents, CoreVec3::new(2.0, 2.0, 0.005));
+        assert_eq!(height, 0.01);
+    }
+
+    #[test]
+    fn collider_wireframes_cover_every_supported_shape() {
+        let center = CoreVec3::new(3.0, -2.0, 1.0);
+        let extents = CoreVec3::new(2.0, 1.0, 0.5);
+        let box_lines = collider_wireframe_segments(ColliderShape::Box, center, extents, 2.0, 1.0);
+        let flat_lines =
+            collider_wireframe_segments(ColliderShape::Flat, center, extents, 2.0, 0.01);
+        let sphere_lines =
+            collider_wireframe_segments(ColliderShape::Sphere, center, extents, 2.0, 1.0);
+        let cylinder_lines =
+            collider_wireframe_segments(ColliderShape::Cylinder, center, extents, 2.0, 1.0);
+
+        assert_eq!(box_lines.len(), 12);
+        assert_eq!(flat_lines.len(), 12);
+        assert_eq!(sphere_lines.len(), 96);
+        assert_eq!(cylinder_lines.len(), 72);
+        assert!(
+            box_lines
+                .into_iter()
+                .flatten()
+                .flatten()
+                .all(f32::is_finite)
+        );
+        assert!(
+            sphere_lines
+                .into_iter()
+                .flatten()
+                .flatten()
+                .all(f32::is_finite)
+        );
+        assert!(
+            cylinder_lines
+                .into_iter()
+                .flatten()
+                .flatten()
+                .all(f32::is_finite)
+        );
+    }
+
+    #[test]
+    fn collider_volume_supports_automatic_component_mass() {
+        let extents = CoreVec3::new(1.0, 2.0, 3.0);
+        assert_eq!(collider_volume(ColliderShape::Box, extents, 0.0, 0.0), 48.0);
+        assert_eq!(
+            collider_volume(ColliderShape::Flat, extents, 0.0, 0.0),
+            48.0
+        );
+        assert!(
+            (collider_volume(ColliderShape::Sphere, extents, 1.0, 0.0)
+                - 4.0 * std::f32::consts::PI / 3.0)
+                .abs()
+                < 1.0e-5
+        );
+        assert!(
+            (collider_volume(ColliderShape::Cylinder, extents, 2.0, 3.0)
+                - 12.0 * std::f32::consts::PI)
+                .abs()
+                < 1.0e-5
+        );
+    }
+
+    #[test]
+    fn force_cut_filter_removes_small_vibration_signals() {
+        assert_eq!(force_cut_scalar(0.01, 0.01), 0.0);
+        assert_eq!(force_cut_scalar(-0.009, 0.01), 0.0);
+        assert_eq!(force_cut_scalar(0.02, 0.01), 0.02);
+        assert_eq!(
+            force_cut_vector(CoreVec3::new(0.003, 0.004, 0.0), 0.01),
+            CoreVec3::ZERO
+        );
+        assert_eq!(
+            force_cut_vector(CoreVec3::new(0.02, 0.0, 0.0), 0.01),
+            CoreVec3::new(0.02, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn collider_friction_defaults_distinguish_rolling_from_sliding() {
+        let low = CoreVec3::new(0.05, 0.8, 0.8);
+        // Cylinder axis is world Y; rolling is therefore world X.
+        let rotation = Quat::from_euler_xyz(CoreVec3::new(-std::f32::consts::FRAC_PI_2, 0.0, 0.0));
+        let rolling = collider_friction_coefficient(
+            ColliderShape::Cylinder,
+            rotation,
+            low,
+            CoreVec3::new(1.0, 0.0, 0.0),
+        );
+        let axial = collider_friction_coefficient(
+            ColliderShape::Cylinder,
+            rotation,
+            low,
+            CoreVec3::new(0.0, 1.0, 0.0),
+        );
+        assert!(rolling < axial);
+        assert_eq!(
+            collider_friction_coefficient(
+                ColliderShape::Sphere,
+                Quat::IDENTITY,
+                CoreVec3::new(0.05, 0.05, 0.05),
+                CoreVec3::new(1.0, 1.0, 0.0),
+            ),
+            0.05
+        );
+    }
+
+    #[test]
+    fn contact_friction_opposes_slip_and_respects_coulomb_limit() {
+        let force =
+            contact_friction_force(CoreVec3::new(4.0, 0.0, 0.0), 0.5, 100.0, 10.0, 1.0 / 60.0);
+        assert!(force.x < 0.0);
+        assert!(force.y.abs() <= f32::EPSILON);
+        assert!((force.length() - 50.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn contact_friction_stops_small_slip_without_reversing_it() {
+        let dt = 0.1;
+        let mass = 2.0;
+        let velocity = CoreVec3::new(0.2, -0.1, 0.0);
+        let force = contact_friction_force(velocity, 10.0, 100.0, mass, dt);
+        let next = velocity + force * (dt / mass);
+        assert!(next.length() < 1.0e-5);
+    }
+
+    #[test]
+    fn impulse_contact_is_non_bouncing_by_default() {
+        assert_eq!(resolve_contact_normal_velocity(-12.0, 0.0), 0.0);
+        assert_eq!(resolve_contact_normal_velocity(-12.0, 0.25), 3.0);
+        assert_eq!(resolve_contact_normal_velocity(2.0, 0.0), 2.0);
+        assert_eq!(contact_count_for_solver(0), (1.0, false));
+        assert_eq!(contact_count_for_solver(4), (4.0, true));
+    }
+
+    #[test]
+    fn wheel_contact_uses_coupled_body_and_rotational_mass() {
+        let wheel_mass = 196.0;
+        let radius = 0.43;
+        let inertia = 0.5 * wheel_mass * radius * radius;
+        let rolling = coupled_contact_mass(wheel_mass, inertia, radius, 1.0);
+        let lateral = coupled_contact_mass(wheel_mass, inertia, radius, 0.0);
+        assert!((rolling - wheel_mass / 3.0).abs() < 1.0e-4);
+        assert!((lateral - wheel_mass).abs() < 1.0e-4);
+
+        // An uncapped rolling impulse computed from this mass removes exactly
+        // the relative slip shared by body translation and wheel rotation.
+        let slip = 2.0;
+        let impulse = rolling * slip;
+        let removed_slip = impulse * (1.0 / wheel_mass + radius * radius / inertia);
+        assert!((removed_slip - slip).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn cylinder_ground_extent_is_invariant_under_axle_rotation() {
+        let half_extents = CoreVec3::new(0.43, 0.43, 0.17);
+        let wheel_orientation =
+            Quat::from_euler_xyz(CoreVec3::new(-std::f32::consts::FRAC_PI_2, 0.0, 0.0));
+        let expected = collider_vertical_extent(
+            ColliderShape::Cylinder,
+            half_extents,
+            CoreVec3::new(1.0, 1.0, 1.0),
+            wheel_orientation,
+        );
+        assert!((expected - 0.43).abs() < 1.0e-5);
+        for step in 0..32 {
+            let spin = step as f32 * std::f32::consts::TAU / 32.0;
+            let rotation = wheel_orientation * Quat::from_euler_xyz(CoreVec3::new(0.0, 0.0, spin));
+            let extent = collider_vertical_extent(
+                ColliderShape::Cylinder,
+                half_extents,
+                CoreVec3::new(1.0, 1.0, 1.0),
+                rotation,
+            );
+            assert!((extent - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
     fn orthographic_grid_segment_matches_direct_projection() {
         let segment = [[-2.0, 1.0, 0.0], [4.0, 1.0, 0.0]];
         let projected = project_segment(
@@ -12173,15 +14383,44 @@ mod tests {
         assert_eq!(parse_compositor_color("0,1"), None);
         assert_eq!(parse_compositor_bezier("0,0;1,1"), None);
         assert_eq!(compositor_input_count(4, 0), 1);
+        assert_eq!(compositor_input_count(0, 0), 0);
+        assert_eq!(compositor_input_count(1, 0), 0);
+        assert_eq!(compositor_input_count(2, 0), 0);
+        assert_eq!(compositor_input_count(15, 0), 0);
         assert_eq!(compositor_input_count(9, 0), 2);
         assert_eq!(compositor_input_count(9, 1), 3);
         assert_eq!(compositor_input_count(13, 0), 4);
         assert_eq!(compositor_input_count(25, 0), 3);
         assert_eq!(compositor_input_count(26, 0), 3);
+        assert_eq!(compositor_input_count(27, 0), 2);
         assert_eq!(compositor_output_count(11), 4);
         assert_eq!(compositor_output_count(25), 1);
         assert_eq!(compositor_output_count(26), 1);
+        assert_eq!(compositor_output_count(27), 2);
         assert_eq!(compositor_output_count(0), 1);
+        assert_eq!(compositor_input_count(28, 0), 3);
+        assert_eq!(compositor_output_count(28), 0);
+        for kind in 0..29 {
+            assert!(!compositor_node_description(kind).is_empty());
+            for input in 0..compositor_input_count(kind, 0) {
+                assert!(!compositor_input_label(kind, input).is_empty());
+            }
+            for output in 0..compositor_output_count(kind) {
+                assert!(!compositor_output_label(kind, output).is_empty());
+            }
+            let socket_bottom = (0..compositor_input_count(kind, 0))
+                .map(|input| compositor_input_socket_y(kind, input))
+                .chain(
+                    (0..compositor_output_count(kind))
+                        .map(|output| compositor_output_socket_y(kind, output)),
+                )
+                .fold(0.0_f32, f32::max);
+            assert!(compositor_controls_top(kind, 0) >= socket_bottom + 20.0);
+        }
+        assert!(
+            compositor_controls_top(9, 1) > compositor_controls_top(9, 0),
+            "the optional Alpha socket must reserve its own row"
+        );
         assert!(matches!(
             NodeSettings::default_for_kind(25),
             Some(NodeSettings::Position { values }) if values == [0.0; 3]

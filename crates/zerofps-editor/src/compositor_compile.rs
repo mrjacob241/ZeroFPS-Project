@@ -347,7 +347,10 @@ impl Compiler<'_> {
             | NodeSettings::SpringMesh { .. }
             | NodeSettings::ForceField { .. }
             | NodeSettings::VelocityField { .. }
-            | NodeSettings::Simulator { .. } => {
+            | NodeSettings::Simulator { .. }
+            | NodeSettings::ObjectSimulator { .. }
+            | NodeSettings::ForceOutput { .. }
+            | NodeSettings::Engine { .. } => {
                 return Err(GraphCompileError::NotOutputNode(socket.0));
             }
         };

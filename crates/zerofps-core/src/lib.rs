@@ -265,6 +265,40 @@ pub enum Component {
     },
     Collider {
         shape: String,
+        #[serde(default)]
+        center: Vec3,
+        #[serde(default = "default_collider_half_extents")]
+        half_extents: Vec3,
+        #[serde(default = "default_collider_radius")]
+        radius: f32,
+        #[serde(default = "default_collider_height")]
+        height: f32,
+        #[serde(default = "default_collider_coupling_stiffness")]
+        coupling_stiffness: f32,
+        #[serde(default = "default_collider_coupling_damping")]
+        coupling_damping: f32,
+        #[serde(default = "default_collider_elasticity_stiffness")]
+        elasticity_stiffness: f32,
+        #[serde(default = "default_collider_elasticity_damping")]
+        elasticity_damping: f32,
+        /// Normal-velocity retention after an impulse contact, in [0, 1].
+        #[serde(default)]
+        restitution: f32,
+        #[serde(default = "default_collider_force_cutoff")]
+        force_cutoff: f32,
+        #[serde(default = "default_collider_force_cutoff")]
+        collision_force_cutoff: f32,
+        #[serde(default = "default_collider_density")]
+        density: f32,
+        #[serde(default = "default_collider_mass")]
+        mass: f32,
+        #[serde(default = "default_true")]
+        automatic_mass: bool,
+        #[serde(default = "default_collider_friction")]
+        friction: Vec3,
+        /// Cylinder-only rotational joint: "none", "wheel", or "engine".
+        #[serde(default)]
+        joint: String,
     },
     RigidBody {
         dynamic: bool,
@@ -278,6 +312,54 @@ pub enum Component {
     Marker {
         kind: String,
     },
+}
+
+fn default_collider_half_extents() -> Vec3 {
+    Vec3::new(0.5, 0.5, 0.5)
+}
+
+fn default_collider_radius() -> f32 {
+    0.5
+}
+
+fn default_collider_height() -> f32 {
+    1.0
+}
+
+fn default_collider_coupling_stiffness() -> f32 {
+    0.5
+}
+
+fn default_collider_coupling_damping() -> f32 {
+    1.0
+}
+
+fn default_collider_elasticity_stiffness() -> f32 {
+    0.5
+}
+
+fn default_collider_elasticity_damping() -> f32 {
+    1.0
+}
+
+fn default_collider_force_cutoff() -> f32 {
+    0.01
+}
+
+fn default_collider_density() -> f32 {
+    1_000.0
+}
+
+fn default_collider_mass() -> f32 {
+    1.0
+}
+
+fn default_collider_friction() -> Vec3 {
+    Vec3::new(0.8, 0.8, 0.8)
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
