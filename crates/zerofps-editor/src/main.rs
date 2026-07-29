@@ -1584,6 +1584,7 @@ struct EditorApp {
     input_worker: InputWorker,
     asset_import_worker: AssetImportWorker,
     viewport_requested_key: Option<DepthCacheKey>,
+    viewport_render_in_flight: bool,
     presented_view: Option<PresentedView>,
     dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
     save_dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -1731,6 +1732,7 @@ impl EditorApp {
             input_worker: InputWorker::new(cc.egui_ctx.clone()),
             asset_import_worker: AssetImportWorker::new(cc.egui_ctx.clone()),
             viewport_requested_key: None,
+            viewport_render_in_flight: false,
             presented_view: None,
             dialog_result: None,
             save_dialog_result: None,
@@ -5567,17 +5569,25 @@ impl EditorApp {
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(5.0);
-                let roots = self.scene.tree.roots().to_vec();
-                for root in roots {
-                    self.object_tree(ui, root, 0);
-                }
-                ui.add_space(10.0);
-                if ui.button("+ Add object").clicked() {
-                    let previous = self.scene.tree.clone();
-                    let id = self.scene.add("New Object", ObjectKind::Empty, None);
-                    self.scene.selected = Some(id);
-                    self.record_undo(previous);
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("scene_objects_scroll")
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .show(ui, |ui| {
+                        let roots = self.scene.tree.roots().to_vec();
+                        for root in roots {
+                            self.object_tree(ui, root, 0);
+                        }
+                        ui.add_space(10.0);
+                        if ui.button("+ Add object").clicked() {
+                            let previous = self.scene.tree.clone();
+                            let id = self.scene.add("New Object", ObjectKind::Empty, None);
+                            self.scene.selected = Some(id);
+                            self.record_undo(previous);
+                        }
+                    });
             });
     }
 
@@ -10867,6 +10877,8 @@ impl EditorApp {
                         newest_completed = Some(result);
                     }
                     if let Some(result) = newest_completed {
+                        self.viewport_render_in_flight = false;
+                        self.viewport_requested_key = None;
                         self.performance
                             .viewport_queue_wait
                             .record(result.queue_wait);
@@ -10948,6 +10960,7 @@ impl EditorApp {
                     }
                     if self.viewport_depth_key != Some(key)
                         && self.viewport_requested_key != Some(key)
+                        && !self.viewport_render_in_flight
                         && viewport_frame_due
                     {
                         self.display_worker.submit_latest(RenderJob {
@@ -10971,6 +10984,7 @@ impl EditorApp {
                             queued_at: Instant::now(),
                         });
                         self.viewport_requested_key = Some(key);
+                        self.viewport_render_in_flight = true;
                     }
                     self.viewport_native_texture
                         .or_else(|| self.viewport_color.as_ref().map(TextureHandle::id))
@@ -12306,6 +12320,10 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
             performance.compositor_vulkan_submit.latest_ms
         ));
         ui.label("Socket  loopback");
+        ui.separator();
+        if ui.button("Copy telemetry").clicked() {
+            ui.ctx().copy_text(format_telemetry_report(performance));
+        }
     });
     ui.add_space(8.0);
     egui::Grid::new("editor_execution_telemetry")
@@ -12317,29 +12335,7 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
             ui.strong("Maximum");
             ui.strong("Samples");
             ui.end_row();
-            for (name, metric) in [
-                ("Vulkan viewport worker", performance.viewport_vulkan),
-                ("GPU batch preparation", performance.viewport_prepare),
-                (
-                    "egui native texture presentation",
-                    performance.viewport_present,
-                ),
-                ("Viewport queue wait", performance.viewport_queue_wait),
-                ("Shadow maps (cached)", performance.shadow_prepare),
-                ("Control → graph apply", performance.control_to_graph_apply),
-                (
-                    "Control → composite ready",
-                    performance.control_to_composite_ready,
-                ),
-                ("Control → presented frame", performance.control_to_present),
-                ("Graph compilation", performance.graph_compile),
-                ("Graph evaluation", performance.graph_evaluation),
-                ("CPU viewport", performance.viewport_cpu),
-                (
-                    "Vulkan graph encode + submission",
-                    performance.compositor_vulkan_submit,
-                ),
-            ] {
+            for (name, metric) in telemetry_metrics(performance) {
                 ui.label(name);
                 ui.monospace(format!("{:.3} ms", metric.latest_ms));
                 ui.monospace(format!("{:.3} ms", metric.average_ms));
@@ -12353,6 +12349,45 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
         "Vulkan viewport timing covers batch preparation plus command encoding/submission. The \
          resident color target is sampled directly by egui; depth is not read back during normal rendering.",
     );
+}
+
+fn telemetry_metrics(
+    performance: &EditorPerformanceTelemetry,
+) -> [(&'static str, TimingMetric); 12] {
+    [
+        ("Vulkan viewport worker", performance.viewport_vulkan),
+        ("GPU batch preparation", performance.viewport_prepare),
+        (
+            "egui native texture presentation",
+            performance.viewport_present,
+        ),
+        ("Viewport queue wait", performance.viewport_queue_wait),
+        ("Shadow maps (cached)", performance.shadow_prepare),
+        ("Control → graph apply", performance.control_to_graph_apply),
+        (
+            "Control → composite ready",
+            performance.control_to_composite_ready,
+        ),
+        ("Control → presented frame", performance.control_to_present),
+        ("Graph compilation", performance.graph_compile),
+        ("Graph evaluation", performance.graph_evaluation),
+        ("CPU viewport", performance.viewport_cpu),
+        (
+            "Vulkan graph encode + submission",
+            performance.compositor_vulkan_submit,
+        ),
+    ]
+}
+
+fn format_telemetry_report(performance: &EditorPerformanceTelemetry) -> String {
+    let mut report = String::from("Stage\tLatest\tEMA\tMaximum\tSamples\n");
+    for (name, metric) in telemetry_metrics(performance) {
+        report.push_str(&format!(
+            "{name}\t{:.3} ms\t{:.3} ms\t{:.3} ms\t{}\n",
+            metric.latest_ms, metric.average_ms, metric.maximum_ms, metric.samples
+        ));
+    }
+    report
 }
 
 #[derive(Clone, Copy)]
@@ -16573,6 +16608,19 @@ mod tests {
         assert_eq!(metric.latest_ms, 4.0);
         assert_eq!(metric.maximum_ms, 4.0);
         assert!((metric.average_ms - 2.2).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn copied_telemetry_report_contains_latency_columns_and_all_stages() {
+        let mut performance = EditorPerformanceTelemetry::default();
+        performance
+            .control_to_present
+            .record(Duration::from_millis(17));
+        let report = format_telemetry_report(&performance);
+        assert!(report.starts_with("Stage\tLatest\tEMA\tMaximum\tSamples\n"));
+        assert!(report.contains("Control → presented frame\t17.000 ms"));
+        assert!(report.contains("Vulkan graph encode + submission"));
+        assert_eq!(report.lines().count(), 13);
     }
 
     #[test]
