@@ -262,6 +262,12 @@ pub enum Component {
     Light {
         intensity: f32,
         color: [f32; 3],
+        /// Radius of the spherical emitter in world units. Zero is a point light.
+        #[serde(default)]
+        radius: f32,
+        /// Per-face shadow-map resolution. Zero disables this light's shadows.
+        #[serde(default = "default_light_shadow_resolution")]
+        shadow_resolution: u32,
     },
     Collider {
         shape: String,
@@ -360,6 +366,10 @@ fn default_collider_friction() -> Vec3 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_light_shadow_resolution() -> u32 {
+    256
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

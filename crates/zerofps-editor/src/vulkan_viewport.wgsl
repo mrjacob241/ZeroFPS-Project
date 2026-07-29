@@ -9,9 +9,17 @@ struct Camera {
     _padding: u32,
     global_light_enabled: u32,
     point_light_count: u32,
-    _lighting_padding: vec2<u32>,
+    directional_shadow_enabled: u32,
+    _lighting_padding: u32,
     point_positions: array<vec4<f32>, 8>,
     point_colors: array<vec4<f32>, 8>,
+    point_shadow_regions: array<vec4<f32>, 8>,
+    shadow_origin: vec4<f32>,
+    shadow_right: vec4<f32>,
+    shadow_up: vec4<f32>,
+    shadow_forward: vec4<f32>,
+    shadow_parameters: vec4<f32>,
+    point_shadow_atlas_size: vec4<f32>,
 };
 
 struct VertexInput {
@@ -33,9 +41,12 @@ struct VertexOutput {
     @location(3) base_color: vec4<f32>,
     @location(4) @interpolate(flat) material: vec3<f32>,
     @location(5) world_position: vec3<f32>,
+    @location(6) @interpolate(flat) object_id: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var directional_shadow_depth: texture_2d<f32>;
+@group(0) @binding(2) var point_shadow_depth: texture_2d<f32>;
 @group(1) @binding(0) var model_texture: texture_2d<f32>;
 @group(1) @binding(1) var model_sampler: sampler;
 
@@ -50,6 +61,167 @@ fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
         value / 12.92,
         value <= vec3<f32>(0.04045)
     );
+}
+
+fn spherical_light_lambert(normal_dot_light: f32, distance: f32, radius: f32) -> f32 {
+    let angular_radius = select(
+        1.0,
+        clamp(max(radius, 0.0) / distance, 0.0, 1.0),
+        distance > 0.000001
+    );
+    let rounded = 0.5 * (
+        normal_dot_light
+        + sqrt(normal_dot_light * normal_dot_light + angular_radius * angular_radius)
+    );
+    let normalization = 2.0 / (1.0 + sqrt(1.0 + angular_radius * angular_radius));
+    return clamp(rounded * normalization, 0.0, 1.0);
+}
+
+fn directional_shadow_visibility(surface: vec3<f32>, normal: vec3<f32>) -> f32 {
+    if camera.directional_shadow_enabled == 0u {
+        return 1.0;
+    }
+    let relative = surface - camera.shadow_origin.xyz;
+    let extent = camera.shadow_parameters.x;
+    let uv = vec2<f32>(
+        dot(relative, camera.shadow_right.xyz) / (extent * 2.0) + 0.5,
+        0.5 - dot(relative, camera.shadow_up.xyz) / (extent * 2.0)
+    );
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) {
+        return 1.0;
+    }
+    let resolution = i32(camera.shadow_parameters.z);
+    let center = vec2<i32>(floor(uv * f32(resolution)));
+    let receiver_depth = dot(relative, camera.shadow_forward.xyz);
+    let normal_light = clamp(
+        dot(normal, normalize(vec3<f32>(-0.35, 0.8, 0.45))),
+        0.0,
+        1.0
+    );
+    let receiver_bias =
+        camera.shadow_parameters.y * (1.0 + (1.0 - normal_light) * 5.0);
+    var visible = 0.0;
+    var samples = 0.0;
+    for (var y = -1; y <= 1; y += 1) {
+        for (var x = -1; x <= 1; x += 1) {
+            let texel = center + vec2<i32>(x, y);
+            if any(texel < vec2<i32>(0)) || any(texel >= vec2<i32>(resolution)) {
+                visible += 1.0;
+            } else {
+                let caster_depth = textureLoad(directional_shadow_depth, texel, 0).x;
+                visible += select(
+                    0.0,
+                    1.0,
+                    receiver_depth <= caster_depth + receiver_bias
+                );
+            }
+            samples += 1.0;
+        }
+    }
+    return visible / samples;
+}
+
+fn cube_shadow_coordinate(direction: vec3<f32>) -> vec3<f32> {
+    let absolute = abs(direction);
+    var face = 0.0;
+    var forward = vec3<f32>(1.0, 0.0, 0.0);
+    var right = vec3<f32>(0.0, -1.0, 0.0);
+    var up = vec3<f32>(0.0, 0.0, 1.0);
+    if absolute.x >= absolute.y && absolute.x >= absolute.z {
+        if direction.x < 0.0 {
+            face = 1.0;
+            forward = vec3<f32>(-1.0, 0.0, 0.0);
+            right = vec3<f32>(0.0, 1.0, 0.0);
+        }
+    } else if absolute.y >= absolute.z {
+        if direction.y >= 0.0 {
+            face = 2.0;
+            forward = vec3<f32>(0.0, 1.0, 0.0);
+            right = vec3<f32>(1.0, 0.0, 0.0);
+        } else {
+            face = 3.0;
+            forward = vec3<f32>(0.0, -1.0, 0.0);
+            right = vec3<f32>(-1.0, 0.0, 0.0);
+        }
+    } else if direction.z >= 0.0 {
+        face = 4.0;
+        forward = vec3<f32>(0.0, 0.0, 1.0);
+        right = vec3<f32>(1.0, 0.0, 0.0);
+        up = vec3<f32>(0.0, -1.0, 0.0);
+    } else {
+        face = 5.0;
+        forward = vec3<f32>(0.0, 0.0, -1.0);
+        right = vec3<f32>(1.0, 0.0, 0.0);
+        up = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    let face_depth = dot(direction, forward);
+    return vec3<f32>(
+        face,
+        dot(direction, right) / face_depth * 0.5 + 0.5,
+        0.5 - dot(direction, up) / face_depth * 0.5
+    );
+}
+
+fn point_shadow_visibility(
+    surface: vec3<f32>,
+    normal: vec3<f32>,
+    light_index: u32
+) -> f32 {
+    let region = camera.point_shadow_regions[light_index];
+    let resolution = i32(region.y);
+    if resolution == 0 {
+        return 1.0;
+    }
+    let point = surface - camera.point_positions[light_index].xyz;
+    let distance = max(length(point), 0.00001);
+    let direction = point / distance;
+    let normal_light = clamp(dot(normal, -point / distance), 0.0, 1.0);
+    let receiver_bias =
+        region.z * distance * (1.0 + (1.0 - normal_light) * 5.0);
+    let kernel = i32(clamp(
+        ceil(camera.point_colors[light_index].w / distance * f32(resolution)),
+        1.0,
+        3.0
+    ));
+    let reference = select(
+        vec3<f32>(0.0, 1.0, 0.0),
+        vec3<f32>(0.0, 0.0, 1.0),
+        abs(direction.z) < 0.9
+    );
+    let tangent = normalize(cross(reference, direction));
+    let bitangent = normalize(cross(direction, tangent));
+    let angular_step = 2.0 / f32(resolution);
+    var visible = 0.0;
+    var samples = 0.0;
+    for (var y = -3; y <= 3; y += 1) {
+        for (var x = -3; x <= 3; x += 1) {
+            if abs(x) <= kernel && abs(y) <= kernel {
+                let sample_direction = normalize(
+                    direction
+                        + tangent * f32(x) * angular_step
+                        + bitangent * f32(y) * angular_step
+                );
+                let coordinate = cube_shadow_coordinate(sample_direction);
+                let local = clamp(
+                    vec2<i32>(floor(coordinate.yz * f32(resolution))),
+                    vec2<i32>(0),
+                    vec2<i32>(resolution - 1)
+                );
+                let texel = vec2<i32>(
+                    i32(coordinate.x) * resolution + local.x,
+                    i32(region.x) + local.y
+                );
+                let caster_depth = textureLoad(point_shadow_depth, texel, 0).x;
+                visible += select(
+                    0.0,
+                    1.0,
+                    distance <= caster_depth + receiver_bias
+                );
+                samples += 1.0;
+            }
+        }
+    }
+    return visible / samples;
 }
 
 @vertex
@@ -115,6 +287,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     );
     out.material = vec3<f32>(input.base_ba_material.zw, input.object_scale.w);
     out.world_position = world_position;
+    out.object_id = input.object_translation.w;
     return out;
 }
 
@@ -131,7 +304,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // global directional light. It is intentionally independent of object
     // transform and camera orientation.
     let light_direction = normalize(vec3<f32>(-0.35, 0.8, 0.45));
-    var diffuse = select(0.0, max(dot(normal, light_direction), 0.0), camera.global_light_enabled != 0u);
+    var diffuse = select(
+        0.0,
+        max(dot(normal, light_direction), 0.0)
+            * directional_shadow_visibility(input.world_position, normal),
+        camera.global_light_enabled != 0u
+    );
     for (var index = 0u; index < camera.point_light_count; index += 1u) {
         let point = camera.point_positions[index];
         let offset = point.xyz - input.world_position;
@@ -140,7 +318,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let light_color = camera.point_colors[index].rgb;
             let luminance = (light_color.r + light_color.g + light_color.b) / 3.0;
             let attenuation = point.w * luminance / (1.0 + distance_squared);
-            diffuse += max(dot(normal, normalize(offset)), 0.0) * attenuation;
+            diffuse += spherical_light_lambert(
+                dot(normal, normalize(offset)),
+                sqrt(distance_squared),
+                camera.point_colors[index].w
+            ) * attenuation * point_shadow_visibility(input.world_position, normal, index);
         }
     }
     diffuse = clamp(diffuse, 0.0, 2.0);

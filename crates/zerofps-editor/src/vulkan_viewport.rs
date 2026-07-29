@@ -10,7 +10,7 @@ use zerofps_core::Vec3;
 
 use crate::vulkan_runtime::GpuImage;
 use crate::vulkan_runtime::shared_runtime;
-use crate::{MAX_VIEWPORT_LIGHTS, ViewportLight};
+use crate::{DirectionalShadowMap, MAX_VIEWPORT_LIGHTS, PointShadowAtlas, ViewportLight};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -45,14 +45,23 @@ struct CameraUniform {
     padding: u32,
     global_light_enabled: u32,
     point_light_count: u32,
-    lighting_padding: [u32; 2],
+    directional_shadow_enabled: u32,
+    lighting_padding: u32,
     point_positions: [[f32; 4]; MAX_VIEWPORT_LIGHTS],
     point_colors: [[f32; 4]; MAX_VIEWPORT_LIGHTS],
+    point_shadow_regions: [[f32; 4]; MAX_VIEWPORT_LIGHTS],
+    shadow_origin: [f32; 4],
+    shadow_right: [f32; 4],
+    shadow_up: [f32; 4],
+    shadow_forward: [f32; 4],
+    shadow_parameters: [f32; 4],
+    point_shadow_atlas_size: [f32; 4],
 }
 
 pub struct VulkanViewport {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    camera_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
@@ -60,7 +69,9 @@ pub struct VulkanViewport {
     white: Arc<wgpu::TextureView>,
     targets: Option<CachedTargets>,
     camera_buffer: wgpu::Buffer,
-    camera_group: wgpu::BindGroup,
+    shadow_cache: Option<(usize, wgpu::Texture, Arc<wgpu::TextureView>)>,
+    point_shadow_cache: Option<(usize, wgpu::Texture, Arc<wgpu::TextureView>)>,
+    camera_group_cache: Option<(usize, usize, Arc<wgpu::BindGroup>)>,
     vertex_cache: HashMap<u64, (usize, Arc<wgpu::Buffer>)>,
     bind_group_cache: HashMap<usize, Arc<wgpu::BindGroup>>,
 }
@@ -79,16 +90,38 @@ impl VulkanViewport {
         let queue = Arc::clone(&runtime.queue);
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("viewport camera layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("viewport texture layout"),
@@ -183,17 +216,10 @@ impl VulkanViewport {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("viewport camera group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
         Ok(Self {
             device,
             queue,
+            camera_layout,
             texture_layout,
             pipeline,
             sampler,
@@ -201,7 +227,9 @@ impl VulkanViewport {
             white,
             targets: None,
             camera_buffer,
-            camera_group,
+            shadow_cache: None,
+            point_shadow_cache: None,
+            camera_group_cache: None,
             vertex_cache: HashMap::new(),
             bind_group_cache: HashMap::new(),
         })
@@ -214,12 +242,15 @@ impl VulkanViewport {
         batches: &[GpuBatch],
         global_light_enabled: bool,
         point_lights: &[ViewportLight],
+        directional_shadow: Option<&DirectionalShadowMap>,
+        point_shadows: Option<&PointShadowAtlas>,
     ) -> Result<Arc<GpuImage>, String> {
         let width = size.x.round().max(1.0) as u32;
         let height = size.y.round().max(1.0) as u32;
         self.ensure_targets(width, height);
         let mut point_positions = [[0.0; 4]; MAX_VIEWPORT_LIGHTS];
         let mut point_colors = [[0.0; 4]; MAX_VIEWPORT_LIGHTS];
+        let mut point_shadow_regions = [[0.0; 4]; MAX_VIEWPORT_LIGHTS];
         for (index, light) in point_lights.iter().take(MAX_VIEWPORT_LIGHTS).enumerate() {
             point_positions[index] = [
                 light.position.x,
@@ -231,9 +262,37 @@ impl VulkanViewport {
                 light.color[0].max(0.0),
                 light.color[1].max(0.0),
                 light.color[2].max(0.0),
-                0.0,
+                light.radius.max(0.0),
             ];
         }
+        let shadow_origin = directional_shadow.map_or([0.0; 4], |shadow| {
+            [shadow.origin.x, shadow.origin.y, shadow.origin.z, 0.0]
+        });
+        let shadow_right = directional_shadow.map_or([0.0; 4], |shadow| {
+            [shadow.right.x, shadow.right.y, shadow.right.z, 0.0]
+        });
+        let shadow_up = directional_shadow.map_or([0.0; 4], |shadow| {
+            [shadow.up.x, shadow.up.y, shadow.up.z, 0.0]
+        });
+        let shadow_forward = directional_shadow.map_or([0.0; 4], |shadow| {
+            [shadow.forward.x, shadow.forward.y, shadow.forward.z, 0.0]
+        });
+        let shadow_parameters = directional_shadow.map_or([0.0; 4], |shadow| {
+            [shadow.extent, shadow.bias, shadow.resolution as f32, 0.0]
+        });
+        if let Some(atlas) = point_shadows {
+            for (target, region) in point_shadow_regions.iter_mut().zip(atlas.regions) {
+                *target = [
+                    region.row as f32,
+                    region.resolution as f32,
+                    region.bias,
+                    0.0,
+                ];
+            }
+        }
+        let point_shadow_atlas_size = point_shadows.map_or([1.0, 1.0, 0.0, 0.0], |atlas| {
+            [atlas.width as f32, atlas.height as f32, 0.0, 0.0]
+        });
         let uniform = CameraUniform {
             yaw: camera.0,
             pitch: camera.1,
@@ -245,9 +304,17 @@ impl VulkanViewport {
             padding: 0,
             global_light_enabled: u32::from(global_light_enabled),
             point_light_count: point_lights.len().min(MAX_VIEWPORT_LIGHTS) as u32,
-            lighting_padding: [0; 2],
+            directional_shadow_enabled: u32::from(directional_shadow.is_some()),
+            lighting_padding: 0,
             point_positions,
             point_colors,
+            point_shadow_regions,
+            shadow_origin,
+            shadow_right,
+            shadow_up,
+            shadow_forward,
+            shadow_parameters,
+            point_shadow_atlas_size,
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -265,6 +332,39 @@ impl VulkanViewport {
                 .expect("viewport targets initialized")
                 .depth_view,
         );
+        let shadow_view = self.shadow_view(directional_shadow);
+        let point_shadow_view = self.point_shadow_view(point_shadows);
+        let shadow_key = Arc::as_ptr(&shadow_view) as usize;
+        let point_shadow_key = Arc::as_ptr(&point_shadow_view) as usize;
+        let camera_group = match self.camera_group_cache.as_ref() {
+            Some((cached_shadow, cached_point, group))
+                if *cached_shadow == shadow_key && *cached_point == point_shadow_key =>
+            {
+                Arc::clone(group)
+            }
+            _ => {
+                let group = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("viewport camera and shadow group"),
+                    layout: &self.camera_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.camera_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&shadow_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&point_shadow_view),
+                        },
+                    ],
+                }));
+                self.camera_group_cache = Some((shadow_key, point_shadow_key, Arc::clone(&group)));
+                group
+            }
+        };
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut live_bind_groups = HashSet::new();
         let mut live_vertex_buffers = HashSet::new();
@@ -291,7 +391,7 @@ impl VulkanViewport {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.camera_group, &[]);
+            pass.set_bind_group(0, camera_group.as_ref(), &[]);
             for batch in batches {
                 if batch.vertices.is_empty() {
                     continue;
@@ -422,6 +522,82 @@ impl VulkanViewport {
         });
         Arc::clone(&self.texture_cache[&key].1)
     }
+
+    fn shadow_view(&mut self, shadow: Option<&DirectionalShadowMap>) -> Arc<wgpu::TextureView> {
+        let key = shadow.map_or(0, |shadow| shadow.depth.as_ptr() as usize);
+        if self
+            .shadow_cache
+            .as_ref()
+            .is_some_and(|(cached_key, _, _)| *cached_key == key)
+        {
+            return Arc::clone(&self.shadow_cache.as_ref().unwrap().2);
+        }
+        let (resolution, depth) = shadow.map_or((1, &[f32::INFINITY][..]), |shadow| {
+            (shadow.resolution as u32, shadow.depth.as_slice())
+        });
+        let texture = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("directional shadow depth"),
+                size: wgpu::Extent3d {
+                    width: resolution,
+                    height: resolution,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(depth),
+        );
+        let view = Arc::new(texture.create_view(&Default::default()));
+        self.shadow_cache = Some((key, texture, Arc::clone(&view)));
+        view
+    }
+
+    fn point_shadow_view(&mut self, atlas: Option<&PointShadowAtlas>) -> Arc<wgpu::TextureView> {
+        let key = atlas.map_or(0, |atlas| atlas.depth.as_ptr() as usize);
+        if self
+            .point_shadow_cache
+            .as_ref()
+            .is_some_and(|(cached_key, _, _)| *cached_key == key)
+        {
+            return Arc::clone(&self.point_shadow_cache.as_ref().unwrap().2);
+        }
+        let (width, height, depth) = atlas.map_or((1, 1, &[f32::INFINITY][..]), |atlas| {
+            (
+                atlas.width as u32,
+                atlas.height as u32,
+                atlas.depth.as_slice(),
+            )
+        });
+        let texture = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("point light shadow atlas"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(depth),
+        );
+        let view = Arc::new(texture.create_view(&Default::default()));
+        self.point_shadow_cache = Some((key, texture, Arc::clone(&view)));
+        view
+    }
 }
 
 fn upload_texture(
@@ -489,6 +665,8 @@ mod tests {
                 &batches,
                 true,
                 &[],
+                None,
+                None,
             )
             .unwrap();
         let pixels = color.readback_rgba8().unwrap();

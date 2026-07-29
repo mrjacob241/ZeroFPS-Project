@@ -198,6 +198,8 @@ impl EditorScene {
             ObjectKind::Light => Some(Component::Light {
                 intensity: 1.0,
                 color: [1.0; 3],
+                radius: 0.0,
+                shadow_resolution: 256,
             }),
             ObjectKind::Camera => Some(Component::Camera {
                 field_of_view_degrees: 60.0,
@@ -394,6 +396,10 @@ fn material_use_imported_optics_key() -> AttributeKey {
     AttributeKey::MaterialUseImportedOptics
 }
 
+fn material_tint_key() -> AttributeKey {
+    AttributeKey::Tint
+}
+
 fn mesh_autofix_key() -> AttributeKey {
     AttributeKey::Custom("mesh.autofix".into())
 }
@@ -575,6 +581,46 @@ enum NodeSettings {
 }
 
 impl NodeSettings {
+    fn object_index(&self) -> Option<usize> {
+        match self {
+            Self::ObjectTexture { object_index, .. }
+            | Self::Output { object_index, .. }
+            | Self::ObjectHandle { object_index, .. }
+            | Self::PaintedMask { object_index }
+            | Self::MassDensity { object_index, .. }
+            | Self::SpringMesh { object_index, .. }
+            | Self::ForceField { object_index, .. }
+            | Self::VelocityField { object_index, .. }
+            | Self::Simulator { object_index, .. }
+            | Self::ObjectSimulator { object_index, .. }
+            | Self::ForceOutput { object_index, .. }
+            | Self::Engine { object_index, .. }
+            | Self::ObjectTransform { object_index }
+            | Self::ObjectMesh { object_index } => Some(*object_index),
+            _ => None,
+        }
+    }
+
+    fn set_object_index(&mut self, value: usize) {
+        match self {
+            Self::ObjectTexture { object_index, .. }
+            | Self::Output { object_index, .. }
+            | Self::ObjectHandle { object_index, .. }
+            | Self::PaintedMask { object_index }
+            | Self::MassDensity { object_index, .. }
+            | Self::SpringMesh { object_index, .. }
+            | Self::ForceField { object_index, .. }
+            | Self::VelocityField { object_index, .. }
+            | Self::Simulator { object_index, .. }
+            | Self::ObjectSimulator { object_index, .. }
+            | Self::ForceOutput { object_index, .. }
+            | Self::Engine { object_index, .. }
+            | Self::ObjectTransform { object_index }
+            | Self::ObjectMesh { object_index } => *object_index = value,
+            _ => {}
+        }
+    }
+
     fn kind(&self) -> usize {
         match self {
             Self::ObjectTexture { .. } => 0,
@@ -746,6 +792,8 @@ struct JointSimulationState {
 struct CompositorNode {
     id: usize,
     object_index: usize,
+    object_name: String,
+    settings_object_name: Option<String>,
     settings: NodeSettings,
     position: Vec2,
 }
@@ -780,6 +828,7 @@ struct PreviewTriangle {
     smooth_normals: bool,
     transmission: f32,
     ior: f32,
+    casts_shadows: bool,
 }
 
 const MAX_VIEWPORT_LIGHTS: usize = 8;
@@ -789,12 +838,50 @@ struct ViewportLight {
     position: CoreVec3,
     color: [f32; 3],
     intensity: f32,
+    radius: f32,
+    shadow_resolution: u32,
 }
 
 #[derive(Clone, Debug)]
 struct ViewportLighting {
     global_enabled: bool,
+    global_shadow_resolution: u32,
     points: Vec<ViewportLight>,
+    directional_shadow: Option<Arc<DirectionalShadowMap>>,
+    point_shadows: Option<Arc<PointShadowAtlas>>,
+}
+
+#[derive(Clone, Debug)]
+struct DirectionalShadowMap {
+    resolution: usize,
+    depth: Vec<f32>,
+    origin: CoreVec3,
+    right: CoreVec3,
+    up: CoreVec3,
+    forward: CoreVec3,
+    extent: f32,
+    bias: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PointShadowRegion {
+    row: usize,
+    resolution: usize,
+    bias: f32,
+}
+
+#[derive(Clone, Debug)]
+struct PointShadowAtlas {
+    width: usize,
+    height: usize,
+    depth: Vec<f32>,
+    regions: [PointShadowRegion; MAX_VIEWPORT_LIGHTS],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectionalShadowCacheKey {
+    scene_revision: u64,
+    resolution: u32,
 }
 
 #[derive(Clone)]
@@ -837,6 +924,7 @@ struct RenderResult {
     tool: Tool,
     render_time: Duration,
     prepare_time: Duration,
+    shadow_prepare_time: Duration,
     device: RenderDevice,
     queue_wait: Duration,
 }
@@ -876,6 +964,7 @@ struct EditorPerformanceTelemetry {
     control_to_present: TimingMetric,
     graph_compile: TimingMetric,
     graph_evaluation: TimingMetric,
+    shadow_prepare: TimingMetric,
 }
 
 struct DisplayWorker {
@@ -1008,6 +1097,13 @@ impl DisplayWorker {
                 let mut workspace = RasterWorkspace::default();
                 let mut vulkan: Option<vulkan_viewport::VulkanViewport> = None;
                 let mut vulkan_unavailable = false;
+                let mut directional_shadow_cache: Option<(
+                    DirectionalShadowCacheKey,
+                    Arc<DirectionalShadowMap>,
+                )> = None;
+                let mut point_shadow_cache: Option<(u64, Arc<PointShadowAtlas>)> = None;
+                let mut vulkan_batch_cache: Option<(u64, Arc<Vec<vulkan_viewport::GpuBatch>>)> =
+                    None;
                 loop {
                     let job = {
                         let (lock, ready) = &*worker_pending;
@@ -1018,6 +1114,53 @@ impl DisplayWorker {
                         guard.take().expect("display job became available")
                     };
                     let queue_wait = job.queued_at.elapsed();
+                    let mut job = job;
+                    let shadow_prepare_started = Instant::now();
+                    if job.lighting.global_enabled && job.lighting.global_shadow_resolution > 0 {
+                        let key = DirectionalShadowCacheKey {
+                            scene_revision: job.key.scene_revision,
+                            resolution: job.lighting.global_shadow_resolution,
+                        };
+                        let shadow = match directional_shadow_cache.as_ref() {
+                            Some((cached_key, shadow)) if *cached_key == key => Arc::clone(shadow),
+                            _ => {
+                                let shadow = Arc::new(build_directional_shadow_map(
+                                    &job.triangles,
+                                    key.resolution as usize,
+                                ));
+                                directional_shadow_cache = Some((key, Arc::clone(&shadow)));
+                                shadow
+                            }
+                        };
+                        job.lighting.directional_shadow = Some(shadow);
+                    } else {
+                        job.lighting.directional_shadow = None;
+                    }
+                    let point_shadow_key = job.key.scene_revision;
+                    if job
+                        .lighting
+                        .points
+                        .iter()
+                        .any(|light| light.shadow_resolution > 0)
+                    {
+                        let atlas = match point_shadow_cache.as_ref() {
+                            Some((cached_key, atlas)) if *cached_key == point_shadow_key => {
+                                Arc::clone(atlas)
+                            }
+                            _ => {
+                                let atlas = Arc::new(build_point_shadow_atlas(
+                                    &job.triangles,
+                                    &job.lighting.points,
+                                ));
+                                point_shadow_cache = Some((point_shadow_key, Arc::clone(&atlas)));
+                                atlas
+                            }
+                        };
+                        job.lighting.point_shadows = Some(atlas);
+                    } else {
+                        job.lighting.point_shadows = None;
+                    }
+                    let shadow_prepare_time = shadow_prepare_started.elapsed();
                     let render_started = Instant::now();
                     let mut prepare_time = Duration::ZERO;
                     let frame = if job.mode == ViewportMode::Wireframe {
@@ -1047,10 +1190,24 @@ impl DisplayWorker {
                             // Key the persistent vertex buffer by both revisions;
                             // otherwise rotating the object (scene revision) is
                             // the first action that repairs stale lighting.
-                            let batches = build_vulkan_batches(
-                                &job.triangles,
-                                job.key.scene_revision ^ job.key.texture_revision.rotate_left(29),
-                            );
+                            let batch_revision =
+                                job.key.scene_revision ^ job.key.texture_revision.rotate_left(29);
+                            let batches = match vulkan_batch_cache.as_ref() {
+                                Some((cached_revision, batches))
+                                    if *cached_revision == batch_revision =>
+                                {
+                                    Arc::clone(batches)
+                                }
+                                _ => {
+                                    let batches = Arc::new(build_vulkan_batches(
+                                        &job.triangles,
+                                        batch_revision,
+                                    ));
+                                    vulkan_batch_cache =
+                                        Some((batch_revision, Arc::clone(&batches)));
+                                    batches
+                                }
+                            };
                             prepare_time = prepare_started.elapsed();
                             let projection = match job.camera.5 {
                                 ProjectionMode::Perspective => 0,
@@ -1070,6 +1227,8 @@ impl DisplayWorker {
                                     &batches,
                                     job.lighting.global_enabled,
                                     &job.lighting.points,
+                                    job.lighting.directional_shadow.as_deref(),
+                                    job.lighting.point_shadows.as_deref(),
                                 )
                                 .ok()
                         });
@@ -1110,6 +1269,7 @@ impl DisplayWorker {
                             tool: job.tool,
                             render_time: render_started.elapsed(),
                             prepare_time,
+                            shadow_prepare_time,
                             device: job.device,
                             queue_wait,
                         })
@@ -1215,7 +1375,7 @@ fn build_vulkan_batches(
                     transform.translation.x,
                     transform.translation.y,
                     transform.translation.z,
-                    0.0,
+                    triangle.object_id.slot as f32 + 1.0,
                 ],
                 object_rotation: [
                     transform.rotation.x,
@@ -1337,6 +1497,7 @@ struct EditorApp {
     texture_paint_heatmap: bool,
     advanced: bool,
     global_light_enabled: bool,
+    global_shadow_resolution: u32,
     show_grid: bool,
     grid_spacing: f32,
     snap: bool,
@@ -1468,6 +1629,7 @@ impl EditorApp {
             texture_paint_heatmap: true,
             advanced: false,
             global_light_enabled: true,
+            global_shadow_resolution: 512,
             show_grid: true,
             grid_spacing: 1.0,
             snap: false,
@@ -1745,6 +1907,14 @@ impl EditorApp {
 
         let previous = self.scene.tree.clone();
         let id = self.scene.add(primitive.label(), ObjectKind::Empty, None);
+        let primitive_scale = self.grid_spacing.max(f32::EPSILON);
+        let _ = self.scene.tree.set_local_transform(
+            id,
+            Transform {
+                scale: CoreVec3::new(primitive_scale, primitive_scale, primitive_scale),
+                ..Transform::IDENTITY
+            },
+        );
         self.scene
             .tree
             .add_component(
@@ -1929,6 +2099,26 @@ impl EditorApp {
                     _ => None,
                 })
                 .unwrap_or(true);
+            let casts_shadows = self
+                .scene
+                .tree
+                .resolve_attribute(id, &AttributeKey::CastShadows)
+                .ok()
+                .and_then(|resolved| match resolved.value {
+                    Attribute::Bool(value) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or(true);
+            let material_tint = self
+                .scene
+                .tree
+                .resolve_attribute(id, &material_tint_key())
+                .ok()
+                .and_then(|resolved| match resolved.value {
+                    Attribute::Color(value) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or([1.0; 4]);
             let compositor_override = self
                 .compositor_texture_overrides
                 .iter()
@@ -1947,6 +2137,9 @@ impl EditorApp {
                 let source_base_color = material
                     .map(|material| material.base_color)
                     .unwrap_or([0.42, 0.64, 0.78, 1.0]);
+                let tinted_base_color = std::array::from_fn(|channel| {
+                    source_base_color[channel] * material_tint[channel]
+                });
                 let field_preview = self.active_tool == Tool::FieldPaint && field.is_some();
                 let texture_paint_preview =
                     self.active_tool == Tool::TexturePaint && self.painted_masks.contains_key(&id);
@@ -1954,7 +2147,7 @@ impl EditorApp {
                     if compositor_override.is_some() || field_preview || texture_paint_preview {
                         [1.0; 4]
                     } else {
-                        source_base_color
+                        tinted_base_color
                     };
                 let source_texture = {
                     material
@@ -2048,7 +2241,7 @@ impl EditorApp {
                         object_transform: transform,
                         vertices,
                         base_color,
-                        source_base_color,
+                        source_base_color: tinted_base_color,
                         texture: texture.clone(),
                         gpu_texture: gpu_texture.clone(),
                         source_texture: source_texture.clone(),
@@ -2056,6 +2249,7 @@ impl EditorApp {
                         smooth_normals,
                         transmission,
                         ior,
+                        casts_shadows,
                     });
                 }
             }
@@ -2440,6 +2634,10 @@ impl EditorApp {
                 "editor.global_light_enabled",
                 self.global_light_enabled.to_string(),
             ),
+            (
+                "editor.global_shadow_resolution",
+                self.global_shadow_resolution.to_string(),
+            ),
             ("editor.camera_yaw", self.camera_yaw.to_string()),
             ("editor.camera_pitch", self.camera_pitch.to_string()),
             ("editor.camera_zoom", self.camera_zoom.to_string()),
@@ -2608,6 +2806,16 @@ impl EditorApp {
                 format!("compositor.node.{id}.graph_object"),
                 node.object_index.to_string(),
             );
+            project.project.properties.insert(
+                format!("compositor.node.{id}.graph_object_name"),
+                node.object_name.clone(),
+            );
+            if let Some(name) = &node.settings_object_name {
+                project.project.properties.insert(
+                    format!("compositor.node.{id}.settings_object_name"),
+                    name.clone(),
+                );
+            }
             project.project.properties.insert(
                 format!("compositor.node.{id}.y"),
                 node.position.y.to_string(),
@@ -3052,6 +3260,12 @@ impl EditorApp {
             .and_then(|value| value.parse::<bool>().ok())
         {
             self.global_light_enabled = value;
+        }
+        if let Some(value) = properties
+            .get("editor.global_shadow_resolution")
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            self.global_shadow_resolution = sanitize_shadow_resolution(value);
         }
         self.camera_yaw = number("editor.camera_yaw").unwrap_or(self.camera_yaw);
         self.camera_pitch = number("editor.camera_pitch").unwrap_or(self.camera_pitch);
@@ -3517,28 +3731,38 @@ impl EditorApp {
                     },
                     _ => continue,
                 };
+                let legacy_graph_index = properties
+                    .get(&format!("compositor.node.{id}.graph_object"))
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| settings.object_index().unwrap_or(0));
+                let object_name = properties
+                    .get(&format!("compositor.node.{id}.graph_object_name"))
+                    .cloned()
+                    .or_else(|| {
+                        self.scene
+                            .tree
+                            .iter()
+                            .nth(legacy_graph_index)
+                            .map(|(_, object)| object.name.clone())
+                    })
+                    .unwrap_or_default();
+                let settings_object_name = properties
+                    .get(&format!("compositor.node.{id}.settings_object_name"))
+                    .cloned()
+                    .or_else(|| {
+                        settings.object_index().and_then(|index| {
+                            self.scene
+                                .tree
+                                .iter()
+                                .nth(index)
+                                .map(|(_, object)| object.name.clone())
+                        })
+                    });
                 loaded_nodes.push(CompositorNode {
                     id,
-                    object_index: properties
-                        .get(&format!("compositor.node.{id}.graph_object"))
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or_else(|| match &settings {
-                            NodeSettings::ObjectTexture { object_index, .. }
-                            | NodeSettings::Output { object_index, .. }
-                            | NodeSettings::ObjectHandle { object_index, .. }
-                            | NodeSettings::PaintedMask { object_index }
-                            | NodeSettings::MassDensity { object_index, .. }
-                            | NodeSettings::SpringMesh { object_index, .. }
-                            | NodeSettings::ForceField { object_index, .. }
-                            | NodeSettings::VelocityField { object_index, .. }
-                            | NodeSettings::Simulator { object_index, .. }
-                            | NodeSettings::ObjectSimulator { object_index, .. }
-                            | NodeSettings::ForceOutput { object_index, .. }
-                            | NodeSettings::Engine { object_index, .. }
-                            | NodeSettings::ObjectTransform { object_index }
-                            | NodeSettings::ObjectMesh { object_index } => *object_index,
-                            _ => 0,
-                        }),
+                    object_index: legacy_graph_index,
+                    object_name,
+                    settings_object_name,
                     settings,
                     position: Vec2::new(x, y),
                 });
@@ -3607,6 +3831,13 @@ impl EditorApp {
                     }
                     if let Some(node) = self.compositor_nodes.iter_mut().find(|n| n.id == node_id) {
                         node.object_index = object_index;
+                        node.object_name = self
+                            .scene
+                            .tree
+                            .iter()
+                            .nth(object_index)
+                            .map(|(_, object)| object.name.clone())
+                            .unwrap_or_default();
                     }
                     pending.extend(
                         self.compositor_links
@@ -3647,7 +3878,6 @@ impl EditorApp {
                 else {
                     return;
                 };
-                *object_index = (*object_index).min(objects.len().saturating_sub(1));
                 ui.label("Object");
                 egui::ComboBox::from_id_salt(("compositor_object", node_id))
                     .selected_text(
@@ -3900,7 +4130,6 @@ impl EditorApp {
                 else {
                     return;
                 };
-                *object_index = (*object_index).min(objects.len().saturating_sub(1));
                 ui.label("Target object");
                 ui.strong(
                     objects
@@ -4108,7 +4337,6 @@ impl EditorApp {
                 else {
                     return;
                 };
-                *object_index = (*object_index).min(objects.len().saturating_sub(1));
                 ui.label("Scene object");
                 egui::ComboBox::from_id_salt(("compositor_handle_object", node_id))
                     .selected_text(
@@ -4662,6 +4890,20 @@ impl EditorApp {
             self.start_compositor_image_import(ui.ctx());
         }
         if changed {
+            if let Some(node) = self
+                .compositor_nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                && let Some(index) = node.settings.object_index()
+                && let Some(name) = self
+                    .scene
+                    .tree
+                    .iter()
+                    .nth(index)
+                    .map(|(_, object)| object.name.clone())
+            {
+                node.settings_object_name = Some(name);
+            }
             if kind == 27 {
                 self.object_simulation_states.remove(&node_id);
             }
@@ -4899,6 +5141,34 @@ impl EditorApp {
                         ui.separator();
                         ui.strong("Viewport");
                         ui.checkbox(&mut self.show_grid, "Show grid");
+                        egui::ComboBox::from_id_salt("global_shadow_resolution")
+                            .selected_text(if self.global_shadow_resolution == 0 {
+                                "Global shadows: Off".into()
+                            } else {
+                                format!("Global shadows: {} px", self.global_shadow_resolution)
+                            })
+                            .show_ui(ui, |ui| {
+                                for (resolution, label) in [
+                                    (0, "Off"),
+                                    (128, "128 px"),
+                                    (256, "256 px"),
+                                    (512, "512 px"),
+                                    (1024, "1024 px"),
+                                    (2048, "2048 px"),
+                                ] {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.global_shadow_resolution,
+                                            resolution,
+                                            label,
+                                        )
+                                        .changed()
+                                    {
+                                        self.scene_revision = self.scene_revision.wrapping_add(1);
+                                        self.project_dirty = true;
+                                    }
+                                }
+                            });
                         egui::ComboBox::from_id_salt("settings_grid_spacing")
                             .selected_text(format_grid_spacing(self.grid_spacing))
                             .show_ui(ui, |ui| {
@@ -5185,6 +5455,7 @@ impl EditorApp {
                                 return;
                             };
                             let mut name = node.name.clone();
+                            let previous_name = name.clone();
                             let mut transform = node.local_transform();
                             let previous = self.scene.tree.clone();
                             let mut changed = false;
@@ -5203,8 +5474,13 @@ impl EditorApp {
                                 .cloned();
                             let mut light_component =
                                 node.components.iter().find_map(|component| match component {
-                                    Component::Light { intensity, color } => {
-                                        Some((*intensity, *color))
+                                    Component::Light {
+                                        intensity,
+                                        color,
+                                        radius,
+                                        shadow_resolution,
+                                    } => {
+                                        Some((*intensity, *color, *radius, *shadow_resolution))
                                     }
                                     _ => None,
                                 });
@@ -5224,6 +5500,7 @@ impl EditorApp {
                                 );
                             });
                             if self.scene.tree.node(id).is_ok_and(|node| node.name != name) {
+                                self.rename_compositor_object_reference(&previous_name, &name);
                                 self.scene.tree.node_mut(id).expect("selected node").name = name;
                                 changed = true;
                             }
@@ -5286,7 +5563,13 @@ impl EditorApp {
                                 let _ = self.scene.tree.set_local_transform(id, transform);
                                 changed = true;
                             }
-                            if let Some((ref mut intensity, ref mut color)) = light_component {
+                            if let Some((
+                                ref mut intensity,
+                                ref mut color,
+                                ref mut radius,
+                                ref mut shadow_resolution,
+                            )) = light_component
+                            {
                                 let mut light_changed = false;
                                 let mut intensity_exponent = intensity_to_exponent(*intensity);
                                 egui::CollapsingHeader::new(RichText::new("Light").strong())
@@ -5309,11 +5592,60 @@ impl EditorApp {
                                             light_changed = true;
                                         }
                                         ui.small(format!("Power: {:.4e} = 10^I", *intensity));
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(radius)
+                                                    .speed(
+                                                        (self.grid_spacing * 0.01)
+                                                            .max(f32::EPSILON),
+                                                    )
+                                                    .range(0.0..=f32::MAX)
+                                                    .prefix("Radius "),
+                                            )
+                                            .on_hover_text(
+                                                "Radius of the spherical emitter in world units. \
+                                                 Larger values soften the diffuse light terminator.",
+                                            )
+                                            .changed()
+                                        {
+                                            light_changed = true;
+                                        }
                                         ui.horizontal(|ui| {
                                             ui.label("Color");
                                             light_changed |=
                                                 ui.color_edit_button_rgb(color).changed();
                                         });
+                                        egui::ComboBox::from_id_salt((
+                                            "light_shadow_resolution",
+                                            id.slot,
+                                            id.generation,
+                                        ))
+                                        .selected_text(if *shadow_resolution == 0 {
+                                            "Shadows: Off".into()
+                                        } else {
+                                            format!("Shadows: {} px", *shadow_resolution)
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for (resolution, label) in [
+                                                (0, "Off"),
+                                                (128, "128 px"),
+                                                (256, "256 px"),
+                                                (512, "512 px"),
+                                                (1024, "1024 px"),
+                                                (2048, "2048 px"),
+                                            ] {
+                                                light_changed |= ui
+                                                    .selectable_value(
+                                                        shadow_resolution,
+                                                        resolution,
+                                                        label,
+                                                    )
+                                                    .changed();
+                                            }
+                                        });
+                                        ui.small(
+                                            "Shadow resolution is per cube face for point lights.",
+                                        );
                                         ui.small("Position is controlled by the object transform.");
                                     });
                                 if light_changed {
@@ -5321,6 +5653,8 @@ impl EditorApp {
                                         && let Some(Component::Light {
                                             intensity: stored_intensity,
                                             color: stored_color,
+                                            radius: stored_radius,
+                                            shadow_resolution: stored_shadow_resolution,
                                         }) = node
                                             .components
                                             .iter_mut()
@@ -5330,6 +5664,8 @@ impl EditorApp {
                                     {
                                         *stored_intensity = intensity.max(0.0);
                                         *stored_color = *color;
+                                        *stored_radius = radius.max(0.0);
+                                        *stored_shadow_resolution = *shadow_resolution;
                                     }
                                     changed = true;
                                 }
@@ -5343,6 +5679,34 @@ impl EditorApp {
                                         model_asset.as_deref().unwrap_or("No mesh assigned"),
                                     );
                                     if model_asset.is_some() {
+                                        let mut casts_shadows = self
+                                            .scene
+                                            .tree
+                                            .resolve_attribute(id, &AttributeKey::CastShadows)
+                                            .ok()
+                                            .and_then(|attribute| match attribute.value {
+                                                Attribute::Bool(value) => Some(value),
+                                                _ => None,
+                                            })
+                                            .unwrap_or(true);
+                                        if ui
+                                            .checkbox(&mut casts_shadows, "Cast shadows")
+                                            .on_hover_text(
+                                                "Include this visible mesh in direct-light \
+                                                 occlusion. This inherited attribute is \
+                                                 script-writable.",
+                                            )
+                                            .changed()
+                                        {
+                                            let _ = self.scene.tree.set_attribute(
+                                                id,
+                                                AttributeKey::CastShadows,
+                                                AttributeDeclaration::Value(Attribute::Bool(
+                                                    casts_shadows,
+                                                )),
+                                            );
+                                            changed = true;
+                                        }
                                         let mut mesh_autofix = self
                                             .scene
                                             .tree
@@ -6071,6 +6435,41 @@ impl EditorApp {
                                         changed = true;
                                     }
                                     } else {
+                                        let mut material_tint = self
+                                            .scene
+                                            .tree
+                                            .resolve_attribute(id, &material_tint_key())
+                                            .ok()
+                                            .and_then(|attribute| match attribute.value {
+                                                Attribute::Color(value) => Some(value),
+                                                _ => None,
+                                            })
+                                            .unwrap_or([1.0; 4]);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Base color");
+                                            if ui
+                                                .color_edit_button_rgb(
+                                                    (&mut material_tint[..3])
+                                                        .try_into()
+                                                        .expect("RGB color slice"),
+                                                )
+                                                .on_hover_text(
+                                                    "Multiply the imported or built-in material \
+                                                     color. This object attribute is inherited by \
+                                                     children and can be changed by scripts.",
+                                                )
+                                                .changed()
+                                            {
+                                                let _ = self.scene.tree.set_attribute(
+                                                    id,
+                                                    material_tint_key(),
+                                                    AttributeDeclaration::Value(
+                                                        Attribute::Color(material_tint),
+                                                    ),
+                                                );
+                                                changed = true;
+                                            }
+                                        });
                                         let mut use_imported_optics = self
                                             .scene
                                             .tree
@@ -6462,9 +6861,19 @@ impl EditorApp {
         }
         let id = self.compositor_next_id;
         self.compositor_next_id += 1;
+        let object_name = self
+            .scene
+            .tree
+            .iter()
+            .nth(object_index)
+            .map(|(_, object)| object.name.clone())
+            .unwrap_or_default();
+        let settings_object_name = settings.object_index().map(|_| object_name.clone());
         self.compositor_nodes.push(CompositorNode {
             id,
             object_index,
+            object_name,
+            settings_object_name,
             settings,
             position: Vec2::ZERO,
         });
@@ -6494,7 +6903,7 @@ impl EditorApp {
         });
     }
 
-    fn viewport_lighting(&self) -> ViewportLighting {
+    fn viewport_lighting(&self, _triangles: &[PreviewTriangle]) -> ViewportLighting {
         let points = self
             .scene
             .tree
@@ -6504,10 +6913,17 @@ impl EditorApp {
                 node.components
                     .iter()
                     .find_map(|component| match component {
-                        Component::Light { intensity, color } => Some(ViewportLight {
+                        Component::Light {
+                            intensity,
+                            color,
+                            radius,
+                            shadow_resolution,
+                        } => Some(ViewportLight {
                             position: node.global_transform().translation,
                             color: *color,
                             intensity: intensity.max(0.0),
+                            radius: radius.max(0.0),
+                            shadow_resolution: *shadow_resolution,
                         }),
                         _ => None,
                     })
@@ -6516,11 +6932,15 @@ impl EditorApp {
             .collect();
         ViewportLighting {
             global_enabled: self.global_light_enabled,
+            global_shadow_resolution: self.global_shadow_resolution,
             points,
+            directional_shadow: None,
+            point_shadows: None,
         }
     }
 
     fn sync_compositor_outputs(&mut self) {
+        self.resolve_compositor_object_names();
         let object_count = self.scene.tree.iter().count();
         let engine_objects = self
             .scene
@@ -6587,12 +7007,21 @@ impl EditorApp {
         }
 
         for object_index in 0..object_count {
+            let object_name = self
+                .scene
+                .tree
+                .iter()
+                .nth(object_index)
+                .map(|(_, object)| object.name.clone())
+                .unwrap_or_default();
             if !seen_transform.contains(&object_index) {
                 let id = self.compositor_next_id;
                 self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
                 self.compositor_nodes.push(CompositorNode {
                     id,
                     object_index,
+                    object_name: object_name.clone(),
+                    settings_object_name: Some(object_name.clone()),
                     settings: NodeSettings::ObjectTransform { object_index },
                     position: Vec2::new(80.0, 80.0),
                 });
@@ -6603,6 +7032,8 @@ impl EditorApp {
                 self.compositor_nodes.push(CompositorNode {
                     id,
                     object_index,
+                    object_name: object_name.clone(),
+                    settings_object_name: Some(object_name.clone()),
                     settings: NodeSettings::ObjectMesh { object_index },
                     position: Vec2::new(420.0, 80.0),
                 });
@@ -6613,6 +7044,8 @@ impl EditorApp {
                 self.compositor_nodes.push(CompositorNode {
                     id,
                     object_index,
+                    object_name: object_name.clone(),
+                    settings_object_name: Some(object_name.clone()),
                     settings: NodeSettings::ForceOutput {
                         object_index,
                         force: [0.0; 3],
@@ -6626,6 +7059,8 @@ impl EditorApp {
                 self.compositor_nodes.push(CompositorNode {
                     id,
                     object_index,
+                    object_name: object_name.clone(),
+                    settings_object_name: Some(object_name.clone()),
                     settings: NodeSettings::Engine {
                         object_index,
                         throttle: 0.0,
@@ -6646,6 +7081,41 @@ impl EditorApp {
                 .first()
                 .map(|node| node.id)
                 .unwrap_or(0);
+        }
+    }
+
+    fn resolve_compositor_object_names(&mut self) {
+        let names = self
+            .scene
+            .tree
+            .iter()
+            .map(|(_, object)| object.name.clone())
+            .collect::<Vec<_>>();
+        for node in &mut self.compositor_nodes {
+            if node.object_name.is_empty() {
+                node.object_name = names.get(node.object_index).cloned().unwrap_or_default();
+            }
+            node.object_index =
+                object_index_by_name(&names, &node.object_name).unwrap_or(usize::MAX);
+
+            if let Some(index) = node.settings.object_index() {
+                let name = node
+                    .settings_object_name
+                    .get_or_insert_with(|| names.get(index).cloned().unwrap_or_default());
+                let resolved = object_index_by_name(&names, name).unwrap_or(usize::MAX);
+                node.settings.set_object_index(resolved);
+            }
+        }
+    }
+
+    fn rename_compositor_object_reference(&mut self, previous: &str, renamed: &str) {
+        for node in &mut self.compositor_nodes {
+            if node.object_name == previous {
+                node.object_name = renamed.to_owned();
+            }
+            if node.settings_object_name.as_deref() == Some(previous) {
+                node.settings_object_name = Some(renamed.to_owned());
+            }
         }
     }
 
@@ -8805,6 +9275,18 @@ impl EditorApp {
         self.compositor_nodes.push(CompositorNode {
             id: node_id,
             object_index,
+            object_name: self
+                .scene
+                .tree
+                .node(id)
+                .map(|object| object.name.clone())
+                .unwrap_or_default(),
+            settings_object_name: self
+                .scene
+                .tree
+                .node(id)
+                .map(|object| object.name.clone())
+                .ok(),
             settings: NodeSettings::PaintedMask { object_index },
             position: Vec2::new(80.0, 330.0),
         });
@@ -10015,7 +10497,7 @@ impl EditorApp {
                 self.schedule_compositor_lod_update(ctx);
                 self.refresh_preview_cache();
                 let preview = Arc::clone(&self.cached_preview);
-                let lighting = self.viewport_lighting();
+                let lighting = self.viewport_lighting(&preview);
                 let viewport_texture = {
                     let key = DepthCacheKey {
                         size: [
@@ -10044,6 +10526,9 @@ impl EditorApp {
                         self.performance
                             .viewport_queue_wait
                             .record(result.queue_wait);
+                        self.performance
+                            .shadow_prepare
+                            .record(result.shadow_prepare_time);
                         if let Some((revision, started)) = self.compositor_present_revision {
                             if result.key.texture_revision >= revision {
                                 self.performance
@@ -10239,10 +10724,16 @@ impl EditorApp {
                                 RenderDevice::Vulkan => self.performance.viewport_vulkan,
                                 RenderDevice::Cpu => self.performance.viewport_cpu,
                             };
+                            let fps = if timing.latest_ms > f64::EPSILON {
+                                1_000.0 / timing.latest_ms
+                            } else {
+                                0.0
+                            };
                             ui.small(format!(
-                                "{} viewport {:.2} ms",
+                                "{} viewport {:.2} ms  •  {:.1} FPS",
                                 self.render_device.label(),
-                                timing.latest_ms
+                                timing.latest_ms,
+                                fps
                             ));
                             ui.separator();
                             ui.small(if self.viewport_focused {
@@ -10436,6 +10927,10 @@ fn remap_curve_editor(ui: &mut egui::Ui, points: &mut [[f32; 2]], bezier: bool) 
 fn parse_compositor_position(value: &str) -> Option<Vec2> {
     let (x, y) = value.split_once(',')?;
     Some(Vec2::new(x.parse().ok()?, y.parse().ok()?))
+}
+
+fn object_index_by_name(names: &[String], target: &str) -> Option<usize> {
+    names.iter().position(|name| name == target)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -11433,6 +11928,7 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
                     performance.viewport_present,
                 ),
                 ("Viewport queue wait", performance.viewport_queue_wait),
+                ("Shadow maps (cached)", performance.shadow_prepare),
                 ("Control → graph apply", performance.control_to_graph_apply),
                 (
                     "Control → composite ready",
@@ -11474,6 +11970,7 @@ struct RasterVertex {
 
 #[derive(Clone)]
 struct PreparedRasterTriangle {
+    object_id: NodeId,
     vertices: [RasterVertex; 3],
     base_color: [f32; 4],
     light: f32,
@@ -11528,7 +12025,13 @@ fn rasterize_depth_frame(
             .cross(world[2] - world[0])
             .normalized();
         let centroid = (world[0] + world[1] + world[2]) * (1.0 / 3.0);
-        let band = viewport_light_factor(normal, centroid, triangle.shader, lighting);
+        let band = viewport_light_factor(
+            normal,
+            centroid,
+            triangle.shader,
+            lighting,
+            Some(triangle.object_id),
+        );
         clip_preview_polygon_to_near_into(
             triangle,
             yaw,
@@ -11586,6 +12089,7 @@ fn rasterize_depth_frame(
                 .ceil()
                 .clamp(0.0, height.saturating_sub(1) as f32) as usize;
             workspace.prepared.push(PreparedRasterTriangle {
+                object_id: triangle.object_id,
                 vertices: raster_vertices,
                 base_color: triangle.base_color,
                 light: band,
@@ -11647,6 +12151,7 @@ fn rasterize_depth_frame(
                         triangle.ior,
                         camera_position,
                         triangle.texture.as_deref(),
+                        triangle.object_id,
                         projection_mode,
                         size,
                         y_start,
@@ -11677,6 +12182,7 @@ fn rasterize_triangle_band(
     ior: f32,
     camera_position: CoreVec3,
     texture: Option<&TextureAsset>,
+    object_id: NodeId,
     projection_mode: ProjectionMode,
     size: [usize; 2],
     y_start: usize,
@@ -11807,7 +12313,13 @@ fn rasterize_triangle_band(
                         interpolate(|vertex| vertex.world_position[2]),
                     );
                     let pixel_light = if smooth_normals {
-                        viewport_light_factor(shading_normal, world_position, shader, lighting)
+                        viewport_light_factor(
+                            shading_normal,
+                            world_position,
+                            shader,
+                            lighting,
+                            Some(object_id),
+                        )
                     } else {
                         light
                     };
@@ -12570,18 +13082,479 @@ fn light_intensity_from_exponent(exponent: f32) -> f32 {
     }
 }
 
+fn sanitize_shadow_resolution(value: u32) -> u32 {
+    match value {
+        0 => 0,
+        1..=191 => 128,
+        192..=383 => 256,
+        384..=767 => 512,
+        768..=1535 => 1024,
+        _ => 2048,
+    }
+}
+
+fn build_directional_shadow_map(
+    triangles: &[PreviewTriangle],
+    resolution: usize,
+) -> DirectionalShadowMap {
+    let resolution = resolution.clamp(1, 2048);
+    let direction = global_light_direction();
+    let forward = direction * -1.0;
+    let reference_up = if forward.z.abs() < 0.95 {
+        CoreVec3::Z
+    } else {
+        CoreVec3::Y
+    };
+    let right = reference_up.cross(forward).normalized();
+    let up = forward.cross(right).normalized();
+    let mut minimum = CoreVec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut maximum = CoreVec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for vertex in triangles.iter().flat_map(|triangle| triangle.vertices) {
+        let point = CoreVec3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
+        minimum.x = minimum.x.min(point.x);
+        minimum.y = minimum.y.min(point.y);
+        minimum.z = minimum.z.min(point.z);
+        maximum.x = maximum.x.max(point.x);
+        maximum.y = maximum.y.max(point.y);
+        maximum.z = maximum.z.max(point.z);
+    }
+    if !minimum.x.is_finite() {
+        return DirectionalShadowMap {
+            resolution,
+            depth: vec![f32::INFINITY; resolution * resolution],
+            origin: CoreVec3::ZERO,
+            right,
+            up,
+            forward,
+            extent: 1.0,
+            bias: 1.0e-3,
+        };
+    }
+    let origin = (minimum + maximum) * 0.5;
+    let mut extent = 0.0_f32;
+    for triangle in triangles {
+        for vertex in triangle.vertices {
+            let point =
+                CoreVec3::new(vertex.position[0], vertex.position[1], vertex.position[2]) - origin;
+            extent = extent.max(point.dot(right).abs()).max(point.dot(up).abs());
+        }
+    }
+    extent = (extent * 1.05).max(1.0e-3);
+    let mut map = DirectionalShadowMap {
+        resolution,
+        depth: vec![f32::INFINITY; resolution * resolution],
+        origin,
+        right,
+        up,
+        forward,
+        extent,
+        bias: (extent * 2.0 / resolution as f32).max(1.0e-5) * 1.5,
+    };
+    for triangle in triangles.iter().filter(|triangle| triangle.casts_shadows) {
+        let projected = triangle.vertices.map(|vertex| {
+            let point =
+                CoreVec3::new(vertex.position[0], vertex.position[1], vertex.position[2]) - origin;
+            let normalized_x = point.dot(right) / (extent * 2.0) + 0.5;
+            let normalized_y = 0.5 - point.dot(up) / (extent * 2.0);
+            (
+                Pos2::new(
+                    normalized_x * resolution as f32,
+                    normalized_y * resolution as f32,
+                ),
+                point.dot(forward),
+            )
+        });
+        rasterize_shadow_triangle(&mut map.depth, resolution, projected);
+    }
+    map
+}
+
+fn rasterize_shadow_triangle(depth: &mut [f32], resolution: usize, vertices: [(Pos2, f32); 3]) {
+    let area = edge_function(vertices[0].0, vertices[1].0, vertices[2].0);
+    if area.abs() <= 1.0e-8 {
+        return;
+    }
+    let min_x = vertices
+        .iter()
+        .map(|vertex| vertex.0.x)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .clamp(0.0, resolution.saturating_sub(1) as f32) as usize;
+    let max_x = vertices
+        .iter()
+        .map(|vertex| vertex.0.x)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .clamp(0.0, resolution.saturating_sub(1) as f32) as usize;
+    let min_y = vertices
+        .iter()
+        .map(|vertex| vertex.0.y)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .clamp(0.0, resolution.saturating_sub(1) as f32) as usize;
+    let max_y = vertices
+        .iter()
+        .map(|vertex| vertex.0.y)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .clamp(0.0, resolution.saturating_sub(1) as f32) as usize;
+    let inverse_area = area.recip();
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let weights = [
+                edge_function(vertices[1].0, vertices[2].0, sample) * inverse_area,
+                edge_function(vertices[2].0, vertices[0].0, sample) * inverse_area,
+                edge_function(vertices[0].0, vertices[1].0, sample) * inverse_area,
+            ];
+            if weights.iter().all(|weight| *weight >= -1.0e-5) {
+                let sample_depth = weights
+                    .iter()
+                    .zip(vertices)
+                    .map(|(weight, vertex)| weight * vertex.1)
+                    .sum::<f32>();
+                let target = &mut depth[y * resolution + x];
+                *target = target.min(sample_depth);
+            }
+        }
+    }
+}
+
+fn directional_shadow_visibility(
+    surface: CoreVec3,
+    normal: CoreVec3,
+    map: &DirectionalShadowMap,
+) -> f32 {
+    let relative = surface - map.origin;
+    let u = relative.dot(map.right) / (map.extent * 2.0) + 0.5;
+    let v = 0.5 - relative.dot(map.up) / (map.extent * 2.0);
+    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+        return 1.0;
+    }
+    let receiver_depth = relative.dot(map.forward);
+    let normal_light = normal.dot(global_light_direction()).clamp(0.0, 1.0);
+    let receiver_bias = map.bias * (1.0 + (1.0 - normal_light) * 5.0);
+    let center_x = (u * map.resolution as f32).floor() as isize;
+    let center_y = (v * map.resolution as f32).floor() as isize;
+    let mut visible = 0.0;
+    let mut samples = 0.0;
+    for offset_y in -1..=1 {
+        for offset_x in -1..=1 {
+            let x = center_x + offset_x;
+            let y = center_y + offset_y;
+            if x < 0 || y < 0 || x >= map.resolution as isize || y >= map.resolution as isize {
+                visible += 1.0;
+            } else {
+                let caster_depth = map.depth[y as usize * map.resolution + x as usize];
+                visible += f32::from(
+                    !caster_depth.is_finite() || receiver_depth <= caster_depth + receiver_bias,
+                );
+            }
+            samples += 1.0;
+        }
+    }
+    visible / samples
+}
+
+fn cube_face_basis(face: usize) -> (CoreVec3, CoreVec3, CoreVec3) {
+    match face {
+        0 => (CoreVec3::X, CoreVec3::new(0.0, -1.0, 0.0), CoreVec3::Z),
+        1 => (CoreVec3::new(-1.0, 0.0, 0.0), CoreVec3::Y, CoreVec3::Z),
+        2 => (CoreVec3::Y, CoreVec3::X, CoreVec3::Z),
+        3 => (
+            CoreVec3::new(0.0, -1.0, 0.0),
+            CoreVec3::new(-1.0, 0.0, 0.0),
+            CoreVec3::Z,
+        ),
+        4 => (CoreVec3::Z, CoreVec3::X, CoreVec3::new(0.0, -1.0, 0.0)),
+        _ => (CoreVec3::new(0.0, 0.0, -1.0), CoreVec3::X, CoreVec3::Y),
+    }
+}
+
+fn cube_shadow_coordinate(direction: CoreVec3) -> (usize, f32, f32) {
+    (0..6)
+        .map(|face| {
+            let (forward, right, up) = cube_face_basis(face);
+            let depth = direction.dot(forward);
+            (
+                face,
+                direction.dot(right) / depth * 0.5 + 0.5,
+                0.5 - direction.dot(up) / depth * 0.5,
+                depth,
+            )
+        })
+        .max_by(|left, right| {
+            left.3
+                .partial_cmp(&right.3)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(face, u, v, _)| (face, u, v))
+        .unwrap()
+}
+
+fn build_point_shadow_atlas(
+    triangles: &[PreviewTriangle],
+    lights: &[ViewportLight],
+) -> PointShadowAtlas {
+    let mut regions = [PointShadowRegion::default(); MAX_VIEWPORT_LIGHTS];
+    let max_resolution = lights
+        .iter()
+        .take(MAX_VIEWPORT_LIGHTS)
+        .map(|light| light.shadow_resolution as usize)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let height = lights
+        .iter()
+        .take(MAX_VIEWPORT_LIGHTS)
+        .map(|light| light.shadow_resolution as usize)
+        .sum::<usize>()
+        .max(1);
+    let width = max_resolution * 6;
+    let mut atlas = PointShadowAtlas {
+        width,
+        height,
+        depth: vec![f32::INFINITY; width * height],
+        regions,
+    };
+    let mut row = 0;
+    for (light_index, light) in lights.iter().take(MAX_VIEWPORT_LIGHTS).enumerate() {
+        let resolution = light.shadow_resolution as usize;
+        if resolution == 0 {
+            continue;
+        }
+        let bias = (1.0 / resolution as f32).max(1.0e-5) * 2.0;
+        regions[light_index] = PointShadowRegion {
+            row,
+            resolution,
+            bias,
+        };
+        for face in 0..6 {
+            let (forward, right, up) = cube_face_basis(face);
+            for triangle in triangles.iter().filter(|triangle| triangle.casts_shadows) {
+                let face_vertices = triangle.vertices.map(|vertex| {
+                    let point =
+                        CoreVec3::new(vertex.position[0], vertex.position[1], vertex.position[2])
+                            - light.position;
+                    CoreVec3::new(point.dot(right), point.dot(up), point.dot(forward))
+                });
+                let clipped = clip_point_shadow_polygon(&face_vertices);
+                for offset in 1..clipped.len().saturating_sub(1) {
+                    let clipped_triangle = [clipped[0], clipped[offset], clipped[offset + 1]];
+                    let projected = clipped_triangle.map(|point| {
+                        (
+                            Pos2::new(
+                                face as f32 * resolution as f32
+                                    + (point.x / point.z * 0.5 + 0.5) * resolution as f32,
+                                row as f32 + (0.5 - point.y / point.z * 0.5) * resolution as f32,
+                            ),
+                            point.z,
+                        )
+                    });
+                    rasterize_point_shadow_triangle(
+                        &mut atlas.depth,
+                        width,
+                        height,
+                        projected,
+                        face * resolution,
+                        row,
+                        resolution,
+                    );
+                }
+            }
+        }
+        row += resolution;
+    }
+    atlas.regions = regions;
+    atlas
+}
+
+fn clip_point_shadow_polygon(vertices: &[CoreVec3; 3]) -> Vec<CoreVec3> {
+    let mut polygon = vertices.to_vec();
+    for plane in [
+        CoreVec3::new(0.0, 0.0, 1.0),
+        CoreVec3::new(1.0, 0.0, 1.0),
+        CoreVec3::new(-1.0, 0.0, 1.0),
+        CoreVec3::new(0.0, 1.0, 1.0),
+        CoreVec3::new(0.0, -1.0, 1.0),
+    ] {
+        if polygon.is_empty() {
+            break;
+        }
+        let input = std::mem::take(&mut polygon);
+        let mut previous = *input.last().unwrap();
+        let mut previous_distance =
+            previous.dot(plane) - if plane == CoreVec3::Z { 1.0e-5 } else { 0.0 };
+        for current in input {
+            let current_distance =
+                current.dot(plane) - if plane == CoreVec3::Z { 1.0e-5 } else { 0.0 };
+            let previous_inside = previous_distance >= 0.0;
+            let current_inside = current_distance >= 0.0;
+            if previous_inside != current_inside {
+                let denominator = previous_distance - current_distance;
+                if denominator.abs() > f32::EPSILON {
+                    polygon
+                        .push(previous + (current - previous) * (previous_distance / denominator));
+                }
+            }
+            if current_inside {
+                polygon.push(current);
+            }
+            previous = current;
+            previous_distance = current_distance;
+        }
+    }
+    polygon
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_point_shadow_triangle(
+    atlas: &mut [f32],
+    atlas_width: usize,
+    atlas_height: usize,
+    vertices: [(Pos2, f32); 3],
+    tile_x: usize,
+    tile_y: usize,
+    resolution: usize,
+) {
+    let area = edge_function(vertices[0].0, vertices[1].0, vertices[2].0);
+    if area.abs() <= 1.0e-8 {
+        return;
+    }
+    let clamp_x =
+        |value: f32| value.clamp(tile_x as f32, (tile_x + resolution - 1) as f32) as usize;
+    let clamp_y =
+        |value: f32| value.clamp(tile_y as f32, (tile_y + resolution - 1) as f32) as usize;
+    let min_x = clamp_x(
+        vertices
+            .iter()
+            .map(|vertex| vertex.0.x)
+            .fold(f32::INFINITY, f32::min)
+            .floor(),
+    );
+    let max_x = clamp_x(
+        vertices
+            .iter()
+            .map(|vertex| vertex.0.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil(),
+    );
+    let min_y = clamp_y(
+        vertices
+            .iter()
+            .map(|vertex| vertex.0.y)
+            .fold(f32::INFINITY, f32::min)
+            .floor(),
+    );
+    let max_y = clamp_y(
+        vertices
+            .iter()
+            .map(|vertex| vertex.0.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil(),
+    );
+    let inverse_area = area.recip();
+    for y in min_y..=max_y.min(atlas_height - 1) {
+        for x in min_x..=max_x.min(atlas_width - 1) {
+            let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let weights = [
+                edge_function(vertices[1].0, vertices[2].0, sample) * inverse_area,
+                edge_function(vertices[2].0, vertices[0].0, sample) * inverse_area,
+                edge_function(vertices[0].0, vertices[1].0, sample) * inverse_area,
+            ];
+            if weights.iter().all(|weight| *weight >= -1.0e-5) {
+                let inverse_face_depth = weights
+                    .iter()
+                    .zip(vertices)
+                    .map(|(weight, vertex)| weight / vertex.1)
+                    .sum::<f32>();
+                if inverse_face_depth > f32::EPSILON {
+                    let face_depth = inverse_face_depth.recip();
+                    let face_x = ((sample.x - tile_x as f32) / resolution as f32) * 2.0 - 1.0;
+                    let face_y = 1.0 - ((sample.y - tile_y as f32) / resolution as f32) * 2.0;
+                    let radial_depth =
+                        face_depth * (1.0 + face_x * face_x + face_y * face_y).sqrt();
+                    let target = &mut atlas[y * atlas_width + x];
+                    *target = target.min(radial_depth);
+                }
+            }
+        }
+    }
+}
+
+fn point_shadow_visibility(
+    surface: CoreVec3,
+    normal: CoreVec3,
+    light: ViewportLight,
+    light_index: usize,
+    atlas: &PointShadowAtlas,
+) -> f32 {
+    let region = atlas.regions[light_index];
+    if region.resolution == 0 {
+        return 1.0;
+    }
+    let point = surface - light.position;
+    let distance = point.length().max(1.0e-5);
+    let direction = point * distance.recip();
+    let surface_to_light = point * (-1.0 / distance);
+    let normal_light = normal.dot(surface_to_light).clamp(0.0, 1.0);
+    let receiver_bias = region.bias * distance * (1.0 + (1.0 - normal_light) * 5.0);
+    let kernel = ((light.radius / distance) * region.resolution as f32)
+        .ceil()
+        .clamp(1.0, 3.0) as isize;
+    let reference = if direction.z.abs() < 0.9 {
+        CoreVec3::Z
+    } else {
+        CoreVec3::Y
+    };
+    let tangent = reference.cross(direction).normalized();
+    let bitangent = direction.cross(tangent).normalized();
+    let angular_step = 2.0 / region.resolution as f32;
+    let mut visible = 0.0;
+    let mut samples = 0.0;
+    for offset_y in -kernel..=kernel {
+        for offset_x in -kernel..=kernel {
+            let sample_direction = (direction
+                + tangent * (offset_x as f32 * angular_step)
+                + bitangent * (offset_y as f32 * angular_step))
+                .normalized();
+            let (face, u, v) = cube_shadow_coordinate(sample_direction);
+            let local_x = (u * region.resolution as f32)
+                .floor()
+                .clamp(0.0, region.resolution.saturating_sub(1) as f32)
+                as usize;
+            let local_y = (v * region.resolution as f32)
+                .floor()
+                .clamp(0.0, region.resolution.saturating_sub(1) as f32)
+                as usize;
+            let x = face * region.resolution + local_x;
+            let y = region.row + local_y;
+            let caster_depth = atlas.depth[y * atlas.width + x];
+            visible +=
+                f32::from(!caster_depth.is_finite() || distance <= caster_depth + receiver_bias);
+            samples += 1.0;
+        }
+    }
+    visible / samples
+}
+
 fn viewport_light_factor(
     normal: CoreVec3,
     world_position: CoreVec3,
     shader: ShaderMode,
     lighting: &ViewportLighting,
+    _receiver: Option<NodeId>,
 ) -> f32 {
     let mut diffuse = if lighting.global_enabled {
-        normal.dot(global_light_direction()).max(0.0)
+        let direction = global_light_direction();
+        normal.dot(direction).max(0.0)
+            * lighting.directional_shadow.as_deref().map_or(1.0, |map| {
+                directional_shadow_visibility(world_position, normal, map)
+            })
     } else {
         0.0
     };
-    for light in lighting.points.iter().take(MAX_VIEWPORT_LIGHTS) {
+    for (light_index, light) in lighting.points.iter().take(MAX_VIEWPORT_LIGHTS).enumerate() {
         let offset = light.position - world_position;
         let distance_squared = offset.dot(offset);
         if distance_squared <= 1.0e-8 {
@@ -12590,9 +13563,34 @@ fn viewport_light_factor(
         let luminance =
             (light.color[0].max(0.0) + light.color[1].max(0.0) + light.color[2].max(0.0)) / 3.0;
         let attenuation = light.intensity.max(0.0) * luminance / (1.0 + distance_squared);
-        diffuse += normal.dot(offset.normalized()).max(0.0) * attenuation;
+        diffuse += spherical_light_lambert(
+            normal.dot(offset.normalized()),
+            distance_squared.sqrt(),
+            light.radius,
+        ) * attenuation
+            * lighting.point_shadows.as_deref().map_or(1.0, |atlas| {
+                point_shadow_visibility(world_position, normal, *light, light_index, atlas)
+            });
     }
     shader_light_factor(diffuse.clamp(0.0, 2.0), shader).clamp(0.0, 2.0)
+}
+
+/// Smooth approximation of diffuse irradiance from a spherical emitter.
+///
+/// `angular_radius` is the sine of the emitter's apparent half-angle. The
+/// square-root form converges exactly to max(N·L, 0) for a zero-radius light,
+/// while finite radii round the terminator as an area light would.
+fn spherical_light_lambert(normal_dot_light: f32, distance: f32, radius: f32) -> f32 {
+    let angular_radius = if distance > f32::EPSILON {
+        (radius.max(0.0) / distance).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let rounded = 0.5
+        * (normal_dot_light
+            + (normal_dot_light * normal_dot_light + angular_radius * angular_radius).sqrt());
+    let normalization = 2.0 / (1.0 + (1.0 + angular_radius * angular_radius).sqrt());
+    (rounded * normalization).clamp(0.0, 1.0)
 }
 
 fn grid_distance_alpha(zoom: f32, grid_spacing: f32) -> f32 {
@@ -14388,6 +15386,7 @@ mod tests {
             smooth_normals: false,
             transmission: 0.0,
             ior: 1.5,
+            casts_shadows: true,
         };
         let triangles = [
             triangle([[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [0.0, 0.0, 2.0]]),
@@ -14404,7 +15403,10 @@ mod tests {
         let mut workspace = RasterWorkspace::default();
         let lighting = ViewportLighting {
             global_enabled: true,
+            global_shadow_resolution: 0,
             points: Vec::new(),
+            directional_shadow: None,
+            point_shadows: None,
         };
         let frame = rasterize_depth_frame(
             Vec2::new(64.0, 64.0),
@@ -14572,53 +15574,155 @@ mod tests {
 
         let unlit = ViewportLighting {
             global_enabled: false,
+            global_shadow_resolution: 0,
             points: Vec::new(),
+            directional_shadow: None,
+            point_shadows: None,
         };
-        let ambient =
-            viewport_light_factor(CoreVec3::Z, CoreVec3::ZERO, ShaderMode::Diffuse, &unlit);
+        let ambient = viewport_light_factor(
+            CoreVec3::Z,
+            CoreVec3::ZERO,
+            ShaderMode::Diffuse,
+            &unlit,
+            None,
+        );
         let point = ViewportLight {
             position: CoreVec3::new(0.0, 0.0, 1.0),
             color: [1.0; 3],
             intensity: 4.0,
+            radius: 0.0,
+            shadow_resolution: 256,
         };
         let lit = ViewportLighting {
             global_enabled: false,
+            global_shadow_resolution: 0,
             points: vec![point],
+            directional_shadow: None,
+            point_shadows: None,
         };
         let from_origin =
-            viewport_light_factor(CoreVec3::Z, CoreVec3::ZERO, ShaderMode::Diffuse, &lit);
+            viewport_light_factor(CoreVec3::Z, CoreVec3::ZERO, ShaderMode::Diffuse, &lit, None);
         let translated = ViewportLighting {
             global_enabled: false,
+            global_shadow_resolution: 0,
             points: vec![ViewportLight {
                 position: CoreVec3::new(5.0, -3.0, 2.0),
                 ..point
             }],
+            directional_shadow: None,
+            point_shadows: None,
         };
         let from_translated_surface = viewport_light_factor(
             CoreVec3::Z,
             CoreVec3::new(5.0, -3.0, 1.0),
             ShaderMode::Diffuse,
             &translated,
+            None,
         );
         assert!(from_origin > ambient);
         assert!((from_origin - from_translated_surface).abs() < 1.0e-6);
 
         let distant_surface = CoreVec3::new(0.0, 0.0, -99.0);
-        let distant_weak =
-            viewport_light_factor(CoreVec3::Z, distant_surface, ShaderMode::Diffuse, &lit);
+        let distant_weak = viewport_light_factor(
+            CoreVec3::Z,
+            distant_surface,
+            ShaderMode::Diffuse,
+            &lit,
+            None,
+        );
         let distant_strong = viewport_light_factor(
             CoreVec3::Z,
             distant_surface,
             ShaderMode::Diffuse,
             &ViewportLighting {
                 global_enabled: false,
+                global_shadow_resolution: 0,
                 points: vec![ViewportLight {
                     intensity: 1_000_000.0,
                     ..point
                 }],
+                directional_shadow: None,
+                point_shadows: None,
             },
+            None,
         );
         assert!(distant_strong > distant_weak + 0.5);
+    }
+
+    #[test]
+    fn spherical_light_radius_softens_the_diffuse_terminator() {
+        let point_dark = spherical_light_lambert(-0.1, 10.0, 0.0);
+        let small = spherical_light_lambert(-0.1, 10.0, 1.0);
+        let large = spherical_light_lambert(-0.1, 10.0, 5.0);
+        assert_eq!(point_dark, 0.0);
+        assert!(small > point_dark);
+        assert!(large > small);
+        assert!((spherical_light_lambert(0.7, 10.0, 0.0) - 0.7).abs() < 1.0e-6);
+        assert!((spherical_light_lambert(1.0, 10.0, 5.0) - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn directional_shadow_depth_comparison_and_pcf_are_stable() {
+        let mut depth = vec![f32::INFINITY; 9];
+        depth[4] = 0.0;
+        let map = DirectionalShadowMap {
+            resolution: 3,
+            depth,
+            origin: CoreVec3::ZERO,
+            right: CoreVec3::X,
+            up: CoreVec3::Y,
+            forward: CoreVec3::Z,
+            extent: 1.0,
+            bias: 0.01,
+        };
+        let behind = directional_shadow_visibility(CoreVec3::new(0.0, 0.0, 1.0), CoreVec3::Z, &map);
+        let before =
+            directional_shadow_visibility(CoreVec3::new(0.0, 0.0, -1.0), CoreVec3::Z, &map);
+        assert!(behind < 1.0);
+        assert_eq!(before, 1.0);
+    }
+
+    #[test]
+    fn point_shadow_atlas_uses_cube_depth_and_resolution_toggle() {
+        let mut atlas = PointShadowAtlas {
+            width: 18,
+            height: 3,
+            depth: vec![f32::INFINITY; 54],
+            regions: [PointShadowRegion::default(); MAX_VIEWPORT_LIGHTS],
+        };
+        atlas.regions[0] = PointShadowRegion {
+            row: 0,
+            resolution: 3,
+            bias: 0.001,
+        };
+        atlas.depth[atlas.width + 1] = 0.5;
+        let light = ViewportLight {
+            position: CoreVec3::ZERO,
+            color: [1.0; 3],
+            intensity: 1.0,
+            radius: 0.0,
+            shadow_resolution: 3,
+        };
+        assert!(
+            point_shadow_visibility(CoreVec3::X, CoreVec3::new(-1.0, 0.0, 0.0), light, 0, &atlas)
+                < 1.0
+        );
+        atlas.regions[0].resolution = 0;
+        assert_eq!(
+            point_shadow_visibility(CoreVec3::X, CoreVec3::new(-1.0, 0.0, 0.0), light, 0, &atlas),
+            1.0
+        );
+    }
+
+    #[test]
+    fn cube_shadow_coordinates_cross_faces_without_leaving_valid_uvs() {
+        let first = cube_shadow_coordinate(CoreVec3::new(1.0, 0.99, 0.0).normalized());
+        let second = cube_shadow_coordinate(CoreVec3::new(0.99, 1.0, 0.0).normalized());
+        assert_ne!(first.0, second.0);
+        for (_, u, v) in [first, second] {
+            assert!((0.0..=1.0).contains(&u));
+            assert!((0.0..=1.0).contains(&v));
+        }
     }
 
     #[test]
@@ -14733,6 +15837,8 @@ mod tests {
         let handle = |id, value, source_handle| CompositorNode {
             id,
             object_index: 0,
+            object_name: "fixture".to_owned(),
+            settings_object_name: Some("fixture".to_owned()),
             settings: NodeSettings::ObjectHandle {
                 object_index: 0,
                 label: format!("Handle {id}"),
@@ -14759,6 +15865,18 @@ mod tests {
         }
         assert_eq!(resolve_object_handle_value(&nodes, 1), None);
         assert_eq!(resolve_object_handle_value(&nodes, 3), None);
+    }
+
+    #[test]
+    fn compositor_object_names_survive_index_shifts() {
+        let before = vec!["Deleted".to_owned(), "Flag".to_owned(), "Pole".to_owned()];
+        assert_eq!(object_index_by_name(&before, "Flag"), Some(1));
+        assert_eq!(object_index_by_name(&before, "Pole"), Some(2));
+
+        let after = vec!["Flag".to_owned(), "Pole".to_owned()];
+        assert_eq!(object_index_by_name(&after, "Flag"), Some(0));
+        assert_eq!(object_index_by_name(&after, "Pole"), Some(1));
+        assert_eq!(object_index_by_name(&after, "Deleted"), None);
     }
 
     #[test]
