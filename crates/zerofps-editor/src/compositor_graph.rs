@@ -3,6 +3,264 @@ use std::{collections::HashMap, fmt, sync::Arc};
 use zerofps_assets::TextureAsset;
 
 pub type GraphNodeId = usize;
+pub const MAX_ALGEBRA_INSTRUCTIONS: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlgebraInstruction {
+    Variable(u8),
+    Constant(f32),
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Power,
+    Negate,
+    Sin,
+    Cos,
+    Abs,
+    Sqrt,
+}
+
+pub fn compile_algebra_expression(expression: &str) -> Result<Vec<AlgebraInstruction>, String> {
+    let mut parser = AlgebraParser {
+        input: expression.as_bytes(),
+        cursor: 0,
+        program: Vec::new(),
+    };
+    parser.expression()?;
+    parser.whitespace();
+    if parser.cursor != parser.input.len() {
+        return Err("unexpected trailing expression".into());
+    }
+    if parser.program.is_empty() {
+        return Err("expression is empty".into());
+    }
+    if parser.program.len() > MAX_ALGEBRA_INSTRUCTIONS {
+        return Err(format!(
+            "expression needs {} operations; maximum is {MAX_ALGEBRA_INSTRUCTIONS}",
+            parser.program.len()
+        ));
+    }
+    Ok(parser.program)
+}
+
+pub fn evaluate_algebra_program(
+    program: &[AlgebraInstruction],
+    variables: [f32; 3],
+) -> Result<f32, String> {
+    let mut stack = Vec::with_capacity(program.len());
+    for instruction in program {
+        match *instruction {
+            AlgebraInstruction::Variable(index) => stack.push(variables[index as usize]),
+            AlgebraInstruction::Constant(value) => stack.push(value),
+            AlgebraInstruction::Negate
+            | AlgebraInstruction::Sin
+            | AlgebraInstruction::Cos
+            | AlgebraInstruction::Abs
+            | AlgebraInstruction::Sqrt => {
+                let value = stack.pop().ok_or("invalid unary expression")?;
+                stack.push(match instruction {
+                    AlgebraInstruction::Negate => -value,
+                    AlgebraInstruction::Sin => value.sin(),
+                    AlgebraInstruction::Cos => value.cos(),
+                    AlgebraInstruction::Abs => value.abs(),
+                    AlgebraInstruction::Sqrt => value.max(0.0).sqrt(),
+                    _ => unreachable!(),
+                });
+            }
+            operation => {
+                let right = stack.pop().ok_or("invalid binary expression")?;
+                let left = stack.pop().ok_or("invalid binary expression")?;
+                stack.push(match operation {
+                    AlgebraInstruction::Add => left + right,
+                    AlgebraInstruction::Subtract => left - right,
+                    AlgebraInstruction::Multiply => left * right,
+                    AlgebraInstruction::Divide => {
+                        if right.abs() <= 1.0e-6 {
+                            0.0
+                        } else {
+                            left / right
+                        }
+                    }
+                    AlgebraInstruction::Power => left.max(0.0).powf(right),
+                    _ => unreachable!(),
+                });
+            }
+        }
+    }
+    let value = stack.pop().ok_or("expression produced no value")?;
+    if !stack.is_empty() || !value.is_finite() {
+        return Err("expression produced an invalid value".into());
+    }
+    Ok(value)
+}
+
+struct AlgebraParser<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    program: Vec<AlgebraInstruction>,
+}
+
+impl AlgebraParser<'_> {
+    fn expression(&mut self) -> Result<(), String> {
+        self.term()?;
+        loop {
+            self.whitespace();
+            if self.consume(b'+') {
+                self.term()?;
+                self.program.push(AlgebraInstruction::Add);
+            } else if self.consume(b'-') {
+                self.term()?;
+                self.program.push(AlgebraInstruction::Subtract);
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn term(&mut self) -> Result<(), String> {
+        self.power()?;
+        loop {
+            self.whitespace();
+            if self.consume(b'*') {
+                self.power()?;
+                self.program.push(AlgebraInstruction::Multiply);
+            } else if self.consume(b'/') {
+                self.power()?;
+                self.program.push(AlgebraInstruction::Divide);
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn power(&mut self) -> Result<(), String> {
+        self.unary()?;
+        self.whitespace();
+        if self.consume(b'^') {
+            self.power()?;
+            self.program.push(AlgebraInstruction::Power);
+        }
+        Ok(())
+    }
+
+    fn unary(&mut self) -> Result<(), String> {
+        self.whitespace();
+        if self.consume(b'+') {
+            self.unary()
+        } else if self.consume(b'-') {
+            self.unary()?;
+            self.program.push(AlgebraInstruction::Negate);
+            Ok(())
+        } else {
+            self.primary()
+        }
+    }
+
+    fn primary(&mut self) -> Result<(), String> {
+        self.whitespace();
+        if self.consume(b'(') {
+            self.expression()?;
+            self.whitespace();
+            return self
+                .consume(b')')
+                .then_some(())
+                .ok_or_else(|| "missing closing parenthesis".into());
+        }
+        if self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+        {
+            let value = self.number()?;
+            self.program.push(AlgebraInstruction::Constant(value));
+            return Ok(());
+        }
+        let identifier = self.identifier()?;
+        match identifier.as_str() {
+            "x" => self.program.push(AlgebraInstruction::Variable(0)),
+            "y" => self.program.push(AlgebraInstruction::Variable(1)),
+            "z" => self.program.push(AlgebraInstruction::Variable(2)),
+            "pi" => self
+                .program
+                .push(AlgebraInstruction::Constant(std::f32::consts::PI)),
+            "e" => self
+                .program
+                .push(AlgebraInstruction::Constant(std::f32::consts::E)),
+            function => {
+                self.whitespace();
+                if !self.consume(b'(') {
+                    return Err(format!("unknown variable `{function}`"));
+                }
+                self.expression()?;
+                self.whitespace();
+                if !self.consume(b')') {
+                    return Err("missing function parenthesis".into());
+                }
+                self.program.push(match function {
+                    "sin" => AlgebraInstruction::Sin,
+                    "cos" => AlgebraInstruction::Cos,
+                    "abs" => AlgebraInstruction::Abs,
+                    "sqrt" => AlgebraInstruction::Sqrt,
+                    _ => return Err(format!("unknown function `{function}`")),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn number(&mut self) -> Result<f32, String> {
+        let start = self.cursor;
+        while self.input.get(self.cursor).is_some_and(|byte| {
+            byte.is_ascii_digit() || matches!(*byte, b'.' | b'e' | b'E' | b'+' | b'-')
+        }) {
+            if self.cursor > start
+                && matches!(self.input[self.cursor], b'+' | b'-')
+                && !matches!(self.input[self.cursor - 1], b'e' | b'E')
+            {
+                break;
+            }
+            self.cursor += 1;
+        }
+        std::str::from_utf8(&self.input[start..self.cursor])
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| "invalid number".into())
+    }
+
+    fn identifier(&mut self) -> Result<String, String> {
+        let start = self.cursor;
+        while self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        {
+            self.cursor += 1;
+        }
+        (self.cursor > start)
+            .then(|| String::from_utf8_lossy(&self.input[start..self.cursor]).into_owned())
+            .ok_or_else(|| "expected a value".into())
+    }
+
+    fn whitespace(&mut self) {
+        while self
+            .input
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.input.get(self.cursor) == Some(&expected) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum GraphSource {
@@ -20,6 +278,9 @@ pub enum GraphOperation {
     Math {
         operation: usize,
         constant: f32,
+    },
+    Algebra {
+        program: Vec<AlgebraInstruction>,
     },
     SharpThreshold {
         threshold: f32,
@@ -278,6 +539,31 @@ fn execute_node(
         } => Ok(map_rgb(required(0)?, "compositor-math", |value| {
             arithmetic(value, *constant, *operation)
         })),
+        GraphOperation::Algebra { program } => {
+            let inputs = [optional(0)?, optional(1)?, optional(2)?];
+            let reference = inputs.iter().flatten().next().copied();
+            let width = reference.map_or(1, |image| image.width);
+            let height = reference.map_or(1, |image| image.height);
+            let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+            for y in 0..height {
+                for x in 0..width {
+                    for channel in 0..4 {
+                        let variables = std::array::from_fn(|index| {
+                            inputs[index]
+                                .map(|image| sample(image, x, y, width, height)[channel])
+                                .unwrap_or(0.0)
+                        });
+                        pixels.push(evaluate_algebra_program(program, variables).unwrap_or(0.0));
+                    }
+                }
+            }
+            Ok(FloatImage {
+                name: "compositor-algebra".into(),
+                width,
+                height,
+                pixels,
+            })
+        }
         GraphOperation::SharpThreshold { threshold } => Ok(map_rgb(
             required(0)?,
             "compositor-sharp-threshold",
@@ -802,6 +1088,38 @@ mod tests {
             .execute(&CompiledGraph { output: 2, ..graph })
             .unwrap();
         assert_eq!(bounded.pixels, [1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn algebra_compiles_precedence_functions_and_three_variables() {
+        let program =
+            compile_algebra_expression("x + y * z - abs(-2)").expect("valid algebra expression");
+        let value = evaluate_algebra_program(&program, [1.0, 3.0, 4.0])
+            .expect("compiled program evaluates");
+        assert!((value - 11.0).abs() < 1.0e-6);
+        assert!(compile_algebra_expression("x + unknown").is_err());
+        assert!(compile_algebra_expression("(x + y").is_err());
+    }
+
+    #[test]
+    fn algebra_graph_resamples_inputs_and_defaults_missing_values_to_zero() {
+        let graph = CompiledGraph {
+            generation: 1,
+            nodes: vec![
+                node(0, GraphOperation::Source(0), &[]),
+                GraphNode {
+                    id: 1,
+                    operation: GraphOperation::Algebra {
+                        program: compile_algebra_expression("x + y + z").unwrap(),
+                    },
+                    inputs: [Some(0), None, None, None],
+                },
+            ],
+            sources: vec![GraphSource::Constant([0.25, 0.5, 0.75, 1.0])],
+            output: 1,
+        };
+        let image = CpuGraphExecutor.execute(&graph).expect("graph executes");
+        assert_eq!(image.pixels, vec![0.25, 0.5, 0.75, 1.0]);
     }
 
     #[test]

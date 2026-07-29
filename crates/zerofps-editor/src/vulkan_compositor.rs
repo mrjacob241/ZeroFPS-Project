@@ -9,7 +9,9 @@ use wgpu::util::DeviceExt;
 use zerofps_assets::TextureAsset;
 
 use crate::{
-    compositor_graph::{CompiledGraph, GraphExecutor, GraphOperation, GraphSource},
+    compositor_graph::{
+        AlgebraInstruction, CompiledGraph, GraphExecutor, GraphOperation, GraphSource,
+    },
     vulkan_runtime::{GpuImage, shared_runtime},
 };
 
@@ -21,7 +23,7 @@ struct GraphParameters {
     connected: u32,
     point_count: u32,
     values: [f32; 4],
-    points: [[f32; 4]; 8],
+    points: [[f32; 4]; 32],
 }
 
 #[repr(C)]
@@ -641,7 +643,7 @@ fn graph_parameters(operation: &GraphOperation, connected: u32) -> GraphParamete
         connected,
         point_count: 0,
         values: [0.0; 4],
-        points: [[0.0; 4]; 8],
+        points: [[0.0; 4]; 32],
     };
     match operation {
         GraphOperation::Source(_) => {}
@@ -660,6 +662,26 @@ fn graph_parameters(operation: &GraphOperation, connected: u32) -> GraphParamete
             result.operation = 2;
             result.variant = *operation as u32;
             result.values[0] = *constant;
+        }
+        GraphOperation::Algebra { program } => {
+            result.operation = 12;
+            result.point_count = program.len().min(32) as u32;
+            for (target, instruction) in result.points.iter_mut().zip(program) {
+                *target = match instruction {
+                    AlgebraInstruction::Variable(index) => [*index as f32, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Constant(value) => [3.0, *value, 0.0, 0.0],
+                    AlgebraInstruction::Add => [4.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Subtract => [5.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Multiply => [6.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Divide => [7.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Power => [8.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Negate => [9.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Sin => [10.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Cos => [11.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Abs => [12.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Sqrt => [13.0, 0.0, 0.0, 0.0],
+                };
+            }
         }
         GraphOperation::SharpThreshold { threshold } => {
             result.operation = 3;
@@ -878,11 +900,19 @@ mod graph_tests {
                 },
                 GraphNode {
                     id: 7,
+                    operation: GraphOperation::Algebra {
+                        program: crate::compositor_graph::compile_algebra_expression("x + y * 2")
+                            .unwrap(),
+                    },
+                    inputs: [Some(6), Some(2), None, None],
+                },
+                GraphNode {
+                    id: 8,
                     operation: GraphOperation::ClampColor,
-                    inputs: [Some(6), None, None, None],
+                    inputs: [Some(7), None, None, None],
                 },
             ],
-            output: 7,
+            output: 8,
         });
         let expected = CpuGraphExecutor
             .execute(&graph)

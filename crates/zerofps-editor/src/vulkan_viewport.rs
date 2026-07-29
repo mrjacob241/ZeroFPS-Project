@@ -69,8 +69,8 @@ pub struct VulkanViewport {
     white: Arc<wgpu::TextureView>,
     targets: Option<CachedTargets>,
     camera_buffer: wgpu::Buffer,
-    shadow_cache: Option<(usize, wgpu::Texture, Arc<wgpu::TextureView>)>,
-    point_shadow_cache: Option<(usize, wgpu::Texture, Arc<wgpu::TextureView>)>,
+    shadow_cache: Option<(usize, u32, u32, wgpu::Texture, Arc<wgpu::TextureView>)>,
+    point_shadow_cache: Option<(usize, u32, u32, wgpu::Texture, Arc<wgpu::TextureView>)>,
     camera_group_cache: Option<(usize, usize, Arc<wgpu::BindGroup>)>,
     vertex_cache: HashMap<u64, (usize, Arc<wgpu::Buffer>)>,
     bind_group_cache: HashMap<usize, Arc<wgpu::BindGroup>>,
@@ -278,7 +278,12 @@ impl VulkanViewport {
             [shadow.forward.x, shadow.forward.y, shadow.forward.z, 0.0]
         });
         let shadow_parameters = directional_shadow.map_or([0.0; 4], |shadow| {
-            [shadow.extent, shadow.bias, shadow.resolution as f32, 0.0]
+            [
+                shadow.extent,
+                shadow.bias,
+                shadow.resolution as f32,
+                shadow.filter_radius as f32,
+            ]
         });
         if let Some(atlas) = point_shadows {
             for (target, region) in point_shadow_regions.iter_mut().zip(atlas.regions) {
@@ -286,7 +291,7 @@ impl VulkanViewport {
                     region.row as f32,
                     region.resolution as f32,
                     region.bias,
-                    0.0,
+                    region.filter_radius as f32,
                 ];
             }
         }
@@ -421,13 +426,17 @@ impl VulkanViewport {
                         }))
                     }));
                 let vertices = match self.vertex_cache.get(&batch.cache_key) {
-                    Some((count, buffer)) if *count == batch.vertices.len() => Arc::clone(buffer),
+                    Some((count, buffer)) if *count == batch.vertices.len() => {
+                        self.queue
+                            .write_buffer(buffer, 0, bytemuck::cast_slice(&batch.vertices));
+                        Arc::clone(buffer)
+                    }
                     _ => {
                         let buffer = Arc::new(self.device.create_buffer_init(
                             &wgpu::util::BufferInitDescriptor {
                                 label: Some("persistent viewport vertices"),
                                 contents: bytemuck::cast_slice(&batch.vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
+                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                             },
                         ));
                         self.vertex_cache
@@ -447,6 +456,12 @@ impl VulkanViewport {
         // resources instead of maintaining a historical cache.
         self.bind_group_cache
             .retain(|key, _| live_bind_groups.contains(key));
+        // CPU compositor results and other procedural textures may receive a
+        // fresh Arc identity every update. Retaining those pointer-keyed
+        // uploads forever leaks one GPU texture per computed frame. Keep only
+        // texture views referenced by the frame that was just encoded.
+        self.texture_cache
+            .retain(|_, (_, view)| live_bind_groups.contains(&(Arc::as_ptr(view) as usize)));
         self.vertex_cache
             .retain(|key, _| live_vertex_buffers.contains(key));
         self.queue.submit([encoder.finish()]);
@@ -528,13 +543,37 @@ impl VulkanViewport {
         if self
             .shadow_cache
             .as_ref()
-            .is_some_and(|(cached_key, _, _)| *cached_key == key)
+            .is_some_and(|(cached_key, _, _, _, _)| *cached_key == key)
         {
-            return Arc::clone(&self.shadow_cache.as_ref().unwrap().2);
+            return Arc::clone(&self.shadow_cache.as_ref().unwrap().4);
         }
         let (resolution, depth) = shadow.map_or((1, &[f32::INFINITY][..]), |shadow| {
             (shadow.resolution as u32, shadow.depth.as_slice())
         });
+        if let Some((cached_key, width, height, texture, view)) = self.shadow_cache.as_mut()
+            && *width == resolution
+            && *height == resolution
+        {
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                bytemuck::cast_slice(depth),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(resolution * 4),
+                    rows_per_image: Some(resolution),
+                },
+                wgpu::Extent3d {
+                    width: resolution,
+                    height: resolution,
+                    depth_or_array_layers: 1,
+                },
+            );
+            *cached_key = key;
+            return Arc::clone(view);
+        }
+        self.camera_group_cache = None;
+        self.shadow_cache = None;
+        let _ = self.device.poll(wgpu::Maintain::Wait);
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
@@ -555,7 +594,7 @@ impl VulkanViewport {
             bytemuck::cast_slice(depth),
         );
         let view = Arc::new(texture.create_view(&Default::default()));
-        self.shadow_cache = Some((key, texture, Arc::clone(&view)));
+        self.shadow_cache = Some((key, resolution, resolution, texture, Arc::clone(&view)));
         view
     }
 
@@ -564,9 +603,9 @@ impl VulkanViewport {
         if self
             .point_shadow_cache
             .as_ref()
-            .is_some_and(|(cached_key, _, _)| *cached_key == key)
+            .is_some_and(|(cached_key, _, _, _, _)| *cached_key == key)
         {
-            return Arc::clone(&self.point_shadow_cache.as_ref().unwrap().2);
+            return Arc::clone(&self.point_shadow_cache.as_ref().unwrap().4);
         }
         let (width, height, depth) = atlas.map_or((1, 1, &[f32::INFINITY][..]), |atlas| {
             (
@@ -575,6 +614,31 @@ impl VulkanViewport {
                 atlas.depth.as_slice(),
             )
         });
+        if let Some((cached_key, cached_width, cached_height, texture, view)) =
+            self.point_shadow_cache.as_mut()
+            && *cached_width == width
+            && *cached_height == height
+        {
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                bytemuck::cast_slice(depth),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            *cached_key = key;
+            return Arc::clone(view);
+        }
+        self.camera_group_cache = None;
+        self.point_shadow_cache = None;
+        let _ = self.device.poll(wgpu::Maintain::Wait);
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
@@ -595,7 +659,7 @@ impl VulkanViewport {
             bytemuck::cast_slice(depth),
         );
         let view = Arc::new(texture.create_view(&Default::default()));
-        self.point_shadow_cache = Some((key, texture, Arc::clone(&view)));
+        self.point_shadow_cache = Some((key, width, height, texture, Arc::clone(&view)));
         view
     }
 }

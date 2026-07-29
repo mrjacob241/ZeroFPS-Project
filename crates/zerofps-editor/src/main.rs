@@ -468,6 +468,9 @@ enum NodeSettings {
         operation: usize,
         constant: f32,
     },
+    Algebra {
+        expression: String,
+    },
     SharpThreshold {
         threshold: f32,
     },
@@ -653,6 +656,7 @@ impl NodeSettings {
             Self::ObjectSimulator { .. } => 27,
             Self::ForceOutput { .. } => 28,
             Self::Engine { .. } => 29,
+            Self::Algebra { .. } => 30,
         }
     }
 
@@ -767,6 +771,9 @@ impl NodeSettings {
                 torque: 100.0,
                 reverse: false,
             },
+            30 => Self::Algebra {
+                expression: "x + y * z".into(),
+            },
             _ => return None,
         })
     }
@@ -796,6 +803,12 @@ struct CompositorNode {
     settings_object_name: Option<String>,
     settings: NodeSettings,
     position: Vec2,
+}
+
+enum CompositorProbeValue {
+    Image(Arc<compositor_graph::FloatImage>),
+    Number(f32),
+    Triple([f32; 3]),
 }
 
 struct PendingCompositorGraph {
@@ -846,6 +859,8 @@ struct ViewportLight {
 struct ViewportLighting {
     global_enabled: bool,
     global_shadow_resolution: u32,
+    shadow_filter_radius: usize,
+    shadow_blur_radius: usize,
     points: Vec<ViewportLight>,
     directional_shadow: Option<Arc<DirectionalShadowMap>>,
     point_shadows: Option<Arc<PointShadowAtlas>>,
@@ -861,6 +876,7 @@ struct DirectionalShadowMap {
     forward: CoreVec3,
     extent: f32,
     bias: f32,
+    filter_radius: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -868,6 +884,7 @@ struct PointShadowRegion {
     row: usize,
     resolution: usize,
     bias: f32,
+    filter_radius: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -882,6 +899,8 @@ struct PointShadowAtlas {
 struct DirectionalShadowCacheKey {
     scene_revision: u64,
     resolution: u32,
+    filter_radius: usize,
+    blur_radius: usize,
 }
 
 #[derive(Clone)]
@@ -989,16 +1008,18 @@ struct InputSample {
 }
 
 #[derive(Clone, Copy, Default)]
-struct ProcessedInput {
+struct RuntimeInputSnapshot {
     orbit: Vec2,
     pan: Vec2,
     zoom_log: f32,
     viewport_extent: f32,
+    sequence: u64,
+    captured_at: Option<Instant>,
 }
 
 struct InputWorker {
     samples: mpsc::Sender<InputSample>,
-    actions: mpsc::Receiver<ProcessedInput>,
+    latest: Arc<Mutex<RuntimeInputSnapshot>>,
 }
 
 struct ImportRequest {
@@ -1049,40 +1070,55 @@ impl AssetImportWorker {
 }
 
 impl InputWorker {
-    fn new(ctx: egui::Context) -> Self {
+    fn new(_ctx: egui::Context) -> Self {
         let (sample_sender, sample_receiver) = mpsc::channel::<InputSample>();
-        let (action_sender, actions) = mpsc::channel();
+        let latest = Arc::new(Mutex::new(RuntimeInputSnapshot::default()));
+        let worker_latest = Arc::clone(&latest);
         std::thread::Builder::new()
             .name("zerofps-input".into())
             .spawn(move || {
                 while let Ok(first) = sample_receiver.recv() {
-                    let mut processed = ProcessedInput {
+                    let mut processed = RuntimeInputSnapshot {
                         orbit: first.orbit,
                         pan: first.pan,
                         zoom_log: first.zoom_log,
                         viewport_extent: first.viewport_extent,
+                        sequence: 0,
+                        captured_at: Some(Instant::now()),
                     };
                     for sample in sample_receiver.try_iter() {
                         processed.orbit += sample.orbit;
                         processed.pan += sample.pan;
                         processed.zoom_log += sample.zoom_log;
                         processed.viewport_extent = sample.viewport_extent;
+                        processed.captured_at = Some(Instant::now());
                     }
-                    if action_sender.send(processed).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
+                    let mut latest = worker_latest
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    processed.sequence = latest.sequence.wrapping_add(1);
+                    *latest = processed;
                 }
             })
             .expect("input worker thread should start");
         Self {
             samples: sample_sender,
-            actions,
+            latest,
         }
     }
 
     fn submit(&self, sample: InputSample) {
         let _ = self.samples.send(sample);
+    }
+
+    /// Samples the latest coalesced input without consuming it. The compiled-game
+    /// runtime will read this once per simulation tick.
+    #[allow(dead_code)]
+    fn snapshot(&self) -> RuntimeInputSnapshot {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -1116,17 +1152,25 @@ impl DisplayWorker {
                     let queue_wait = job.queued_at.elapsed();
                     let mut job = job;
                     let shadow_prepare_started = Instant::now();
+                    // Rendering policy: preserve temporal continuity. People tolerate reduced
+                    // spatial detail much better than flicker, uneven frame pacing, or shadow
+                    // updates that visibly lag behind motion. Reuse an exact cached map, but
+                    // never skip a changed map merely to meet a frame budget.
                     if job.lighting.global_enabled && job.lighting.global_shadow_resolution > 0 {
                         let key = DirectionalShadowCacheKey {
                             scene_revision: job.key.scene_revision,
                             resolution: job.lighting.global_shadow_resolution,
+                            filter_radius: job.lighting.shadow_filter_radius,
+                            blur_radius: job.lighting.shadow_blur_radius,
                         };
                         let shadow = match directional_shadow_cache.as_ref() {
                             Some((cached_key, shadow)) if *cached_key == key => Arc::clone(shadow),
                             _ => {
-                                let shadow = Arc::new(build_directional_shadow_map(
+                                let shadow = Arc::new(build_directional_shadow_map_with_blur(
                                     &job.triangles,
                                     key.resolution as usize,
+                                    key.filter_radius,
+                                    key.blur_radius,
                                 ));
                                 directional_shadow_cache = Some((key, Arc::clone(&shadow)));
                                 shadow
@@ -1136,7 +1180,19 @@ impl DisplayWorker {
                     } else {
                         job.lighting.directional_shadow = None;
                     }
-                    let point_shadow_key = job.key.scene_revision;
+                    let point_shadow_key = job.lighting.points.iter().fold(
+                        job.key.scene_revision
+                            ^ (job.lighting.shadow_filter_radius as u64).rotate_left(17),
+                        |key, light| {
+                            key.rotate_left(7)
+                                ^ light.shadow_resolution as u64
+                                ^ (light.position.x.to_bits() as u64).rotate_left(11)
+                                ^ (light.position.y.to_bits() as u64).rotate_left(23)
+                                ^ (light.position.z.to_bits() as u64).rotate_left(37)
+                        },
+                    );
+                    let point_shadow_key =
+                        point_shadow_key ^ (job.lighting.shadow_blur_radius as u64).rotate_left(29);
                     if job
                         .lighting
                         .points
@@ -1148,9 +1204,11 @@ impl DisplayWorker {
                                 Arc::clone(atlas)
                             }
                             _ => {
-                                let atlas = Arc::new(build_point_shadow_atlas(
+                                let atlas = Arc::new(build_point_shadow_atlas_with_blur(
                                     &job.triangles,
                                     &job.lighting.points,
+                                    job.lighting.shadow_filter_radius,
+                                    job.lighting.shadow_blur_radius,
                                 ));
                                 point_shadow_cache = Some((point_shadow_key, Arc::clone(&atlas)));
                                 atlas
@@ -1187,9 +1245,8 @@ impl DisplayWorker {
                             let prepare_started = Instant::now();
                             // A compositor result can change the packed material
                             // vertices without changing geometry/scene state.
-                            // Key the persistent vertex buffer by both revisions;
-                            // otherwise rotating the object (scene revision) is
-                            // the first action that repairs stale lighting.
+                            // Repack when scene or texture contents change, but
+                            // keep stable per-batch GPU buffer identities.
                             let batch_revision =
                                 job.key.scene_revision ^ job.key.texture_revision.rotate_left(29);
                             let batches = match vulkan_batch_cache.as_ref() {
@@ -1199,10 +1256,7 @@ impl DisplayWorker {
                                     Arc::clone(batches)
                                 }
                                 _ => {
-                                    let batches = Arc::new(build_vulkan_batches(
-                                        &job.triangles,
-                                        batch_revision,
-                                    ));
+                                    let batches = Arc::new(build_vulkan_batches(&job.triangles));
                                     vulkan_batch_cache =
                                         Some((batch_revision, Arc::clone(&batches)));
                                     batches
@@ -1291,10 +1345,7 @@ impl DisplayWorker {
     }
 }
 
-fn build_vulkan_batches(
-    triangles: &[PreviewTriangle],
-    scene_revision: u64,
-) -> Vec<vulkan_viewport::GpuBatch> {
+fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::GpuBatch> {
     let mut groups: HashMap<usize, vulkan_viewport::GpuBatch> = HashMap::new();
     for triangle in triangles {
         let key = triangle
@@ -1311,7 +1362,12 @@ fn build_vulkan_batches(
         let batch = groups
             .entry(key)
             .or_insert_with(|| vulkan_viewport::GpuBatch {
-                cache_key: scene_revision ^ 0x9e37_79b9_7f4a_7c15,
+                cache_key: triangle
+                    .source_texture
+                    .as_ref()
+                    .map(|texture| Arc::as_ptr(texture) as u64)
+                    .unwrap_or(0)
+                    ^ 0x9e37_79b9_7f4a_7c15,
                 texture: triangle.texture.clone(),
                 gpu_texture: triangle.gpu_texture.clone(),
                 vertices: Vec::new(),
@@ -1319,20 +1375,8 @@ fn build_vulkan_batches(
         batch.cache_key = batch.cache_key.rotate_left(7)
             ^ triangle.object_id.slot as u64
             ^ ((triangle.object_id.generation as u64) << 32)
-            ^ triangle.vertices[0].local_position[0].to_bits() as u64
-            ^ ((triangle.vertices[0].local_position[1].to_bits() as u64) << 32)
-            ^ triangle.vertices[0].local_position[2].to_bits() as u64
-            ^ ((triangle.base_color[0].to_bits() as u64) << 1)
-            ^ ((triangle.base_color[1].to_bits() as u64) << 9)
-            ^ ((triangle.base_color[2].to_bits() as u64) << 17)
-            ^ ((triangle.base_color[3].to_bits() as u64) << 25)
-            ^ ((triangle.shader as u64) << 48)
-            ^ ((triangle.transmission.to_bits() as u64) << 32)
-            ^ ((triangle
-                .gpu_texture
-                .as_ref()
-                .is_some_and(|image| image.encoded_srgb) as u64)
-                << 63);
+            ^ ((triangle.vertices[0].uv[0].to_bits() as u64) << 1)
+            ^ ((triangle.vertices[0].uv[1].to_bits() as u64) << 33);
         let local_positions = triangle.vertices.map(|vertex| {
             CoreVec3::new(
                 vertex.local_position[0],
@@ -1420,6 +1464,9 @@ struct DepthCacheKey {
     scene_revision: u64,
     texture_revision: u64,
     global_light_enabled: bool,
+    global_shadow_resolution: u32,
+    shadow_quality: usize,
+    shadow_blur_radius: usize,
     show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
@@ -1498,6 +1545,10 @@ struct EditorApp {
     advanced: bool,
     global_light_enabled: bool,
     global_shadow_resolution: u32,
+    shadow_quality: usize,
+    shadow_blur_radius: usize,
+    target_fps: u32,
+    next_viewport_frame: Instant,
     show_grid: bool,
     grid_spacing: f32,
     snap: bool,
@@ -1630,6 +1681,10 @@ impl EditorApp {
             advanced: false,
             global_light_enabled: true,
             global_shadow_resolution: 512,
+            shadow_quality: 3,
+            shadow_blur_radius: 1,
+            target_fps: 60,
+            next_viewport_frame: Instant::now(),
             show_grid: true,
             grid_spacing: 1.0,
             snap: false,
@@ -2638,6 +2693,12 @@ impl EditorApp {
                 "editor.global_shadow_resolution",
                 self.global_shadow_resolution.to_string(),
             ),
+            ("editor.shadow_quality", self.shadow_quality.to_string()),
+            (
+                "editor.shadow_blur_radius",
+                self.shadow_blur_radius.to_string(),
+            ),
+            ("editor.target_fps", self.target_fps.to_string()),
             ("editor.camera_yaw", self.camera_yaw.to_string()),
             ("editor.camera_pitch", self.camera_pitch.to_string()),
             ("editor.camera_zoom", self.camera_zoom.to_string()),
@@ -2896,6 +2957,12 @@ impl EditorApp {
                     project.project.properties.insert(
                         format!("compositor.node.{id}.math_constant"),
                         constant.to_string(),
+                    );
+                }
+                NodeSettings::Algebra { expression } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.algebra_expression"),
+                        expression.clone(),
                     );
                 }
                 NodeSettings::SharpThreshold { threshold } => {
@@ -3267,6 +3334,22 @@ impl EditorApp {
         {
             self.global_shadow_resolution = sanitize_shadow_resolution(value);
         }
+        self.shadow_quality = properties
+            .get("editor.shadow_quality")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(self.shadow_quality)
+            .min(4);
+        self.shadow_blur_radius = properties
+            .get("editor.shadow_blur_radius")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(self.shadow_blur_radius)
+            .min(4);
+        self.target_fps = properties
+            .get("editor.target_fps")
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(sanitize_target_fps)
+            .unwrap_or(self.target_fps);
+        self.next_viewport_frame = Instant::now();
         self.camera_yaw = number("editor.camera_yaw").unwrap_or(self.camera_yaw);
         self.camera_pitch = number("editor.camera_pitch").unwrap_or(self.camera_pitch);
         self.camera_zoom = number("editor.camera_zoom")
@@ -3729,6 +3812,12 @@ impl EditorApp {
                             .and_then(|value| value.parse().ok())
                             .unwrap_or(false),
                     },
+                    30 => NodeSettings::Algebra {
+                        expression: properties
+                            .get(&format!("compositor.node.{id}.algebra_expression"))
+                            .cloned()
+                            .unwrap_or_else(|| "x + y * z".into()),
+                    },
                     _ => continue,
                 };
                 let legacy_graph_index = properties
@@ -4043,6 +4132,32 @@ impl EditorApp {
                     });
                 ui.label("Fallback value");
                 changed |= ui.add(egui::DragValue::new(constant).speed(0.01)).changed();
+            }
+            30 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Algebra { ref mut expression } =
+                    self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Expression");
+                changed |= ui.text_edit_singleline(expression).changed();
+                ui.small("Variables: x, y, z");
+                match compositor_graph::compile_algebra_expression(expression) {
+                    Ok(program) => {
+                        ui.small(
+                            RichText::new(format!("Valid · {} operations", program.len()))
+                                .color(Color32::from_rgb(100, 190, 125)),
+                        );
+                    }
+                    Err(error) => {
+                        ui.small(RichText::new(error).color(Color32::from_rgb(225, 105, 95)));
+                    }
+                }
             }
             5 => {
                 let pos = self
@@ -4431,24 +4546,13 @@ impl EditorApp {
             }
             16 => {
                 ui.label("Live input preview");
-                let preview = self
-                    .compositor_input_source(node_id, 0)
-                    .and_then(|(source_id, output)| {
-                        self.compile_compositor_preview(
-                            source_id,
-                            output,
-                            self.compositor_next_generation,
-                            self.compositor_lod_max_dimension.min(1024),
-                        )
-                        .map_err(|error| error.to_string())
-                    })
-                    .and_then(|graph| {
-                        CpuGraphExecutor
-                            .execute(&graph)
-                            .map_err(|error| error.to_string())
-                    });
+                let preview =
+                    self.compositor_input_source(node_id, 0)
+                        .and_then(|(source_id, output)| {
+                            self.probe_compositor_node(source_id, output, &mut BTreeSet::new())
+                        });
                 match preview {
-                    Ok(texture) => {
+                    Ok(CompositorProbeValue::Image(texture)) => {
                         let display = texture.to_texture_asset_clamped();
                         let image = ColorImage::from_rgba_unmultiplied(
                             [display.width as usize, display.height as usize],
@@ -4480,6 +4584,18 @@ impl EditorApp {
                                 texture.pixels[3],
                             ));
                         }
+                    }
+                    Ok(CompositorProbeValue::Number(value)) => {
+                        self.compositor_debug_textures.remove(&node_id);
+                        ui.strong("Number");
+                        ui.monospace(format!("{value:.6}"));
+                    }
+                    Ok(CompositorProbeValue::Triple(values)) => {
+                        self.compositor_debug_textures.remove(&node_id);
+                        ui.strong("XYZ triple");
+                        ui.monospace(format!("X  {:.6}", values[0]));
+                        ui.monospace(format!("Y  {:.6}", values[1]));
+                        ui.monospace(format!("Z  {:.6}", values[2]));
                     }
                     Err(message) => {
                         self.compositor_debug_textures.remove(&node_id);
@@ -5139,6 +5255,77 @@ impl EditorApp {
                             RenderDevice::Cpu => "Portable reference renderer + compositor",
                         });
                         ui.separator();
+                        ui.strong("Render");
+                        ui.collapsing("Shadows", |ui| {
+                        let previous_quality = self.shadow_quality;
+                        egui::ComboBox::from_id_salt("settings_shadow_quality")
+                            .selected_text(format!(
+                                "Shadow quality: {}",
+                                shadow_quality_label(self.shadow_quality)
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (quality, label) in [
+                                    (0, "Potato"),
+                                    (1, "Low"),
+                                    (2, "Medium"),
+                                    (3, "High"),
+                                    (4, "Ultra"),
+                                ] {
+                                    ui.selectable_value(&mut self.shadow_quality, quality, label);
+                                }
+                            });
+                        if self.shadow_quality != previous_quality {
+                            self.viewport_requested_key = None;
+                            self.project_dirty = true;
+                        }
+                        ui.small("Downsamples all shadow maps, then filters their reconstruction.");
+                        let previous_blur = self.shadow_blur_radius;
+                        egui::ComboBox::from_id_salt("settings_shadow_blur")
+                            .selected_text(match self.shadow_blur_radius {
+                                0 => "Fast blur: Off".into(),
+                                radius => format!("Fast blur: {radius} px"),
+                            })
+                            .show_ui(ui, |ui| {
+                                for (radius, label) in [
+                                    (0, "Off"),
+                                    (1, "1 px"),
+                                    (2, "2 px"),
+                                    (3, "3 px"),
+                                    (4, "4 px"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.shadow_blur_radius,
+                                        radius,
+                                        label,
+                                    );
+                                }
+                            });
+                        if self.shadow_blur_radius != previous_blur {
+                            self.viewport_requested_key = None;
+                            self.project_dirty = true;
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small("Continuous shadows · reduce spatial quality before temporal quality.");
+                            let previous_fps = self.target_fps;
+                            egui::ComboBox::from_id_salt("settings_target_fps")
+                                .selected_text(format!("Target: {} FPS", self.target_fps))
+                                .show_ui(ui, |ui| {
+                                    for fps in [30, 45, 60, 75, 90, 120, 144, 165, 240] {
+                                        ui.selectable_value(
+                                            &mut self.target_fps,
+                                            fps,
+                                            format!("{fps} FPS"),
+                                        );
+                                    }
+                                });
+                            if self.target_fps != previous_fps {
+                                self.target_fps = sanitize_target_fps(self.target_fps);
+                                self.next_viewport_frame = Instant::now();
+                                self.project_dirty = true;
+                            }
+                        });
+                        });
+                        ui.separator();
                         ui.strong("Viewport");
                         ui.checkbox(&mut self.show_grid, "Show grid");
                         egui::ComboBox::from_id_salt("global_shadow_resolution")
@@ -5164,7 +5351,7 @@ impl EditorApp {
                                         )
                                         .changed()
                                     {
-                                        self.scene_revision = self.scene_revision.wrapping_add(1);
+                                        self.viewport_requested_key = None;
                                         self.project_dirty = true;
                                     }
                                 }
@@ -5459,6 +5646,7 @@ impl EditorApp {
                             let mut transform = node.local_transform();
                             let previous = self.scene.tree.clone();
                             let mut changed = false;
+                            let mut lighting_only_changed = false;
                             let kind = self.scene.kind(id);
                             let model_asset =
                                 node.components
@@ -5667,7 +5855,7 @@ impl EditorApp {
                                         *stored_radius = radius.max(0.0);
                                         *stored_shadow_resolution = *shadow_resolution;
                                     }
-                                    changed = true;
+                                    lighting_only_changed = true;
                                 }
                             }
                             egui::CollapsingHeader::new(RichText::new("Mesh Renderer").strong())
@@ -6602,6 +6790,14 @@ impl EditorApp {
                             }
                             if changed {
                                 self.record_undo(previous);
+                            } else if lighting_only_changed {
+                                self.undo_stack.push(previous);
+                                if self.undo_stack.len() > 100 {
+                                    self.undo_stack.remove(0);
+                                }
+                                self.redo_stack.clear();
+                                self.project_dirty = true;
+                                self.viewport_requested_key = None;
                             }
                             ui.add_space(10.0);
                             ui.add_sized(
@@ -6923,7 +7119,10 @@ impl EditorApp {
                             color: *color,
                             intensity: intensity.max(0.0),
                             radius: radius.max(0.0),
-                            shadow_resolution: *shadow_resolution,
+                            shadow_resolution: effective_shadow_resolution(
+                                *shadow_resolution,
+                                self.shadow_quality,
+                            ),
                         }),
                         _ => None,
                     })
@@ -6932,7 +7131,12 @@ impl EditorApp {
             .collect();
         ViewportLighting {
             global_enabled: self.global_light_enabled,
-            global_shadow_resolution: self.global_shadow_resolution,
+            global_shadow_resolution: effective_shadow_resolution(
+                self.global_shadow_resolution,
+                self.shadow_quality,
+            ),
+            shadow_filter_radius: shadow_filter_radius(self.shadow_quality),
+            shadow_blur_radius: self.shadow_blur_radius,
             points,
             directional_shadow: None,
             point_shadows: None,
@@ -7209,6 +7413,112 @@ impl EditorApp {
         }
     }
 
+    fn probe_compositor_node(
+        &mut self,
+        node_id: usize,
+        output: usize,
+        visiting: &mut BTreeSet<usize>,
+    ) -> Result<CompositorProbeValue, String> {
+        if !visiting.insert(node_id) {
+            return Err("probe found a compositor cycle".into());
+        }
+        let settings = self
+            .compositor_nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .map(|node| node.settings.clone())
+            .ok_or_else(|| "probe source no longer exists".to_owned())?;
+        let result = match settings {
+            NodeSettings::ConstantValue { value, .. } => Ok(CompositorProbeValue::Number(value)),
+            NodeSettings::ObjectHandle { .. } => self
+                .resolve_object_handle_value(node_id)
+                .map(CompositorProbeValue::Number)
+                .ok_or_else(|| "Object Handle has a copy cycle or missing source".into()),
+            NodeSettings::Time { scale, modulus, .. } => {
+                Ok(CompositorProbeValue::Number(scaled_modulated_time(
+                    self.compositor_clock_started.elapsed().as_secs_f32(),
+                    scale,
+                    modulus,
+                )))
+            }
+            NodeSettings::Position { .. } | NodeSettings::Rotation { .. } => self
+                .transform_vector_value(node_id)
+                .map(|(values, _)| CompositorProbeValue::Triple(values))
+                .ok_or_else(|| "could not evaluate the XYZ value".into()),
+            NodeSettings::Algebra { expression } => {
+                let program = compositor_graph::compile_algebra_expression(&expression)?;
+                let mut inputs = Vec::with_capacity(3);
+                for index in 0..3 {
+                    inputs.push(
+                        self.compositor_input_source(node_id, index)
+                            .ok()
+                            .map(|(source, source_output)| {
+                                self.probe_compositor_node(source, source_output, visiting)
+                            })
+                            .transpose()?,
+                    );
+                }
+                if inputs
+                    .iter()
+                    .flatten()
+                    .any(|value| matches!(value, CompositorProbeValue::Image(_)))
+                {
+                    let graph = self
+                        .compile_compositor_preview(
+                            node_id,
+                            output,
+                            self.compositor_next_generation,
+                            self.compositor_lod_max_dimension.min(1024),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    CpuGraphExecutor::default()
+                        .execute(&graph)
+                        .map(CompositorProbeValue::Image)
+                        .map_err(|error| error.to_string())
+                } else if inputs
+                    .iter()
+                    .flatten()
+                    .any(|value| matches!(value, CompositorProbeValue::Triple(_)))
+                {
+                    let mut result = [0.0; 3];
+                    for component in 0..3 {
+                        let variables = std::array::from_fn(|index| match &inputs[index] {
+                            Some(CompositorProbeValue::Triple(values)) => values[component],
+                            Some(CompositorProbeValue::Number(value)) => *value,
+                            _ => 0.0,
+                        });
+                        result[component] =
+                            compositor_graph::evaluate_algebra_program(&program, variables)?;
+                    }
+                    Ok(CompositorProbeValue::Triple(result))
+                } else {
+                    let variables = std::array::from_fn(|index| match &inputs[index] {
+                        Some(CompositorProbeValue::Number(value)) => *value,
+                        _ => 0.0,
+                    });
+                    compositor_graph::evaluate_algebra_program(&program, variables)
+                        .map(CompositorProbeValue::Number)
+                }
+            }
+            _ => {
+                let graph = self
+                    .compile_compositor_preview(
+                        node_id,
+                        output,
+                        self.compositor_next_generation,
+                        self.compositor_lod_max_dimension.min(1024),
+                    )
+                    .map_err(|error| error.to_string())?;
+                CpuGraphExecutor::default()
+                    .execute(&graph)
+                    .map(CompositorProbeValue::Image)
+                    .map_err(|error| error.to_string())
+            }
+        };
+        visiting.remove(&node_id);
+        result
+    }
+
     fn scalar_node_value(
         &mut self,
         node_id: usize,
@@ -7232,6 +7542,12 @@ impl EditorApp {
                 scale,
                 modulus,
             )),
+            NodeSettings::Algebra { .. } => {
+                match self.probe_compositor_node(node_id, output, &mut BTreeSet::new()) {
+                    Ok(CompositorProbeValue::Number(value)) => Some(value),
+                    _ => None,
+                }
+            }
             _ => {
                 let mut texture_visiting = BTreeSet::new();
                 self.evaluate_compositor_node(node_id, output, &mut texture_visiting)
@@ -7569,6 +7885,16 @@ impl EditorApp {
                     operation,
                     constant,
                 )))
+            }
+            NodeSettings::Algebra { expression } => {
+                let program = compositor_graph::compile_algebra_expression(&expression)?;
+                let mut inputs: [Option<Arc<TextureAsset>>; 3] = [None, None, None];
+                for (index, target) in inputs.iter_mut().enumerate() {
+                    if let Ok((from_id, from_out)) = self.compositor_input_source(node_id, index) {
+                        *target = Some(self.evaluate_compositor_node(from_id, from_out, visiting)?);
+                    }
+                }
+                Ok(Arc::new(apply_compositor_algebra(&inputs, &program)))
             }
             NodeSettings::SharpThreshold { .. }
             | NodeSettings::SmoothThreshold { .. }
@@ -9536,7 +9862,7 @@ impl EditorApp {
                             }
                         });
                         ui.menu_button("Converter", |ui| {
-                            for (index, label) in [(4, "Texture Math"), (9, "Texture Combine"), (5, "Sharp Threshold"), (6, "Smooth Threshold")] {
+                            for (index, label) in [(4, "Texture Math"), (30, "Algebra"), (9, "Texture Combine"), (5, "Sharp Threshold"), (6, "Smooth Threshold")] {
                                 if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
@@ -9657,7 +9983,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 30] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 31] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -9704,12 +10030,13 @@ impl EditorApp {
                         "Object Output",
                         Color32::from_rgb(190, 93, 47),
                     ),
+                    ("Algebra", "Converter", Color32::from_rgb(105, 112, 122)),
                 ];
-                let node_heights_by_kind: [f32; 30] = [
+                let node_heights_by_kind: [f32; 31] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
                     175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
                     285.0, 235.0, 245.0, 285.0, 190.0,
-                    205.0, 205.0, 360.0, 210.0, 190.0,
+                    205.0, 205.0, 360.0, 210.0, 190.0, 190.0,
                 ];
                 let node_width = 230.0;
 
@@ -10312,6 +10639,22 @@ impl EditorApp {
         }
     }
 
+    fn apply_editor_camera_input(&mut self, input: InputSample) {
+        self.camera_yaw += input.orbit.x * 0.002;
+        self.camera_pitch = (self.camera_pitch + input.orbit.y * 0.002).clamp(-1.2, 1.2);
+        self.camera_zoom = (self.camera_zoom * input.zoom_log.exp()).clamp(0.001, 100.0);
+        if input.pan != Vec2::ZERO {
+            let pixels_per_unit = input.viewport_extent * 0.18 * self.camera_zoom;
+            self.camera_target = pan_camera_target(
+                self.camera_target,
+                input.pan,
+                pixels_per_unit,
+                self.camera_yaw,
+                self.camera_pitch,
+            );
+        }
+    }
+
     fn viewport(&mut self, ctx: &egui::Context) {
         if self.active_tool == Tool::TexturePaint
             && let Some(id) = self.scene.selected
@@ -10371,23 +10714,6 @@ impl EditorApp {
                 let available = ui.available_size();
                 let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
                 self.viewport_focused = response.hovered();
-                while let Ok(input) = self.input_worker.actions.try_recv() {
-                    self.camera_yaw += input.orbit.x * 0.002;
-                    self.camera_pitch =
-                        (self.camera_pitch + input.orbit.y * 0.002).clamp(-1.2, 1.2);
-                    self.camera_zoom =
-                        (self.camera_zoom * input.zoom_log.exp()).clamp(0.001, 100.0);
-                    if input.pan != Vec2::ZERO {
-                        let pixels_per_unit = input.viewport_extent * 0.18 * self.camera_zoom;
-                        self.camera_target = pan_camera_target(
-                            self.camera_target,
-                            input.pan,
-                            pixels_per_unit,
-                            self.camera_yaw,
-                            self.camera_pitch,
-                        );
-                    }
-                }
                 let pointer_delta = ui.input(|input| input.pointer.delta());
                 if matches!(self.active_tool, Tool::FieldPaint | Tool::TexturePaint) {
                     let (pointer, pressed, down, released) = ui.input(|input| {
@@ -10487,17 +10813,32 @@ impl EditorApp {
                     0.0
                 };
                 if orbit != Vec2::ZERO || pan != Vec2::ZERO || zoom_log != 0.0 {
-                    self.input_worker.submit(InputSample {
+                    let sample = InputSample {
                         orbit,
                         pan,
                         zoom_log,
                         viewport_extent: response.rect.width().min(response.rect.height()),
-                    });
+                    };
+                    self.apply_editor_camera_input(sample);
+                    self.input_worker.submit(sample);
                 }
                 self.schedule_compositor_lod_update(ctx);
                 self.refresh_preview_cache();
                 let preview = Arc::clone(&self.cached_preview);
                 let lighting = self.viewport_lighting(&preview);
+                let frame_now = Instant::now();
+                let viewport_frame_due = frame_now >= self.next_viewport_frame;
+                if viewport_frame_due {
+                    self.next_viewport_frame = advance_frame_deadline(
+                        self.next_viewport_frame,
+                        frame_now,
+                        self.target_fps,
+                    );
+                }
+                ctx.request_repaint_after(
+                    self.next_viewport_frame
+                        .saturating_duration_since(Instant::now()),
+                );
                 let viewport_texture = {
                     let key = DepthCacheKey {
                         size: [
@@ -10513,6 +10854,9 @@ impl EditorApp {
                         scene_revision: self.scene_revision,
                         texture_revision: self.texture_revision,
                         global_light_enabled: self.global_light_enabled,
+                        global_shadow_resolution: self.global_shadow_resolution,
+                        shadow_quality: self.shadow_quality,
+                        shadow_blur_radius: self.shadow_blur_radius,
                         show_grid: self.show_grid,
                         mode: self.viewport_mode,
                         tool: self.active_tool,
@@ -10604,6 +10948,7 @@ impl EditorApp {
                     }
                     if self.viewport_depth_key != Some(key)
                         && self.viewport_requested_key != Some(key)
+                        && viewport_frame_due
                     {
                         self.display_worker.submit_latest(RenderJob {
                             key,
@@ -10725,15 +11070,16 @@ impl EditorApp {
                                 RenderDevice::Cpu => self.performance.viewport_cpu,
                             };
                             let fps = if timing.latest_ms > f64::EPSILON {
-                                1_000.0 / timing.latest_ms
+                                (1_000.0 / timing.latest_ms).min(self.target_fps as f64)
                             } else {
                                 0.0
                             };
                             ui.small(format!(
-                                "{} viewport {:.2} ms  •  {:.1} FPS",
+                                "{} viewport {:.2} ms  •  {:.1} FPS ({} cap)",
                                 self.render_device.label(),
                                 timing.latest_ms,
-                                fps
+                                fps,
+                                self.target_fps
                             ));
                             ui.separator();
                             ui.small(if self.viewport_focused {
@@ -11260,7 +11606,7 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
             }
         }
         13 => 4,
-        17 | 25 | 26 | 28 => 3,
+        17 | 25 | 26 | 28 | 30 => 3,
         18 => 1,
         22 => 3,
         23 => 1,
@@ -11273,7 +11619,7 @@ fn compositor_input_socket_y(kind: usize, input: usize) -> f32 {
     match kind {
         9 => 85.0 + input as f32 * 30.0,
         13 => 75.0 + input as f32 * 22.0,
-        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 => 74.0 + input as f32 * 26.0,
+        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 | 30 => 74.0 + input as f32 * 26.0,
         _ => 70.0,
     }
 }
@@ -11335,6 +11681,7 @@ fn compositor_input_label(kind: usize, input: usize) -> &'static str {
         27 => ["Initial Position", "Initial Rotation"][input],
         28 => ["X", "Y", "Z"][input],
         29 => ["Throttle", "Torque"][input],
+        30 => ["X", "Y", "Z"][input],
         _ => "Input",
     }
 }
@@ -11351,7 +11698,7 @@ fn compositor_output_label(kind: usize, output: usize) -> &'static str {
         26 => "Rotation",
         27 => ["Position", "Rotation"][output],
         0 | 1 | 7 | 8 | 9 | 10 | 12 | 13 | 19 => "Texture",
-        3 | 4 | 5 | 6 | 14 | 15 => "Value",
+        3 | 4 | 5 | 6 | 14 | 15 | 30 => "Value",
         2 => "Value / Color",
         16 => "Preview",
         _ => "Output",
@@ -11390,6 +11737,7 @@ fn compositor_node_description(kind: usize) -> &'static str {
         27 => "Runs fixed-step rigid position and rotation simulation.",
         28 => "Collects an object's force and propagates it to simulated ancestors.",
         29 => "Drives an Engine cylinder around its local Z axle.",
+        30 => "Evaluates an algebraic expression using up to three inputs.",
         _ => "Node",
     }
 }
@@ -11518,6 +11866,55 @@ fn combine_compositor_textures(
     }
     TextureAsset {
         name: "compositor-combine".into(),
+        width,
+        height,
+        pixels,
+    }
+}
+
+fn apply_compositor_algebra(
+    inputs: &[Option<Arc<TextureAsset>>; 3],
+    program: &[compositor_graph::AlgebraInstruction],
+) -> TextureAsset {
+    let width = inputs
+        .iter()
+        .flatten()
+        .map(|texture| texture.width)
+        .max()
+        .unwrap_or(1);
+    let height = inputs
+        .iter()
+        .flatten()
+        .map(|texture| texture.height)
+        .max()
+        .unwrap_or(1);
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let uv = [
+                (x as f32 + 0.5) / width as f32,
+                (y as f32 + 0.5) / height as f32,
+            ];
+            let samples = inputs.each_ref().map(|input| {
+                input
+                    .as_deref()
+                    .map(|texture| sample_texture_nearest(texture, uv))
+                    .unwrap_or([0.0; 4])
+            });
+            for channel in 0..4 {
+                let variables = [
+                    samples[0][channel],
+                    samples[1][channel],
+                    samples[2][channel],
+                ];
+                let value =
+                    compositor_graph::evaluate_algebra_program(program, variables).unwrap_or(0.0);
+                pixels.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+    }
+    TextureAsset {
+        name: "compositor-algebra".into(),
         width,
         height,
         pixels,
@@ -13093,9 +13490,54 @@ fn sanitize_shadow_resolution(value: u32) -> u32 {
     }
 }
 
+fn sanitize_target_fps(value: u32) -> u32 {
+    value.clamp(15, 360)
+}
+
+fn target_frame_period(target_fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / sanitize_target_fps(target_fps) as f64)
+}
+
+fn advance_frame_deadline(deadline: Instant, now: Instant, target_fps: u32) -> Instant {
+    let period = target_frame_period(target_fps);
+    if deadline > now {
+        return deadline;
+    }
+    let elapsed = now.saturating_duration_since(deadline);
+    let missed_periods = (elapsed.as_secs_f64() / period.as_secs_f64()).floor() as u32;
+    deadline + period * missed_periods.saturating_add(1)
+}
+
+fn shadow_quality_label(quality: usize) -> &'static str {
+    ["Potato", "Low", "Medium", "High", "Ultra"][quality.min(4)]
+}
+
+fn effective_shadow_resolution(requested: u32, quality: usize) -> u32 {
+    if requested == 0 {
+        return 0;
+    }
+    let divisor = [4, 2, 4, 1, 1][quality.min(4)];
+    let numerator = [1, 1, 3, 1, 1][quality.min(4)];
+    (requested.saturating_mul(numerator) / divisor).max(32)
+}
+
+fn shadow_filter_radius(quality: usize) -> usize {
+    [2, 2, 1, 1, 2][quality.min(4)]
+}
+
 fn build_directional_shadow_map(
     triangles: &[PreviewTriangle],
     resolution: usize,
+    filter_radius: usize,
+) -> DirectionalShadowMap {
+    build_directional_shadow_map_with_blur(triangles, resolution, filter_radius, 0)
+}
+
+fn build_directional_shadow_map_with_blur(
+    triangles: &[PreviewTriangle],
+    resolution: usize,
+    filter_radius: usize,
+    blur_radius: usize,
 ) -> DirectionalShadowMap {
     let resolution = resolution.clamp(1, 2048);
     let direction = global_light_direction();
@@ -13128,6 +13570,7 @@ fn build_directional_shadow_map(
             forward,
             extent: 1.0,
             bias: 1.0e-3,
+            filter_radius,
         };
     }
     let origin = (minimum + maximum) * 0.5;
@@ -13149,6 +13592,7 @@ fn build_directional_shadow_map(
         forward,
         extent,
         bias: (extent * 2.0 / resolution as f32).max(1.0e-5) * 1.5,
+        filter_radius,
     };
     for triangle in triangles.iter().filter(|triangle| triangle.casts_shadows) {
         let projected = triangle.vertices.map(|vertex| {
@@ -13166,7 +13610,74 @@ fn build_directional_shadow_map(
         });
         rasterize_shadow_triangle(&mut map.depth, resolution, projected);
     }
+    fast_blur_shadow_region(
+        &mut map.depth,
+        resolution,
+        resolution,
+        0,
+        0,
+        resolution,
+        resolution,
+        blur_radius,
+    );
     map
+}
+
+fn fast_blur_shadow_region(
+    depth: &mut [f32],
+    stride: usize,
+    full_height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+) {
+    let radius = radius.min(4);
+    if radius == 0 || width == 0 || height == 0 || depth.len() < stride * full_height {
+        return;
+    }
+    let mut scratch = vec![f32::INFINITY; width * height];
+    for y in origin_y..origin_y + height {
+        for x in origin_x..origin_x + width {
+            let center = depth[y * stride + x];
+            if !center.is_finite() {
+                continue;
+            }
+            let mut total = 0.0;
+            let mut samples = 0;
+            for sample_x in
+                x.saturating_sub(radius).max(origin_x)..=(x + radius).min(origin_x + width - 1)
+            {
+                let sample = depth[y * stride + sample_x];
+                if sample.is_finite() {
+                    total += sample;
+                    samples += 1;
+                }
+            }
+            scratch[(y - origin_y) * width + x - origin_x] = total / samples.max(1) as f32;
+        }
+    }
+    for y in origin_y..origin_y + height {
+        for x in origin_x..origin_x + width {
+            let center = scratch[(y - origin_y) * width + x - origin_x];
+            if !center.is_finite() {
+                continue;
+            }
+            let mut total = 0.0;
+            let mut samples = 0;
+            for sample_y in
+                y.saturating_sub(radius).max(origin_y)..=(y + radius).min(origin_y + height - 1)
+            {
+                let sample = scratch[(sample_y - origin_y) * width + x - origin_x];
+                if sample.is_finite() {
+                    total += sample;
+                    samples += 1;
+                }
+            }
+            depth[y * stride + x] = total / samples.max(1) as f32;
+        }
+    }
 }
 
 fn rasterize_shadow_triangle(depth: &mut [f32], resolution: usize, vertices: [(Pos2, f32); 3]) {
@@ -13238,8 +13749,9 @@ fn directional_shadow_visibility(
     let center_y = (v * map.resolution as f32).floor() as isize;
     let mut visible = 0.0;
     let mut samples = 0.0;
-    for offset_y in -1..=1 {
-        for offset_x in -1..=1 {
+    let radius = map.filter_radius as isize;
+    for offset_y in -radius..=radius {
+        for offset_x in -radius..=radius {
             let x = center_x + offset_x;
             let y = center_y + offset_y;
             if x < 0 || y < 0 || x >= map.resolution as isize || y >= map.resolution as isize {
@@ -13295,6 +13807,16 @@ fn cube_shadow_coordinate(direction: CoreVec3) -> (usize, f32, f32) {
 fn build_point_shadow_atlas(
     triangles: &[PreviewTriangle],
     lights: &[ViewportLight],
+    filter_radius: usize,
+) -> PointShadowAtlas {
+    build_point_shadow_atlas_with_blur(triangles, lights, filter_radius, 0)
+}
+
+fn build_point_shadow_atlas_with_blur(
+    triangles: &[PreviewTriangle],
+    lights: &[ViewportLight],
+    filter_radius: usize,
+    blur_radius: usize,
 ) -> PointShadowAtlas {
     let mut regions = [PointShadowRegion::default(); MAX_VIEWPORT_LIGHTS];
     let max_resolution = lights
@@ -13328,6 +13850,7 @@ fn build_point_shadow_atlas(
             row,
             resolution,
             bias,
+            filter_radius,
         };
         for face in 0..6 {
             let (forward, right, up) = cube_face_basis(face);
@@ -13362,6 +13885,16 @@ fn build_point_shadow_atlas(
                     );
                 }
             }
+            fast_blur_shadow_region(
+                &mut atlas.depth,
+                width,
+                height,
+                face * resolution,
+                row,
+                resolution,
+                resolution,
+                blur_radius,
+            );
         }
         row += resolution;
     }
@@ -13501,7 +14034,7 @@ fn point_shadow_visibility(
     let receiver_bias = region.bias * distance * (1.0 + (1.0 - normal_light) * 5.0);
     let kernel = ((light.radius / distance) * region.resolution as f32)
         .ceil()
-        .clamp(1.0, 3.0) as isize;
+        .clamp(region.filter_radius as f32, 3.0) as isize;
     let reference = if direction.z.abs() < 0.9 {
         CoreVec3::Z
     } else {
@@ -15392,6 +15925,20 @@ mod tests {
             triangle([[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [0.0, 0.0, 2.0]]),
             triangle([[-2.0, 5.0, -2.0], [2.0, 5.0, -2.0], [0.0, 5.0, 2.0]]),
         ];
+        let original_batches = build_vulkan_batches(&triangles);
+        let mut deformed = triangles.clone();
+        deformed[0].vertices[0].local_position[0] += 0.25;
+        deformed[0].object_transform.translation.x += 2.0;
+        let deformed_batches = build_vulkan_batches(&deformed);
+        assert_eq!(original_batches.len(), deformed_batches.len());
+        assert_eq!(
+            original_batches[0].cache_key, deformed_batches[0].cache_key,
+            "deformation and transforms must update a stable GPU buffer"
+        );
+        assert_ne!(
+            original_batches[0].vertices[0].position,
+            deformed_batches[0].vertices[0].position
+        );
         let camera = (
             0.0,
             0.0,
@@ -15404,6 +15951,8 @@ mod tests {
         let lighting = ViewportLighting {
             global_enabled: true,
             global_shadow_resolution: 0,
+            shadow_filter_radius: 1,
+            shadow_blur_radius: 0,
             points: Vec::new(),
             directional_shadow: None,
             point_shadows: None,
@@ -15575,6 +16124,8 @@ mod tests {
         let unlit = ViewportLighting {
             global_enabled: false,
             global_shadow_resolution: 0,
+            shadow_filter_radius: 1,
+            shadow_blur_radius: 0,
             points: Vec::new(),
             directional_shadow: None,
             point_shadows: None,
@@ -15596,6 +16147,8 @@ mod tests {
         let lit = ViewportLighting {
             global_enabled: false,
             global_shadow_resolution: 0,
+            shadow_filter_radius: 1,
+            shadow_blur_radius: 0,
             points: vec![point],
             directional_shadow: None,
             point_shadows: None,
@@ -15605,6 +16158,8 @@ mod tests {
         let translated = ViewportLighting {
             global_enabled: false,
             global_shadow_resolution: 0,
+            shadow_filter_radius: 1,
+            shadow_blur_radius: 0,
             points: vec![ViewportLight {
                 position: CoreVec3::new(5.0, -3.0, 2.0),
                 ..point
@@ -15637,6 +16192,8 @@ mod tests {
             &ViewportLighting {
                 global_enabled: false,
                 global_shadow_resolution: 0,
+                shadow_filter_radius: 1,
+                shadow_blur_radius: 0,
                 points: vec![ViewportLight {
                     intensity: 1_000_000.0,
                     ..point
@@ -15674,12 +16231,53 @@ mod tests {
             forward: CoreVec3::Z,
             extent: 1.0,
             bias: 0.01,
+            filter_radius: 1,
         };
         let behind = directional_shadow_visibility(CoreVec3::new(0.0, 0.0, 1.0), CoreVec3::Z, &map);
         let before =
             directional_shadow_visibility(CoreVec3::new(0.0, 0.0, -1.0), CoreVec3::Z, &map);
         assert!(behind < 1.0);
         assert_eq!(before, 1.0);
+    }
+
+    #[test]
+    fn shadow_quality_downsamples_requested_maps_predictably() {
+        assert_eq!(effective_shadow_resolution(0, 0), 0);
+        assert_eq!(effective_shadow_resolution(1024, 0), 256);
+        assert_eq!(effective_shadow_resolution(1024, 1), 512);
+        assert_eq!(effective_shadow_resolution(1024, 2), 768);
+        assert_eq!(effective_shadow_resolution(1024, 3), 1024);
+        assert_eq!(effective_shadow_resolution(1024, 4), 1024);
+        assert!(shadow_filter_radius(0) > shadow_filter_radius(3));
+    }
+
+    #[test]
+    fn viewport_frame_deadline_keeps_a_fixed_phase_and_skips_late_frames() {
+        let start = Instant::now();
+        let period = target_frame_period(60);
+        let first = advance_frame_deadline(start, start, 60);
+        assert_eq!(first, start + period);
+        let late = start + period * 3 + period / 2;
+        assert_eq!(advance_frame_deadline(first, late, 60), start + period * 4);
+        assert_eq!(sanitize_target_fps(0), 15);
+        assert_eq!(sanitize_target_fps(1_000), 360);
+    }
+
+    #[test]
+    fn fast_shadow_blur_is_separable_and_stays_inside_its_region() {
+        let mut depth = vec![f32::INFINITY; 15];
+        depth[6] = 0.0;
+        depth[7] = 3.0;
+        depth[8] = 6.0;
+        depth[5] = -10.0;
+        depth[9] = 10.0;
+        fast_blur_shadow_region(&mut depth, 5, 3, 1, 1, 3, 1, 1);
+        assert!((depth[6] - 1.5).abs() < 1.0e-6);
+        assert!((depth[7] - 3.0).abs() < 1.0e-6);
+        assert!((depth[8] - 4.5).abs() < 1.0e-6);
+        assert_eq!(depth[5], -10.0);
+        assert_eq!(depth[9], 10.0);
+        assert!(depth[0].is_infinite());
     }
 
     #[test]
@@ -15694,6 +16292,7 @@ mod tests {
             row: 0,
             resolution: 3,
             bias: 0.001,
+            filter_radius: 1,
         };
         atlas.depth[atlas.width + 1] = 0.5;
         let light = ViewportLight {
@@ -15792,7 +16391,9 @@ mod tests {
         assert_eq!(compositor_output_count(0), 1);
         assert_eq!(compositor_input_count(28, 0), 3);
         assert_eq!(compositor_output_count(28), 0);
-        for kind in 0..29 {
+        assert_eq!(compositor_input_count(30, 0), 3);
+        assert_eq!(compositor_output_count(30), 1);
+        for kind in 0..31 {
             assert!(!compositor_node_description(kind).is_empty());
             for input in 0..compositor_input_count(kind, 0) {
                 assert!(!compositor_input_label(kind, input).is_empty());

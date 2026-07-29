@@ -1,7 +1,7 @@
 struct Parameters {
     operation: u32, variant: u32, connected: u32, point_count: u32,
     values: vec4<f32>,
-    points: array<vec4<f32>, 8>,
+    points: array<vec4<f32>, 32>,
 }
 @group(0) @binding(0) var a_tex: texture_2d<f32>;
 @group(0) @binding(1) var b_tex: texture_2d<f32>;
@@ -93,6 +93,27 @@ fn apply_filter(pixel:vec2<u32>,out_size:vec2<u32>)->vec4<f32>{
 }
 fn srgb_linear(v:vec3<f32>)->vec3<f32>{return select(pow((v+vec3<f32>(0.055))/1.055,vec3<f32>(2.4)),v/12.92,v<=vec3<f32>(0.04045));}
 fn linear_srgb(v:vec3<f32>)->vec3<f32>{return select(1.055*pow(v,vec3<f32>(1.0/2.4))-vec3<f32>(0.055),v*12.92,v<=vec3<f32>(0.0031308));}
+fn algebra(values:array<f32,3>)->f32 {
+    var stack:array<f32,32>; var top=0u;
+    for(var i=0u;i<32u;i++){
+        if i>=p.point_count{break;}
+        let instruction=p.points[i]; let op=u32(round(instruction.x));
+        if op<=2u{stack[top]=values[op];top+=1u;}
+        else if op==3u{stack[top]=instruction.y;top+=1u;}
+        else if op>=9u {
+            if top==0u{return 0.0;} let a=stack[top-1u];
+            if op==9u{stack[top-1u]=-a;}else if op==10u{stack[top-1u]=sin(a);}
+            else if op==11u{stack[top-1u]=cos(a);}else if op==12u{stack[top-1u]=abs(a);}
+            else{stack[top-1u]=sqrt(max(a,0.0));}
+        } else {
+            if top<2u{return 0.0;}let b=stack[top-1u];let a=stack[top-2u];top-=1u;
+            if op==4u{stack[top-1u]=a+b;}else if op==5u{stack[top-1u]=a-b;}
+            else if op==6u{stack[top-1u]=a*b;}else if op==7u{stack[top-1u]=select(a/b,0.0,abs(b)<=0.000001);}
+            else{stack[top-1u]=pow(max(a,0.0),b);}
+        }
+    }
+    if top!=1u{return 0.0;}return stack[0];
+}
 
 @compute @workgroup_size(16,16,1)
 fn main(@builtin(global_invocation_id) id:vec3<u32>){
@@ -110,6 +131,9 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>){
         case 9u:{var gray=dot(a.rgb,vec3<f32>(0.2126,0.7152,0.0722));if p.variant==1u{gray=(a.r+a.g+a.b)/3.0;}if p.variant==2u{gray=(max(a.r,max(a.g,a.b))+min(a.r,min(a.g,a.b)))*0.5;}r=vec4<f32>(gray,gray,gray,a.a);}
         case 10u:{let b=load_b(q,size);let c=load_c(q,size);let d=load_d(q,size);r=vec4<f32>(select(0.0,a.r,(p.connected&1u)!=0u),select(0.0,b.r,(p.connected&2u)!=0u),select(0.0,c.r,(p.connected&4u)!=0u),select(1.0,d.r,(p.connected&8u)!=0u));}
         case 11u:{r=clamp(a,vec4<f32>(0.0),vec4<f32>(1.0));}
+        case 12u:{let b=load_b(q,size);let c=load_c(q,size);r=vec4<f32>(
+            algebra(array<f32,3>(a.r,b.r,c.r)),algebra(array<f32,3>(a.g,b.g,c.g)),
+            algebra(array<f32,3>(a.b,b.b,c.b)),algebra(array<f32,3>(a.a,b.a,c.a)));}
         default:{}
     }
     textureStore(output_tex,vec2<i32>(q),r);

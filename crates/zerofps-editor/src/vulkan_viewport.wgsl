@@ -102,8 +102,10 @@ fn directional_shadow_visibility(surface: vec3<f32>, normal: vec3<f32>) -> f32 {
         camera.shadow_parameters.y * (1.0 + (1.0 - normal_light) * 5.0);
     var visible = 0.0;
     var samples = 0.0;
-    for (var y = -1; y <= 1; y += 1) {
-        for (var x = -1; x <= 1; x += 1) {
+    let filter_radius = i32(camera.shadow_parameters.w);
+    for (var y = -2; y <= 2; y += 1) {
+        for (var x = -2; x <= 2; x += 1) {
+            if abs(x) <= filter_radius && abs(y) <= filter_radius {
             let texel = center + vec2<i32>(x, y);
             if any(texel < vec2<i32>(0)) || any(texel >= vec2<i32>(resolution)) {
                 visible += 1.0;
@@ -116,6 +118,7 @@ fn directional_shadow_visibility(surface: vec3<f32>, normal: vec3<f32>) -> f32 {
                 );
             }
             samples += 1.0;
+            }
         }
     }
     return visible / samples;
@@ -180,7 +183,7 @@ fn point_shadow_visibility(
         region.z * distance * (1.0 + (1.0 - normal_light) * 5.0);
     let kernel = i32(clamp(
         ceil(camera.point_colors[light_index].w / distance * f32(resolution)),
-        1.0,
+        region.w,
         3.0
     ));
     let reference = select(

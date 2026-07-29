@@ -288,6 +288,14 @@ impl Compiler<'_> {
                     constant,
                 }
             }
+            NodeSettings::Algebra { expression } => {
+                for (index, target) in inputs.iter_mut().take(3).enumerate() {
+                    *target = self.optional_input(socket.0, index)?;
+                }
+                let program = super::compositor_graph::compile_algebra_expression(&expression)
+                    .map_err(|message| source_error(socket.0, message))?;
+                GraphOperation::Algebra { program }
+            }
             NodeSettings::SharpThreshold { threshold } => {
                 inputs[0] = Some(self.required_input(socket.0, 0)?);
                 GraphOperation::SharpThreshold { threshold }
