@@ -10,6 +10,7 @@ use zerofps_core::Vec3;
 
 use crate::vulkan_runtime::GpuImage;
 use crate::vulkan_runtime::shared_runtime;
+use crate::{MAX_VIEWPORT_LIGHTS, ViewportLight};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -42,6 +43,11 @@ struct CameraUniform {
     viewport: [f32; 2],
     projection: u32,
     padding: u32,
+    global_light_enabled: u32,
+    point_light_count: u32,
+    lighting_padding: [u32; 2],
+    point_positions: [[f32; 4]; MAX_VIEWPORT_LIGHTS],
+    point_colors: [[f32; 4]; MAX_VIEWPORT_LIGHTS],
 }
 
 pub struct VulkanViewport {
@@ -75,7 +81,7 @@ impl VulkanViewport {
             label: Some("viewport camera layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -206,10 +212,28 @@ impl VulkanViewport {
         size: Vec2,
         camera: (f32, f32, f32, Vec3, f32, u32),
         batches: &[GpuBatch],
+        global_light_enabled: bool,
+        point_lights: &[ViewportLight],
     ) -> Result<Arc<GpuImage>, String> {
         let width = size.x.round().max(1.0) as u32;
         let height = size.y.round().max(1.0) as u32;
         self.ensure_targets(width, height);
+        let mut point_positions = [[0.0; 4]; MAX_VIEWPORT_LIGHTS];
+        let mut point_colors = [[0.0; 4]; MAX_VIEWPORT_LIGHTS];
+        for (index, light) in point_lights.iter().take(MAX_VIEWPORT_LIGHTS).enumerate() {
+            point_positions[index] = [
+                light.position.x,
+                light.position.y,
+                light.position.z,
+                light.intensity.max(0.0),
+            ];
+            point_colors[index] = [
+                light.color[0].max(0.0),
+                light.color[1].max(0.0),
+                light.color[2].max(0.0),
+                0.0,
+            ];
+        }
         let uniform = CameraUniform {
             yaw: camera.0,
             pitch: camera.1,
@@ -219,6 +243,11 @@ impl VulkanViewport {
             viewport: [width as f32, height as f32],
             projection: camera.5,
             padding: 0,
+            global_light_enabled: u32::from(global_light_enabled),
+            point_light_count: point_lights.len().min(MAX_VIEWPORT_LIGHTS) as u32,
+            lighting_padding: [0; 2],
+            point_positions,
+            point_colors,
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -458,6 +487,8 @@ mod tests {
                 Vec2::new(128.0, 128.0),
                 (0.0, 0.0, 1.0, Vec3::ZERO, 1.0, 1),
                 &batches,
+                true,
+                &[],
             )
             .unwrap();
         let pixels = color.readback_rgba8().unwrap();

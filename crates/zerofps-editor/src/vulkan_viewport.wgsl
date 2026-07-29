@@ -7,6 +7,11 @@ struct Camera {
     viewport: vec2<f32>,
     projection: u32,
     _padding: u32,
+    global_light_enabled: u32,
+    point_light_count: u32,
+    _lighting_padding: vec2<u32>,
+    point_positions: array<vec4<f32>, 8>,
+    point_colors: array<vec4<f32>, 8>,
 };
 
 struct VertexInput {
@@ -126,8 +131,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // global directional light. It is intentionally independent of object
     // transform and camera orientation.
     let light_direction = normalize(vec3<f32>(-0.35, 0.8, 0.45));
-    let diffuse = max(dot(normal, light_direction), 0.0);
-    let lighting = select(0.28 + diffuse * 0.72, select(0.42, 0.86, diffuse > 0.5), input.material.x > 0.5);
+    var diffuse = select(0.0, max(dot(normal, light_direction), 0.0), camera.global_light_enabled != 0u);
+    for (var index = 0u; index < camera.point_light_count; index += 1u) {
+        let point = camera.point_positions[index];
+        let offset = point.xyz - input.world_position;
+        let distance_squared = dot(offset, offset);
+        if distance_squared > 0.00000001 {
+            let light_color = camera.point_colors[index].rgb;
+            let luminance = (light_color.r + light_color.g + light_color.b) / 3.0;
+            let attenuation = point.w * luminance / (1.0 + distance_squared);
+            diffuse += max(dot(normal, normalize(offset)), 0.0) * attenuation;
+        }
+    }
+    diffuse = clamp(diffuse, 0.0, 2.0);
+    let lighting = clamp(select(0.28 + diffuse * 0.72, select(0.42, 0.86, diffuse > 0.5), input.material.x > 0.5), 0.0, 2.0);
     return vec4<f32>(
         sampled_rgb * input.color.rgb * input.base_color.rgb * lighting,
         sampled.a * input.color.a * input.base_color.a

@@ -782,6 +782,21 @@ struct PreviewTriangle {
     ior: f32,
 }
 
+const MAX_VIEWPORT_LIGHTS: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct ViewportLight {
+    position: CoreVec3,
+    color: [f32; 3],
+    intensity: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ViewportLighting {
+    global_enabled: bool,
+    points: Vec<ViewportLight>,
+}
+
 #[derive(Clone)]
 enum TextureOverride {
     Cpu(Arc<TextureAsset>),
@@ -803,6 +818,7 @@ struct RenderJob {
     viewport_size: Vec2,
     triangles: Arc<Vec<PreviewTriangle>>,
     camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    lighting: ViewportLighting,
     show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
@@ -1052,6 +1068,8 @@ impl DisplayWorker {
                                         projection,
                                     ),
                                     &batches,
+                                    job.lighting.global_enabled,
+                                    &job.lighting.points,
                                 )
                                 .ok()
                         });
@@ -1066,6 +1084,7 @@ impl DisplayWorker {
                                 job.viewport_size,
                                 &job.triangles,
                                 job.camera,
+                                &job.lighting,
                                 job.reusable_depth,
                                 &mut workspace,
                             )
@@ -1075,6 +1094,7 @@ impl DisplayWorker {
                             job.viewport_size,
                             &job.triangles,
                             job.camera,
+                            &job.lighting,
                             job.reusable_depth,
                             &mut workspace,
                         )
@@ -1239,6 +1259,7 @@ struct DepthCacheKey {
     projection: ProjectionMode,
     scene_revision: u64,
     texture_revision: u64,
+    global_light_enabled: bool,
     show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
@@ -1315,6 +1336,7 @@ struct EditorApp {
     texture_paint_last_uv: Option<[f32; 2]>,
     texture_paint_heatmap: bool,
     advanced: bool,
+    global_light_enabled: bool,
     show_grid: bool,
     grid_spacing: f32,
     snap: bool,
@@ -1445,6 +1467,7 @@ impl EditorApp {
             texture_paint_last_uv: None,
             texture_paint_heatmap: true,
             advanced: false,
+            global_light_enabled: true,
             show_grid: true,
             grid_spacing: 1.0,
             snap: false,
@@ -2413,6 +2436,10 @@ impl EditorApp {
         for (key, value) in [
             ("editor.grid_spacing", self.grid_spacing.to_string()),
             ("editor.show_grid", self.show_grid.to_string()),
+            (
+                "editor.global_light_enabled",
+                self.global_light_enabled.to_string(),
+            ),
             ("editor.camera_yaw", self.camera_yaw.to_string()),
             ("editor.camera_pitch", self.camera_pitch.to_string()),
             ("editor.camera_zoom", self.camera_zoom.to_string()),
@@ -3019,6 +3046,12 @@ impl EditorApp {
             .and_then(|value| value.parse::<bool>().ok())
         {
             self.show_grid = value;
+        }
+        if let Some(value) = properties
+            .get("editor.global_light_enabled")
+            .and_then(|value| value.parse::<bool>().ok())
+        {
+            self.global_light_enabled = value;
         }
         self.camera_yaw = number("editor.camera_yaw").unwrap_or(self.camera_yaw);
         self.camera_pitch = number("editor.camera_pitch").unwrap_or(self.camera_pitch);
@@ -4784,18 +4817,42 @@ impl EditorApp {
                             ui.close_menu();
                         }
                     });
-                    ui.menu_button("Primitive", |ui| {
-                        for primitive in [
-                            BuiltinPrimitive::Cube,
-                            BuiltinPrimitive::Sphere,
-                            BuiltinPrimitive::Floor,
-                        ] {
-                            if ui.button(primitive.label()).clicked() {
-                                self.add_builtin_primitive(primitive);
+                    ui.menu_button("Props", |ui| {
+                        ui.menu_button("Primitive", |ui| {
+                            for primitive in [
+                                BuiltinPrimitive::Cube,
+                                BuiltinPrimitive::Sphere,
+                                BuiltinPrimitive::Floor,
+                            ] {
+                                if ui.button(primitive.label()).clicked() {
+                                    self.add_builtin_primitive(primitive);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("Light", |ui| {
+                            if ui.button("Light").clicked() {
+                                self.add_omnidirectional_light();
                                 ui.close_menu();
                             }
-                        }
+                        });
                     });
+                    let global_light = ui.selectable_label(
+                        self.global_light_enabled,
+                        if self.global_light_enabled {
+                            "☀ Global Light"
+                        } else {
+                            "○ Global Light"
+                        },
+                    );
+                    if global_light
+                        .on_hover_text("Toggle the editor's global directional light")
+                        .clicked()
+                    {
+                        self.global_light_enabled = !self.global_light_enabled;
+                        self.scene_revision = self.scene_revision.wrapping_add(1);
+                        self.project_dirty = true;
+                    }
                     for title in ["Scene", "Build", "Window"] {
                         ui.menu_button(title, |ui| {
                             ui.label(format!("{title} commands"));
@@ -5144,6 +5201,13 @@ impl EditorApp {
                                 .iter()
                                 .find(|component| matches!(component, Component::Collider { .. }))
                                 .cloned();
+                            let mut light_component =
+                                node.components.iter().find_map(|component| match component {
+                                    Component::Light { intensity, color } => {
+                                        Some((*intensity, *color))
+                                    }
+                                    _ => None,
+                                });
                             let mut visible = self.scene.visible(id);
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut visible, "").changed() {
@@ -5221,6 +5285,54 @@ impl EditorApp {
                             {
                                 let _ = self.scene.tree.set_local_transform(id, transform);
                                 changed = true;
+                            }
+                            if let Some((ref mut intensity, ref mut color)) = light_component {
+                                let mut light_changed = false;
+                                let mut intensity_exponent = intensity_to_exponent(*intensity);
+                                egui::CollapsingHeader::new(RichText::new("Light").strong())
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        ui.label("Omnidirectional point light");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut intensity_exponent)
+                                                    .speed(0.1)
+                                                    .prefix("Intensity I "),
+                                            )
+                                            .on_hover_text(
+                                                "Physical light power is 10^I. This logarithmic control has no artificial maximum.",
+                                            )
+                                            .changed()
+                                        {
+                                            *intensity =
+                                                light_intensity_from_exponent(intensity_exponent);
+                                            light_changed = true;
+                                        }
+                                        ui.small(format!("Power: {:.4e} = 10^I", *intensity));
+                                        ui.horizontal(|ui| {
+                                            ui.label("Color");
+                                            light_changed |=
+                                                ui.color_edit_button_rgb(color).changed();
+                                        });
+                                        ui.small("Position is controlled by the object transform.");
+                                    });
+                                if light_changed {
+                                    if let Ok(node) = self.scene.tree.node_mut(id)
+                                        && let Some(Component::Light {
+                                            intensity: stored_intensity,
+                                            color: stored_color,
+                                        }) = node
+                                            .components
+                                            .iter_mut()
+                                            .find(|component| {
+                                                matches!(component, Component::Light { .. })
+                                            })
+                                    {
+                                        *stored_intensity = intensity.max(0.0);
+                                        *stored_color = *color;
+                                    }
+                                    changed = true;
+                                }
                             }
                             egui::CollapsingHeader::new(RichText::new("Mesh Renderer").strong())
                                 .default_open(true)
@@ -6362,6 +6474,50 @@ impl EditorApp {
         self.compositor_eval_cache.clear();
         self.compositor_gpu_cache.clear();
         self.project_dirty = true;
+    }
+
+    fn add_omnidirectional_light(&mut self) {
+        let previous = self.scene.tree.clone();
+        let id = self.scene.add("Light", ObjectKind::Light, None);
+        let mut transform = Transform::IDENTITY;
+        transform.translation =
+            self.camera_target + CoreVec3::new(0.0, 0.0, self.grid_spacing.max(1.0) * 2.0);
+        let _ = self.scene.tree.set_local_transform(id, transform);
+        self.scene.selected = Some(id);
+        self.record_undo(previous);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+        self.logs.push(LogEntry {
+            level: "SCENE",
+            color: Color32::from_rgb(255, 210, 48),
+            message: "Added omnidirectional `Light` to the scene".into(),
+        });
+    }
+
+    fn viewport_lighting(&self) -> ViewportLighting {
+        let points = self
+            .scene
+            .tree
+            .iter()
+            .filter(|(id, _)| self.scene.visible(*id))
+            .filter_map(|(_, node)| {
+                node.components
+                    .iter()
+                    .find_map(|component| match component {
+                        Component::Light { intensity, color } => Some(ViewportLight {
+                            position: node.global_transform().translation,
+                            color: *color,
+                            intensity: intensity.max(0.0),
+                        }),
+                        _ => None,
+                    })
+            })
+            .take(MAX_VIEWPORT_LIGHTS)
+            .collect();
+        ViewportLighting {
+            global_enabled: self.global_light_enabled,
+            points,
+        }
     }
 
     fn sync_compositor_outputs(&mut self) {
@@ -9859,6 +10015,7 @@ impl EditorApp {
                 self.schedule_compositor_lod_update(ctx);
                 self.refresh_preview_cache();
                 let preview = Arc::clone(&self.cached_preview);
+                let lighting = self.viewport_lighting();
                 let viewport_texture = {
                     let key = DepthCacheKey {
                         size: [
@@ -9873,6 +10030,7 @@ impl EditorApp {
                         projection: self.projection_mode,
                         scene_revision: self.scene_revision,
                         texture_revision: self.texture_revision,
+                        global_light_enabled: self.global_light_enabled,
                         show_grid: self.show_grid,
                         mode: self.viewport_mode,
                         tool: self.active_tool,
@@ -9974,6 +10132,7 @@ impl EditorApp {
                                 self.grid_spacing,
                                 self.projection_mode,
                             ),
+                            lighting: lighting.clone(),
                             show_grid: self.show_grid,
                             mode: self.viewport_mode,
                             tool: self.active_tool,
@@ -9998,6 +10157,7 @@ impl EditorApp {
                         presented.mode,
                         viewport_texture,
                         &collider_wireframe,
+                        &lighting.points,
                     );
                 } else {
                     painter.rect_filled(response.rect, 0.0, Color32::from_rgb(21, 24, 31));
@@ -11331,6 +11491,7 @@ fn rasterize_depth_frame(
     viewport_size: Vec2,
     triangles: &[PreviewTriangle],
     camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    lighting: &ViewportLighting,
     mut linear_depth: Vec<f32>,
     workspace: &mut RasterWorkspace,
 ) -> DepthFrame {
@@ -11347,7 +11508,6 @@ fn rasterize_depth_frame(
         projection_mode,
         grid_spacing,
     );
-    let light = global_light_direction();
     let camera_position = perspective_camera_position(
         yaw,
         pitch,
@@ -11367,8 +11527,8 @@ fn rasterize_depth_frame(
         let normal = (world[1] - world[0])
             .cross(world[2] - world[0])
             .normalized();
-        let diffuse = normal.dot(light).max(0.0);
-        let band = shader_light_factor(diffuse, triangle.shader);
+        let centroid = (world[0] + world[1] + world[2]) * (1.0 / 3.0);
+        let band = viewport_light_factor(normal, centroid, triangle.shader, lighting);
         clip_preview_polygon_to_near_into(
             triangle,
             yaw,
@@ -11482,7 +11642,7 @@ fn rasterize_depth_frame(
                         triangle.face_normal,
                         triangle.shader,
                         triangle.smooth_normals,
-                        light,
+                        lighting,
                         triangle.transmission,
                         triangle.ior,
                         camera_position,
@@ -11512,7 +11672,7 @@ fn rasterize_triangle_band(
     face_normal: CoreVec3,
     shader: ShaderMode,
     smooth_normals: bool,
-    light_direction: CoreVec3,
+    lighting: &ViewportLighting,
     transmission: f32,
     ior: f32,
     camera_position: CoreVec3,
@@ -11641,8 +11801,13 @@ fn rasterize_triangle_band(
                     } else {
                         face_normal
                     };
+                    let world_position = CoreVec3::new(
+                        interpolate(|vertex| vertex.world_position[0]),
+                        interpolate(|vertex| vertex.world_position[1]),
+                        interpolate(|vertex| vertex.world_position[2]),
+                    );
                     let pixel_light = if smooth_normals {
-                        shader_light_factor(shading_normal.dot(light_direction).max(0.0), shader)
+                        viewport_light_factor(shading_normal, world_position, shader, lighting)
                     } else {
                         light
                     };
@@ -11661,11 +11826,6 @@ fn rasterize_triangle_band(
                         (rgba[3] * 255.0).round() as u8,
                     );
                     if transmission > 0.0 && color[pixel] != Color32::TRANSPARENT {
-                        let world_position = CoreVec3::new(
-                            interpolate(|vertex| vertex.world_position[0]),
-                            interpolate(|vertex| vertex.world_position[1]),
-                            interpolate(|vertex| vertex.world_position[2]),
-                        );
                         let view_direction = (camera_position - world_position).normalized();
                         let fresnel =
                             schlick_fresnel(shading_normal.dot(view_direction).abs(), ior);
@@ -12101,6 +12261,7 @@ fn draw_viewport(
     mode: ViewportMode,
     viewport_texture: Option<TextureId>,
     collider_wireframe: &[[[f32; 3]; 2]],
+    point_lights: &[ViewportLight],
 ) {
     let (yaw, pitch, zoom, camera_target, grid_spacing, projection_mode) = camera;
     painter.rect_filled(rect, 0.0, Color32::from_rgb(21, 24, 31));
@@ -12321,6 +12482,22 @@ fn draw_viewport(
             painter.line_segment(projected, collider_stroke);
         }
     }
+    for light in point_lights {
+        if let Some(position) = project(
+            [light.position.x, light.position.y, light.position.z],
+            center,
+            scale,
+            yaw,
+            pitch,
+            camera_target,
+            projection_mode,
+            grid_spacing,
+        ) {
+            let yellow = Color32::from_rgb(255, 210, 48);
+            painter.circle_filled(position, 4.0, yellow);
+            painter.circle_stroke(position, 8.0, Stroke::new(2.0, yellow));
+        }
+    }
     painter.text(
         rect.left_top() + Vec2::new(12.0, 14.0),
         Align2::LEFT_TOP,
@@ -12369,6 +12546,53 @@ fn transform_normal(normal: CoreVec3, scale: CoreVec3, rotation: Quat) -> CoreVe
 /// orientation must never participate in this value.
 fn global_light_direction() -> CoreVec3 {
     CoreVec3::new(-0.35, 0.8, 0.45).normalized()
+}
+
+fn intensity_to_exponent(intensity: f32) -> f32 {
+    if intensity.is_finite() && intensity > 0.0 {
+        intensity.log10()
+    } else if intensity == f32::INFINITY {
+        f32::MAX.log10()
+    } else {
+        f32::MIN_POSITIVE.log10()
+    }
+}
+
+fn light_intensity_from_exponent(exponent: f32) -> f32 {
+    if exponent.is_nan() {
+        return 1.0;
+    }
+    let intensity = 10.0_f32.powf(exponent);
+    if intensity.is_infinite() {
+        f32::MAX
+    } else {
+        intensity.max(0.0)
+    }
+}
+
+fn viewport_light_factor(
+    normal: CoreVec3,
+    world_position: CoreVec3,
+    shader: ShaderMode,
+    lighting: &ViewportLighting,
+) -> f32 {
+    let mut diffuse = if lighting.global_enabled {
+        normal.dot(global_light_direction()).max(0.0)
+    } else {
+        0.0
+    };
+    for light in lighting.points.iter().take(MAX_VIEWPORT_LIGHTS) {
+        let offset = light.position - world_position;
+        let distance_squared = offset.dot(offset);
+        if distance_squared <= 1.0e-8 {
+            continue;
+        }
+        let luminance =
+            (light.color[0].max(0.0) + light.color[1].max(0.0) + light.color[2].max(0.0)) / 3.0;
+        let attenuation = light.intensity.max(0.0) * luminance / (1.0 + distance_squared);
+        diffuse += normal.dot(offset.normalized()).max(0.0) * attenuation;
+    }
+    shader_light_factor(diffuse.clamp(0.0, 2.0), shader).clamp(0.0, 2.0)
 }
 
 fn grid_distance_alpha(zoom: f32, grid_spacing: f32) -> f32 {
@@ -14178,10 +14402,15 @@ mod tests {
             ProjectionMode::Perspective,
         );
         let mut workspace = RasterWorkspace::default();
+        let lighting = ViewportLighting {
+            global_enabled: true,
+            points: Vec::new(),
+        };
         let frame = rasterize_depth_frame(
             Vec2::new(64.0, 64.0),
             &triangles,
             camera,
+            &lighting,
             Vec::new(),
             &mut workspace,
         );
@@ -14189,6 +14418,7 @@ mod tests {
             Vec2::new(64.0, 64.0),
             &[triangles[1].clone(), triangles[0].clone()],
             camera,
+            &lighting,
             Vec::new(),
             &mut workspace,
         );
@@ -14331,6 +14561,64 @@ mod tests {
             turned_world.dot(light) < identity_world.dot(light) - 0.5,
             "the normal must rotate into world space while the light stays fixed"
         );
+    }
+
+    #[test]
+    fn point_light_is_omnidirectional_and_global_light_is_optional() {
+        assert_eq!(light_intensity_from_exponent(0.0), 1.0);
+        assert_eq!(light_intensity_from_exponent(3.0), 1_000.0);
+        assert!((intensity_to_exponent(1_000.0) - 3.0).abs() < 1.0e-6);
+        assert!(light_intensity_from_exponent(12.0) > 1_000_000.0);
+
+        let unlit = ViewportLighting {
+            global_enabled: false,
+            points: Vec::new(),
+        };
+        let ambient =
+            viewport_light_factor(CoreVec3::Z, CoreVec3::ZERO, ShaderMode::Diffuse, &unlit);
+        let point = ViewportLight {
+            position: CoreVec3::new(0.0, 0.0, 1.0),
+            color: [1.0; 3],
+            intensity: 4.0,
+        };
+        let lit = ViewportLighting {
+            global_enabled: false,
+            points: vec![point],
+        };
+        let from_origin =
+            viewport_light_factor(CoreVec3::Z, CoreVec3::ZERO, ShaderMode::Diffuse, &lit);
+        let translated = ViewportLighting {
+            global_enabled: false,
+            points: vec![ViewportLight {
+                position: CoreVec3::new(5.0, -3.0, 2.0),
+                ..point
+            }],
+        };
+        let from_translated_surface = viewport_light_factor(
+            CoreVec3::Z,
+            CoreVec3::new(5.0, -3.0, 1.0),
+            ShaderMode::Diffuse,
+            &translated,
+        );
+        assert!(from_origin > ambient);
+        assert!((from_origin - from_translated_surface).abs() < 1.0e-6);
+
+        let distant_surface = CoreVec3::new(0.0, 0.0, -99.0);
+        let distant_weak =
+            viewport_light_factor(CoreVec3::Z, distant_surface, ShaderMode::Diffuse, &lit);
+        let distant_strong = viewport_light_factor(
+            CoreVec3::Z,
+            distant_surface,
+            ShaderMode::Diffuse,
+            &ViewportLighting {
+                global_enabled: false,
+                points: vec![ViewportLight {
+                    intensity: 1_000_000.0,
+                    ..point
+                }],
+            },
+        );
+        assert!(distant_strong > distant_weak + 0.5);
     }
 
     #[test]
