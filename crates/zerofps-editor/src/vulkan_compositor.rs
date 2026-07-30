@@ -842,6 +842,7 @@ mod graph_tests {
             width: 2,
             height: 1,
             pixels: vec![64, 128, 255, 255, 200, 20, 100, 128],
+            cached_mips: Vec::new(),
         });
         let graph = Arc::new(CompiledGraph {
             generation: 1,

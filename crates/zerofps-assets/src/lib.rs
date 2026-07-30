@@ -10,6 +10,8 @@ pub mod stl;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    io,
     path::Path,
 };
 use thiserror::Error;
@@ -42,6 +44,364 @@ pub struct TextureAsset {
     pub height: u32,
     /// Row-major RGBA8 pixels.
     pub pixels: Vec<u8>,
+    /// Validated derived levels loaded from an optional sidecar cache.
+    pub cached_mips: Vec<TextureMipLevel>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextureMipLevel {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl TextureAsset {
+    /// Builds a bounded RGBA8 mip pyramid. RGB is averaged in linear light and
+    /// encoded back to sRGB; alpha remains linear.
+    pub fn mip_chain(&self, maximum_levels: usize) -> Vec<Self> {
+        let maximum_levels = maximum_levels.max(1);
+        let expected = self.width as usize * self.height as usize * 4;
+        let mut base = self.clone();
+        base.cached_mips.clear();
+        let mut levels = vec![base];
+        if self.width == 0 || self.height == 0 || self.pixels.len() < expected {
+            return levels;
+        }
+        let mut expected_width = self.width;
+        let mut expected_height = self.height;
+        for cached in &self.cached_mips {
+            if levels.len() >= maximum_levels || (expected_width == 1 && expected_height == 1) {
+                break;
+            }
+            expected_width = expected_width.div_ceil(2);
+            expected_height = expected_height.div_ceil(2);
+            if cached.width != expected_width
+                || cached.height != expected_height
+                || cached.pixels.len() != cached.width as usize * cached.height as usize * 4
+            {
+                break;
+            }
+            levels.push(Self {
+                name: format!("{} mip {}", self.name, levels.len()),
+                width: cached.width,
+                height: cached.height,
+                pixels: cached.pixels.clone(),
+                cached_mips: Vec::new(),
+            });
+        }
+        while levels.len() < maximum_levels {
+            let source = levels.last().expect("mip chain always has a base level");
+            if source.width == 1 && source.height == 1 {
+                break;
+            }
+            let width = source.width.div_ceil(2);
+            let height = source.height.div_ceil(2);
+            let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+            for y in 0..height {
+                for x in 0..width {
+                    let mut rgb = [0.0_f32; 3];
+                    let mut alpha = 0.0_f32;
+                    let mut samples = 0.0_f32;
+                    for source_y in y * 2..(y * 2 + 2).min(source.height) {
+                        for source_x in x * 2..(x * 2 + 2).min(source.width) {
+                            let source_offset =
+                                (source_y as usize * source.width as usize + source_x as usize) * 4;
+                            for channel in 0..3 {
+                                rgb[channel] +=
+                                    srgb_to_linear(source.pixels[source_offset + channel]);
+                            }
+                            alpha += source.pixels[source_offset + 3] as f32 / 255.0;
+                            samples += 1.0;
+                        }
+                    }
+                    let target = (y as usize * width as usize + x as usize) * 4;
+                    for channel in 0..3 {
+                        pixels[target + channel] = linear_to_srgb(rgb[channel] / samples);
+                    }
+                    pixels[target + 3] = ((alpha / samples) * 255.0).round() as u8;
+                }
+            }
+            levels.push(Self {
+                name: format!("{} mip {}", self.name, levels.len()),
+                width,
+                height,
+                pixels,
+                cached_mips: Vec::new(),
+            });
+        }
+        levels
+    }
+}
+
+fn srgb_to_linear(value: u8) -> f32 {
+    let value = value as f32 / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round() as u8
+}
+
+const MIP_CACHE_MAGIC: &[u8; 8] = b"ZFPMIP01";
+
+pub fn mip_cache_path(model_path: impl AsRef<Path>) -> std::path::PathBuf {
+    let model_path = model_path.as_ref();
+    let mut name: OsString = model_path.as_os_str().to_owned();
+    name.push(".zfp-cache");
+    name.into()
+}
+
+pub fn prepare_texture_mips(asset: &mut MeshAsset) {
+    for texture in asset.textures.values_mut() {
+        texture.cached_mips = texture
+            .mip_chain(3)
+            .into_iter()
+            .skip(1)
+            .map(|level| TextureMipLevel {
+                width: level.width,
+                height: level.height,
+                pixels: level.pixels,
+            })
+            .collect();
+    }
+}
+
+pub fn save_texture_mip_cache(
+    model_path: impl AsRef<Path>,
+    asset: &MeshAsset,
+) -> io::Result<std::path::PathBuf> {
+    let path = mip_cache_path(model_path);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(MIP_CACHE_MAGIC);
+    write_u32(&mut bytes, asset.textures.len() as u32);
+    for (name, texture) in &asset.textures {
+        write_bytes(&mut bytes, name.as_bytes())?;
+        write_u64(&mut bytes, texture_fingerprint(texture));
+        let levels = texture.mip_chain(3);
+        write_u32(&mut bytes, levels.len().saturating_sub(1) as u32);
+        for level in levels.iter().skip(1) {
+            write_u32(&mut bytes, level.width);
+            write_u32(&mut bytes, level.height);
+            write_bytes(&mut bytes, &level.pixels)?;
+        }
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = std::path::PathBuf::from(temporary);
+    std::fs::write(&temporary, bytes)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+pub fn load_texture_mip_cache(
+    model_path: impl AsRef<Path>,
+    asset: &mut MeshAsset,
+) -> io::Result<bool> {
+    let path = mip_cache_path(model_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut cursor = CacheCursor::new(&bytes);
+    if cursor.take(MIP_CACHE_MAGIC.len())? != MIP_CACHE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid ZeroFPS mip-cache header",
+        ));
+    }
+    let texture_count = cursor.u32()? as usize;
+    if texture_count > 16_384 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mip cache declares too many textures",
+        ));
+    }
+    let mut cached = BTreeMap::<String, (u64, Vec<TextureMipLevel>)>::new();
+    for _ in 0..texture_count {
+        let name = String::from_utf8(cursor.bytes(1 << 20)?).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mip-cache texture name is not UTF-8",
+            )
+        })?;
+        let fingerprint = cursor.u64()?;
+        let level_count = cursor.u32()? as usize;
+        if level_count > 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mip cache has more than two derived levels",
+            ));
+        }
+        let mut levels = Vec::with_capacity(level_count);
+        for _ in 0..level_count {
+            let width = cursor.u32()?;
+            let height = cursor.u32()?;
+            let expected = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .filter(|bytes| *bytes <= 1 << 30)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "mip-cache level dimensions are too large",
+                    )
+                })?;
+            let pixels = cursor.bytes(expected)?;
+            if pixels.len() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "mip-cache level has an invalid byte count",
+                ));
+            }
+            levels.push(TextureMipLevel {
+                width,
+                height,
+                pixels,
+            });
+        }
+        if cached.insert(name, (fingerprint, levels)).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mip cache contains a duplicate texture name",
+            ));
+        }
+    }
+    if !cursor.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mip cache contains trailing data",
+        ));
+    }
+    let mut applied = 0;
+    for (name, texture) in &mut asset.textures {
+        let Some((fingerprint, levels)) = cached.get(name) else {
+            continue;
+        };
+        if *fingerprint != texture_fingerprint(texture) {
+            continue;
+        }
+        if cached_mips_valid(texture, levels) {
+            texture.cached_mips = levels.clone();
+            applied += 1;
+        }
+    }
+    Ok(applied == asset.textures.len())
+}
+
+fn cached_mips_valid(texture: &TextureAsset, levels: &[TextureMipLevel]) -> bool {
+    let mut width = texture.width;
+    let mut height = texture.height;
+    let expected_levels = if width == 1 && height == 1 {
+        0
+    } else if width <= 2 && height <= 2 {
+        1
+    } else {
+        2
+    };
+    if levels.len() != expected_levels {
+        return false;
+    }
+    levels.iter().all(|level| {
+        width = width.div_ceil(2);
+        height = height.div_ceil(2);
+        level.width == width
+            && level.height == height
+            && level.pixels.len() == width as usize * height as usize * 4
+    })
+}
+
+fn texture_fingerprint(texture: &TextureAsset) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in texture
+        .width
+        .to_le_bytes()
+        .into_iter()
+        .chain(texture.height.to_le_bytes())
+        .chain(texture.pixels.iter().copied())
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn write_u32(target: &mut Vec<u8>, value: u32) {
+    target.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(target: &mut Vec<u8>, value: u64) {
+    target.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_bytes(target: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cache field exceeds 4 GiB"))?;
+    write_u32(target, length);
+    target.extend_from_slice(value);
+    Ok(())
+}
+
+struct CacheCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> CacheCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
+        if length > self.remaining.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated ZeroFPS mip cache",
+            ));
+        }
+        let (value, remaining) = self.remaining.split_at(length);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("four bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().expect("eight bytes"),
+        ))
+    }
+
+    fn bytes(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
+        let length = self.u32()? as usize;
+        if length > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mip-cache field exceeds its allowed size",
+            ));
+        }
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -781,5 +1141,90 @@ mod tests {
         let (_, large_report) = autofix_mesh(&large);
         assert_eq!(large_report.boundary_loops, 1);
         assert_eq!(large_report.filled_loops, 0);
+    }
+
+    #[test]
+    fn texture_mips_are_bounded_handle_odd_sizes_and_average_in_linear_light() {
+        let texture = TextureAsset {
+            name: "checker".into(),
+            width: 3,
+            height: 2,
+            pixels: vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+                255, 255, 255, 255,
+            ],
+            cached_mips: Vec::new(),
+        };
+        let levels = texture.mip_chain(3);
+        assert_eq!(
+            levels
+                .iter()
+                .map(|level| (level.width, level.height))
+                .collect::<Vec<_>>(),
+            vec![(3, 2), (2, 1), (1, 1)]
+        );
+        assert_eq!(levels[1].pixels.len(), 8);
+        assert!(
+            levels[1].pixels[0] > 180,
+            "linear-light black/white averaging should encode brighter than byte averaging"
+        );
+        assert_eq!(levels[1].pixels[3], 255);
+        assert_eq!(texture.mip_chain(1), vec![texture]);
+    }
+
+    #[test]
+    fn texture_mip_sidecar_round_trips_and_rejects_stale_or_corrupt_data() {
+        let unique = format!(
+            "zerofps-mip-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let model = directory.join("model.glb");
+        let source_texture = TextureAsset {
+            name: "base".into(),
+            width: 4,
+            height: 4,
+            pixels: (0..4 * 4 * 4).map(|value| value as u8).collect(),
+            cached_mips: Vec::new(),
+        };
+        let mut prepared = MeshAsset::default();
+        prepared
+            .textures
+            .insert("base".into(), source_texture.clone());
+        prepare_texture_mips(&mut prepared);
+        assert_eq!(prepared.textures["base"].cached_mips.len(), 2);
+        let cache_path = save_texture_mip_cache(&model, &prepared).unwrap();
+        assert_eq!(cache_path, mip_cache_path(&model));
+
+        let mut loaded = MeshAsset::default();
+        loaded
+            .textures
+            .insert("base".into(), source_texture.clone());
+        assert!(load_texture_mip_cache(&model, &mut loaded).unwrap());
+        assert_eq!(
+            loaded.textures["base"].mip_chain(3),
+            prepared.textures["base"].mip_chain(3)
+        );
+
+        let mut stale = MeshAsset::default();
+        let mut changed = source_texture;
+        changed.pixels[0] ^= 0xff;
+        stale.textures.insert("base".into(), changed);
+        assert!(!load_texture_mip_cache(&model, &mut stale).unwrap());
+        assert!(stale.textures["base"].cached_mips.is_empty());
+
+        std::fs::write(&cache_path, b"broken").unwrap();
+        assert_eq!(
+            load_texture_mip_cache(&model, &mut stale)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

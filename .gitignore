@@ -2,4 +2,6 @@
 /target/
 /DOCS.md
 *.zfps-autosave
+*.zfp-cache
+*.zfp-cache.tmp
 .DS_Store

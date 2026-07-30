@@ -13,7 +13,7 @@ mod vulkan_runtime;
 mod vulkan_viewport;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant},
@@ -25,6 +25,7 @@ use eframe::egui::{
 };
 use zerofps_assets::{
     MeshAsset, MeshAutofixReport, Primitive, TextureAsset, Vertex, autofix_mesh, import_file,
+    load_texture_mip_cache, mip_cache_path, prepare_texture_mips, save_texture_mip_cache,
 };
 use zerofps_core::{
     Attribute, AttributeDeclaration, AttributeKey, Component, GeometryTree, NodeId, Quat,
@@ -299,6 +300,7 @@ impl PaintedMask {
             width: self.width,
             height: self.height,
             pixels: rgba,
+            cached_mips: Vec::new(),
         }
     }
 }
@@ -835,6 +837,7 @@ struct PreviewTriangle {
     base_color: [f32; 4],
     source_base_color: [f32; 4],
     texture: Option<Arc<TextureAsset>>,
+    texture_cache_key: u64,
     gpu_texture: Option<Arc<vulkan_runtime::GpuImage>>,
     source_texture: Option<Arc<TextureAsset>>,
     shader: ShaderMode,
@@ -944,6 +947,12 @@ struct RenderResult {
     render_time: Duration,
     prepare_time: Duration,
     shadow_prepare_time: Duration,
+    resource_upload_time: Duration,
+    vertex_upload_time: Duration,
+    texture_upload_time: Duration,
+    viewport_target_allocation_time: Duration,
+    shadow_target_allocation_time: Duration,
+    renderer_initialization_time: Duration,
     device: RenderDevice,
     queue_wait: Duration,
 }
@@ -984,6 +993,12 @@ struct EditorPerformanceTelemetry {
     graph_compile: TimingMetric,
     graph_evaluation: TimingMetric,
     shadow_prepare: TimingMetric,
+    viewport_resource_upload: TimingMetric,
+    viewport_vertex_upload: TimingMetric,
+    viewport_texture_upload: TimingMetric,
+    viewport_target_allocation: TimingMetric,
+    shadow_target_allocation: TimingMetric,
+    viewport_initialization: TimingMetric,
 }
 
 struct DisplayWorker {
@@ -1025,31 +1040,110 @@ struct InputWorker {
 struct ImportRequest {
     path: String,
     add_to_scene: bool,
+    save_cache_in_file: bool,
+}
+
+struct PreparedImport {
+    asset: MeshAsset,
+    autofixed_mesh: MeshAsset,
+    autofix_report: MeshAutofixReport,
+    bounds: ([f32; 3], [f32; 3]),
+    inferred_grid_spacing: Option<f32>,
 }
 
 struct ImportResult {
     path: String,
     add_to_scene: bool,
-    asset: Result<MeshAsset, zerofps_assets::ImportError>,
+    asset: Result<PreparedImport, zerofps_assets::ImportError>,
+    cache_message: Option<Result<String, String>>,
+}
+
+struct ImportProgress {
+    path: String,
+    phase: &'static str,
 }
 
 struct AssetImportWorker {
     requests: mpsc::Sender<ImportRequest>,
     results: mpsc::Receiver<ImportResult>,
+    progress: mpsc::Receiver<ImportProgress>,
 }
 
 impl AssetImportWorker {
     fn new(ctx: egui::Context) -> Self {
         let (request_sender, request_receiver) = mpsc::channel::<ImportRequest>();
         let (result_sender, results) = mpsc::channel();
+        let (progress_sender, progress) = mpsc::channel();
         std::thread::Builder::new()
             .name("zerofps-asset-import".into())
             .spawn(move || {
                 while let Ok(request) = request_receiver.recv() {
+                    let report_progress = |phase| {
+                        let _ = progress_sender.send(ImportProgress {
+                            path: request.path.clone(),
+                            phase,
+                        });
+                        ctx.request_repaint();
+                    };
+                    report_progress("Decoding model and source textures");
+                    let mut asset = import_file(&request.path);
+                    let cache_message = if request.save_cache_in_file {
+                        report_progress("Loading processed texture cache");
+                        asset.as_mut().ok().map(|asset| {
+                            match load_texture_mip_cache(&request.path, asset) {
+                                Ok(true) => Ok(format!(
+                                    "Loaded texture cache `{}`",
+                                    mip_cache_path(&request.path).display()
+                                )),
+                                Ok(false) => {
+                                    prepare_texture_mips(asset);
+                                    save_texture_mip_cache(&request.path, asset)
+                                        .map(|path| {
+                                            format!("Created texture cache `{}`", path.display())
+                                        })
+                                        .map_err(|error| error.to_string())
+                                }
+                                Err(error) => {
+                                    prepare_texture_mips(asset);
+                                    save_texture_mip_cache(&request.path, asset)
+                                        .map(|path| {
+                                            format!(
+                                                "Rebuilt texture cache `{}` after {error}",
+                                                path.display()
+                                            )
+                                        })
+                                        .map_err(|write_error| {
+                                            format!(
+                                                "could not read cache ({error}) or rebuild it ({write_error})"
+                                            )
+                                        })
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    if asset.is_ok() {
+                        report_progress("Repairing and validating mesh");
+                    }
+                    let asset = asset.map(|asset| {
+                        let bounds = mesh_bounds(&asset);
+                        let inferred_grid_spacing = infer_grid_spacing(&asset);
+                        let (autofixed_mesh, autofix_report) = autofix_mesh(&asset);
+                        PreparedImport {
+                            asset,
+                            autofixed_mesh,
+                            autofix_report,
+                            bounds,
+                            inferred_grid_spacing,
+                        }
+                    });
+                    report_progress("Finalizing scene resources");
                     let result = ImportResult {
-                        asset: import_file(&request.path),
+                        asset,
                         path: request.path,
                         add_to_scene: request.add_to_scene,
+                        cache_message,
                     };
                     if result_sender.send(result).is_err() {
                         break;
@@ -1061,11 +1155,16 @@ impl AssetImportWorker {
         Self {
             requests: request_sender,
             results,
+            progress,
         }
     }
 
-    fn submit(&self, path: String, add_to_scene: bool) {
-        let _ = self.requests.send(ImportRequest { path, add_to_scene });
+    fn submit(&self, path: String, add_to_scene: bool, save_cache_in_file: bool) {
+        let _ = self.requests.send(ImportRequest {
+            path,
+            add_to_scene,
+            save_cache_in_file,
+        });
     }
 }
 
@@ -1156,7 +1255,12 @@ impl DisplayWorker {
                     // spatial detail much better than flicker, uneven frame pacing, or shadow
                     // updates that visibly lag behind motion. Reuse an exact cached map, but
                     // never skip a changed map merely to meet a frame budget.
-                    if job.lighting.global_enabled && job.lighting.global_shadow_resolution > 0 {
+                    let gpu_shadow_pipeline =
+                        job.device == RenderDevice::Vulkan && !vulkan_unavailable;
+                    if !gpu_shadow_pipeline
+                        && job.lighting.global_enabled
+                        && job.lighting.global_shadow_resolution > 0
+                    {
                         let key = DirectionalShadowCacheKey {
                             scene_revision: job.key.scene_revision,
                             resolution: job.lighting.global_shadow_resolution,
@@ -1193,11 +1297,12 @@ impl DisplayWorker {
                     );
                     let point_shadow_key =
                         point_shadow_key ^ (job.lighting.shadow_blur_radius as u64).rotate_left(29);
-                    if job
-                        .lighting
-                        .points
-                        .iter()
-                        .any(|light| light.shadow_resolution > 0)
+                    if !gpu_shadow_pipeline
+                        && job
+                            .lighting
+                            .points
+                            .iter()
+                            .any(|light| light.shadow_resolution > 0)
                     {
                         let atlas = match point_shadow_cache.as_ref() {
                             Some((cached_key, atlas)) if *cached_key == point_shadow_key => {
@@ -1218,7 +1323,13 @@ impl DisplayWorker {
                     } else {
                         job.lighting.point_shadows = None;
                     }
-                    let shadow_prepare_time = shadow_prepare_started.elapsed();
+                    let mut shadow_prepare_time = shadow_prepare_started.elapsed();
+                    let mut resource_upload_time = Duration::ZERO;
+                    let mut vertex_upload_time = Duration::ZERO;
+                    let mut texture_upload_time = Duration::ZERO;
+                    let mut viewport_target_allocation_time = Duration::ZERO;
+                    let mut shadow_target_allocation_time = Duration::ZERO;
+                    let mut renderer_initialization_time = Duration::ZERO;
                     let render_started = Instant::now();
                     let mut prepare_time = Duration::ZERO;
                     let frame = if job.mode == ViewportMode::Wireframe {
@@ -1236,10 +1347,12 @@ impl DisplayWorker {
                         }
                     } else if job.device == RenderDevice::Vulkan && !vulkan_unavailable {
                         if vulkan.is_none() {
+                            let initialization_started = Instant::now();
                             match vulkan_viewport::VulkanViewport::new() {
                                 Ok(renderer) => vulkan = Some(renderer),
                                 Err(_) => vulkan_unavailable = true,
                             }
+                            renderer_initialization_time = initialization_started.elapsed();
                         }
                         let rendered = vulkan.as_mut().and_then(|renderer| {
                             let prepare_started = Instant::now();
@@ -1267,7 +1380,7 @@ impl DisplayWorker {
                                 ProjectionMode::Perspective => 0,
                                 ProjectionMode::Orthographic => 1,
                             };
-                            renderer
+                            let rendered = renderer
                                 .render_resident(
                                     job.viewport_size,
                                     (
@@ -1283,8 +1396,21 @@ impl DisplayWorker {
                                     &job.lighting.points,
                                     job.lighting.directional_shadow.as_deref(),
                                     job.lighting.point_shadows.as_deref(),
+                                    Some(job.key.scene_revision),
+                                    batch_revision,
+                                    job.lighting.global_shadow_resolution,
+                                    job.lighting.shadow_filter_radius,
                                 )
-                                .ok()
+                                .ok();
+                            shadow_prepare_time += renderer.last_shadow_encode_time();
+                            resource_upload_time += renderer.last_resource_upload_time();
+                            vertex_upload_time += renderer.last_vertex_upload_time();
+                            texture_upload_time += renderer.last_texture_upload_time();
+                            viewport_target_allocation_time +=
+                                renderer.last_viewport_target_allocation_time();
+                            shadow_target_allocation_time +=
+                                renderer.last_shadow_target_allocation_time();
+                            rendered
                         });
                         if let Some(color) = rendered {
                             DepthFrame {
@@ -1324,6 +1450,12 @@ impl DisplayWorker {
                             render_time: render_started.elapsed(),
                             prepare_time,
                             shadow_prepare_time,
+                            resource_upload_time,
+                            vertex_upload_time,
+                            texture_upload_time,
+                            viewport_target_allocation_time,
+                            shadow_target_allocation_time,
+                            renderer_initialization_time,
                             device: job.device,
                             queue_wait,
                         })
@@ -1346,7 +1478,7 @@ impl DisplayWorker {
 }
 
 fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::GpuBatch> {
-    let mut groups: HashMap<usize, vulkan_viewport::GpuBatch> = HashMap::new();
+    let mut groups: HashMap<(usize, bool), vulkan_viewport::GpuBatch> = HashMap::new();
     for triangle in triangles {
         let key = triangle
             .gpu_texture
@@ -1360,7 +1492,7 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
             })
             .unwrap_or(0);
         let batch = groups
-            .entry(key)
+            .entry((key, triangle.casts_shadows))
             .or_insert_with(|| vulkan_viewport::GpuBatch {
                 cache_key: triangle
                     .source_texture
@@ -1368,6 +1500,8 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
                     .map(|texture| Arc::as_ptr(texture) as u64)
                     .unwrap_or(0)
                     ^ 0x9e37_79b9_7f4a_7c15,
+                casts_shadows: triangle.casts_shadows,
+                texture_cache_key: triangle.texture_cache_key,
                 texture: triangle.texture.clone(),
                 gpu_texture: triangle.gpu_texture.clone(),
                 vertices: Vec::new(),
@@ -1450,6 +1584,7 @@ struct RasterWorkspace {
     bands: Vec<Vec<PreparedRasterTriangle>>,
     clipped: Vec<PreviewVertex>,
     projected: Vec<RasterVertex>,
+    texture_mips: HashMap<usize, (Arc<TextureAsset>, Arc<Vec<TextureAsset>>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1549,6 +1684,7 @@ struct EditorApp {
     shadow_blur_radius: usize,
     target_fps: u32,
     next_viewport_frame: Instant,
+    save_cache_in_file: bool,
     show_grid: bool,
     grid_spacing: f32,
     snap: bool,
@@ -1566,6 +1702,8 @@ struct EditorApp {
     undo_stack: Vec<GeometryTree>,
     redo_stack: Vec<GeometryTree>,
     asset_import_path: String,
+    asset_loading: BTreeMap<String, &'static str>,
+    asset_loading_present_revision: BTreeMap<String, u64>,
     imported_assets: Vec<ImportedAsset>,
     viewport_mode: ViewportMode,
     projection_mode: ProjectionMode,
@@ -1686,6 +1824,7 @@ impl EditorApp {
             shadow_blur_radius: 1,
             target_fps: 60,
             next_viewport_frame: Instant::now(),
+            save_cache_in_file: false,
             show_grid: true,
             grid_spacing: 1.0,
             snap: false,
@@ -1714,6 +1853,8 @@ impl EditorApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             asset_import_path: String::new(),
+            asset_loading: BTreeMap::new(),
+            asset_loading_present_revision: BTreeMap::new(),
             imported_assets: builtin_imported_assets(),
             viewport_mode: ViewportMode::Shaded,
             projection_mode: ProjectionMode::Orthographic,
@@ -1746,23 +1887,47 @@ impl EditorApp {
         if path.is_empty() {
             return;
         }
-        self.asset_import_worker.submit(path, add_to_scene);
+        self.asset_loading.insert(path.clone(), "Queued");
+        self.asset_import_worker
+            .submit(path, add_to_scene, self.save_cache_in_file);
         self.asset_import_path.clear();
     }
 
     fn poll_asset_imports(&mut self) {
+        while let Ok(progress) = self.asset_import_worker.progress.try_recv() {
+            self.asset_loading.insert(progress.path, progress.phase);
+        }
         while let Ok(result) = self.asset_import_worker.results.try_recv() {
+            if let Some(cache_message) = result.cache_message.as_ref() {
+                match cache_message {
+                    Ok(message) => self.logs.push(LogEntry {
+                        level: "CACHE",
+                        color: Color32::from_rgb(112, 174, 220),
+                        message: message.clone(),
+                    }),
+                    Err(message) => self.logs.push(LogEntry {
+                        level: "WARN",
+                        color: Color32::from_rgb(235, 167, 88),
+                        message: format!("Texture cache unavailable: {message}"),
+                    }),
+                }
+            }
             let path = result.path;
             match result.asset {
-                Ok(asset) => {
+                Ok(prepared) => {
+                    let PreparedImport {
+                        asset,
+                        autofixed_mesh,
+                        autofix_report,
+                        bounds,
+                        inferred_grid_spacing,
+                    } = prepared;
                     let completed_path = path.clone();
                     let triangle_count = asset.triangle_count();
-                    let bounds = mesh_bounds(&asset);
-                    let (autofixed_mesh, autofix_report) = autofix_mesh(&asset);
                     let inferred_grid_spacing = self
                         .imported_assets
                         .is_empty()
-                        .then(|| infer_grid_spacing(&asset))
+                        .then_some(inferred_grid_spacing)
                         .flatten();
                     if let Some(spacing) = inferred_grid_spacing {
                         self.grid_spacing = spacing;
@@ -1825,12 +1990,19 @@ impl EditorApp {
                     for id in rebuild {
                         let _ = self.enable_dynamics_for(id);
                     }
+                    self.asset_loading
+                        .insert(completed_path.clone(), "Uploading renderer resources");
+                    self.asset_loading_present_revision
+                        .insert(completed_path, self.scene_revision);
                 }
-                Err(error) => self.logs.push(LogEntry {
-                    level: "ERROR",
-                    color: Color32::from_rgb(235, 91, 91),
-                    message: format!("Asset import failed: {error}"),
-                }),
+                Err(error) => {
+                    self.asset_loading.remove(&path);
+                    self.logs.push(LogEntry {
+                        level: "ERROR",
+                        color: Color32::from_rgb(235, 91, 91),
+                        message: format!("Asset import failed: {error}"),
+                    });
+                }
             }
         }
     }
@@ -2206,13 +2378,13 @@ impl EditorApp {
                     } else {
                         tinted_base_color
                     };
-                let source_texture = {
-                    material
-                        .and_then(|material| material.base_color_texture.as_ref())
-                        .and_then(|name| asset.textures.get(name))
-                        .cloned()
-                        .map(Arc::new)
-                };
+                let source_texture_asset = material
+                    .and_then(|material| material.base_color_texture.as_ref())
+                    .and_then(|name| asset.textures.get(name));
+                let source_texture_cache_key = source_texture_asset
+                    .map(|texture| texture as *const TextureAsset as usize as u64)
+                    .unwrap_or(0);
+                let source_texture = source_texture_asset.cloned().map(Arc::new);
                 let painted_preview = texture_paint_preview
                     .then(|| Arc::new(self.painted_masks[&id].texture(self.texture_paint_heatmap)));
                 let texture = match (&compositor_override, field_preview, painted_preview) {
@@ -2227,6 +2399,19 @@ impl EditorApp {
                         (Some(TextureOverride::Gpu(texture)), false) => Some(Arc::clone(texture)),
                         _ => None,
                     };
+                let texture_cache_key = match (
+                    &compositor_override,
+                    field_preview,
+                    texture_paint_preview,
+                    &texture,
+                ) {
+                    (Some(TextureOverride::Cpu(texture)), false, false, _) => {
+                        Arc::as_ptr(texture) as usize as u64
+                    }
+                    (_, false, false, Some(_)) => source_texture_cache_key,
+                    (_, _, _, Some(texture)) => Arc::as_ptr(texture) as usize as u64,
+                    _ => 0,
+                };
                 let transmission = if use_imported_optics {
                     material
                         .and_then(|material| material.transmission)
@@ -2300,6 +2485,7 @@ impl EditorApp {
                         base_color,
                         source_base_color: tinted_base_color,
                         texture: texture.clone(),
+                        texture_cache_key,
                         gpu_texture: gpu_texture.clone(),
                         source_texture: source_texture.clone(),
                         shader,
@@ -2330,10 +2516,12 @@ impl EditorApp {
                     match texture {
                         TextureOverride::Cpu(texture) => {
                             triangle.texture = Some(Arc::clone(texture));
+                            triangle.texture_cache_key = Arc::as_ptr(texture) as usize as u64;
                             triangle.gpu_texture = None;
                         }
                         TextureOverride::Gpu(texture) => {
                             triangle.texture = None;
+                            triangle.texture_cache_key = 0;
                             triangle.gpu_texture = Some(Arc::clone(texture));
                         }
                     }
@@ -2613,7 +2801,7 @@ impl EditorApp {
                 self.scene.tree = project.scene.geometry;
                 self.compositor_texture_overrides.clear();
                 self.scene.selected = self.scene.tree.roots().first().copied();
-                let referenced_assets: Vec<String> = self
+                let referenced_assets: BTreeSet<String> = self
                     .scene
                     .tree
                     .iter()
@@ -2701,6 +2889,10 @@ impl EditorApp {
                 self.shadow_blur_radius.to_string(),
             ),
             ("editor.target_fps", self.target_fps.to_string()),
+            (
+                "editor.save_cache_in_file",
+                self.save_cache_in_file.to_string(),
+            ),
             ("editor.camera_yaw", self.camera_yaw.to_string()),
             ("editor.camera_pitch", self.camera_pitch.to_string()),
             ("editor.camera_zoom", self.camera_zoom.to_string()),
@@ -2848,9 +3040,18 @@ impl EditorApp {
             let archive_path = format!("assets/{index:04}/{filename}");
             mapping.insert(source, archive_path.clone());
             files.push(BundleAsset {
-                source: source_path,
-                archive_path,
+                source: source_path.clone(),
+                archive_path: archive_path.clone(),
             });
+            if self.save_cache_in_file {
+                let cache_source = mip_cache_path(&source_path);
+                if cache_source.is_file() {
+                    files.push(BundleAsset {
+                        source: cache_source,
+                        archive_path: format!("{archive_path}.zfp-cache"),
+                    });
+                }
+            }
         }
         rewrite_asset_paths(&mut project, &mapping);
         // Serialize compositor nodes
@@ -3352,6 +3553,10 @@ impl EditorApp {
             .map(sanitize_target_fps)
             .unwrap_or(self.target_fps);
         self.next_viewport_frame = Instant::now();
+        self.save_cache_in_file = properties
+            .get("editor.save_cache_in_file")
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(self.save_cache_in_file);
         self.camera_yaw = number("editor.camera_yaw").unwrap_or(self.camera_yaw);
         self.camera_pitch = number("editor.camera_pitch").unwrap_or(self.camera_pitch);
         self.camera_zoom = number("editor.camera_zoom")
@@ -5256,6 +5461,15 @@ impl EditorApp {
                             }
                             RenderDevice::Cpu => "Portable reference renderer + compositor",
                         });
+                        if ui
+                            .checkbox(&mut self.save_cache_in_file, "Save cache in file")
+                            .on_hover_text(
+                                "Store validated 1/2× and 1/4× texture mipmaps beside imported models as `<model>.zfp-cache`",
+                            )
+                            .changed()
+                        {
+                            self.project_dirty = true;
+                        }
                         ui.separator();
                         ui.strong("Render");
                         ui.collapsing("Shadows", |ui| {
@@ -7793,6 +8007,7 @@ impl EditorApp {
                 width: image.width,
                 height: image.height,
                 pixels: image.readback_rgba8()?,
+                cached_mips: Vec::new(),
             });
             self.compositor_eval_cache
                 .insert(cache_key, Arc::clone(&texture));
@@ -7863,6 +8078,7 @@ impl EditorApp {
                         width: image.width(),
                         height: image.height(),
                         pixels: image.into_raw(),
+                        cached_mips: Vec::new(),
                     });
                     self.compositor_image_cache
                         .insert(path, Arc::clone(&texture));
@@ -7879,6 +8095,7 @@ impl EditorApp {
                     .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
                     .chain(std::iter::once(255))
                     .collect(),
+                cached_mips: Vec::new(),
             })),
             NodeSettings::Remap { .. } => {
                 let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
@@ -7973,6 +8190,7 @@ impl EditorApp {
                     width: 1,
                     height: 1,
                     pixels: vec![v, v, v, 255],
+                    cached_mips: Vec::new(),
                 };
                 let r = match self.compositor_input_source(node_id, 0) {
                     Ok((fid, fo)) => self.evaluate_compositor_node(fid, fo, visiting)?,
@@ -8002,6 +8220,7 @@ impl EditorApp {
                     width: 1,
                     height: 1,
                     pixels: vec![channel, channel, channel, 255],
+                    cached_mips: Vec::new(),
                 }))
             }
             NodeSettings::Time { scale, modulus, .. } => {
@@ -8016,6 +8235,7 @@ impl EditorApp {
                     width: 1,
                     height: 1,
                     pixels: vec![channel, channel, channel, 255],
+                    cached_mips: Vec::new(),
                 }))
             }
             NodeSettings::Debug => {
@@ -10879,12 +11099,40 @@ impl EditorApp {
                     if let Some(result) = newest_completed {
                         self.viewport_render_in_flight = false;
                         self.viewport_requested_key = None;
+                        let presented_assets = completed_asset_loads(
+                            &self.asset_loading_present_revision,
+                            result.key.scene_revision,
+                        );
+                        for path in presented_assets {
+                            self.asset_loading_present_revision.remove(&path);
+                            self.asset_loading.remove(&path);
+                        }
                         self.performance
                             .viewport_queue_wait
                             .record(result.queue_wait);
                         self.performance
                             .shadow_prepare
                             .record(result.shadow_prepare_time);
+                        self.performance
+                            .viewport_resource_upload
+                            .record(result.resource_upload_time);
+                        self.performance
+                            .viewport_vertex_upload
+                            .record(result.vertex_upload_time);
+                        self.performance
+                            .viewport_texture_upload
+                            .record(result.texture_upload_time);
+                        self.performance
+                            .viewport_target_allocation
+                            .record(result.viewport_target_allocation_time);
+                        self.performance
+                            .shadow_target_allocation
+                            .record(result.shadow_target_allocation_time);
+                        if !result.renderer_initialization_time.is_zero() {
+                            self.performance
+                                .viewport_initialization
+                                .record(result.renderer_initialization_time);
+                        }
                         if let Some((revision, started)) = self.compositor_present_revision {
                             if result.key.texture_revision >= revision {
                                 self.performance
@@ -11096,10 +11344,58 @@ impl EditorApp {
                                 self.target_fps
                             ));
                             ui.separator();
+                            if !self.asset_loading.is_empty() {
+                                ui.small(
+                                    RichText::new(format!(
+                                        "Loading {} asset{}",
+                                        self.asset_loading.len(),
+                                        if self.asset_loading.len() == 1 {
+                                            ""
+                                        } else {
+                                            "s"
+                                        }
+                                    ))
+                                    .color(Color32::from_rgb(235, 167, 88)),
+                                );
+                                ui.separator();
+                            }
                             ui.small(if self.viewport_focused {
                                 "Viewport focused  •  RMB orbit  •  Wheel zoom"
                             } else {
                                 "Ready"
+                            });
+                        });
+                    });
+            });
+    }
+
+    fn loading_overlay(&self, ctx: &egui::Context) {
+        let Some((path, phase)) = self.asset_loading.first_key_value() else {
+            return;
+        };
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        egui::Area::new(Id::new("asset_loading_overlay"))
+            .anchor(Align2::CENTER_TOP, [0.0, 72.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_rgb(28, 30, 37))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(18.0));
+                            ui.vertical(|ui| {
+                                ui.strong(format!("Loading {name}"));
+                                ui.small(*phase);
+                                if self.asset_loading.len() > 1 {
+                                    ui.weak(format!(
+                                        "{} additional assets queued",
+                                        self.asset_loading.len() - 1
+                                    ));
+                                }
                             });
                         });
                     });
@@ -11135,6 +11431,7 @@ impl eframe::App for EditorApp {
             }
             WorkspaceTab::Compositing => self.compositing_workspace(ctx),
         }
+        self.loading_overlay(ctx);
         self.status_bar(ctx);
         self.project_error_popup(ctx);
     }
@@ -11827,6 +12124,7 @@ fn resize_texture_for_lod(texture: &Arc<TextureAsset>, maximum: u32) -> Arc<Text
         width,
         height,
         pixels: resized.into_raw(),
+        cached_mips: Vec::new(),
     })
 }
 
@@ -11883,6 +12181,7 @@ fn combine_compositor_textures(
         width,
         height,
         pixels,
+        cached_mips: Vec::new(),
     }
 }
 
@@ -11932,6 +12231,7 @@ fn apply_compositor_algebra(
         width,
         height,
         pixels,
+        cached_mips: Vec::new(),
     }
 }
 
@@ -12083,6 +12383,7 @@ fn join_compositor_channels(rgb: [&TextureAsset; 3], alpha: Option<&TextureAsset
         width,
         height,
         pixels,
+        cached_mips: Vec::new(),
     }
 }
 
@@ -12353,7 +12654,7 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
 
 fn telemetry_metrics(
     performance: &EditorPerformanceTelemetry,
-) -> [(&'static str, TimingMetric); 12] {
+) -> [(&'static str, TimingMetric); 18] {
     [
         ("Vulkan viewport worker", performance.viewport_vulkan),
         ("GPU batch preparation", performance.viewport_prepare),
@@ -12362,7 +12663,31 @@ fn telemetry_metrics(
             performance.viewport_present,
         ),
         ("Viewport queue wait", performance.viewport_queue_wait),
-        ("Shadow maps (cached)", performance.shadow_prepare),
+        (
+            "Shadow preparation / GPU encoding",
+            performance.shadow_prepare,
+        ),
+        (
+            "GPU resource loading / upload",
+            performance.viewport_resource_upload,
+        ),
+        ("GPU mesh-buffer upload", performance.viewport_vertex_upload),
+        (
+            "GPU texture + mip upload",
+            performance.viewport_texture_upload,
+        ),
+        (
+            "Viewport target allocation",
+            performance.viewport_target_allocation,
+        ),
+        (
+            "Shadow target allocation",
+            performance.shadow_target_allocation,
+        ),
+        (
+            "Vulkan renderer initialization",
+            performance.viewport_initialization,
+        ),
         ("Control → graph apply", performance.control_to_graph_apply),
         (
             "Control → composite ready",
@@ -12390,6 +12715,13 @@ fn format_telemetry_report(performance: &EditorPerformanceTelemetry) -> String {
     report
 }
 
+fn completed_asset_loads(pending: &BTreeMap<String, u64>, presented_revision: u64) -> Vec<String> {
+    pending
+        .iter()
+        .filter_map(|(path, revision)| (presented_revision >= *revision).then_some(path.clone()))
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct RasterVertex {
     position: Pos2,
@@ -12411,7 +12743,8 @@ struct PreparedRasterTriangle {
     smooth_normals: bool,
     transmission: f32,
     ior: f32,
-    texture: Option<Arc<TextureAsset>>,
+    texture_mips: Option<Arc<Vec<TextureAsset>>>,
+    texture_lod: usize,
     min_y: usize,
     max_y: usize,
 }
@@ -12430,6 +12763,14 @@ fn rasterize_depth_frame(
     let mut color = ColorImage::new(size, Color32::TRANSPARENT);
     linear_depth.resize(width * height, f32::INFINITY);
     linear_depth.fill(f32::INFINITY);
+    let live_textures = triangles
+        .iter()
+        .filter_map(|triangle| triangle.texture.as_ref())
+        .map(|texture| Arc::as_ptr(texture) as usize)
+        .collect::<HashSet<_>>();
+    workspace
+        .texture_mips
+        .retain(|key, _| live_textures.contains(key));
     let (yaw, pitch, zoom, camera_target, grid_spacing, projection_mode) = camera;
     let center = Pos2::new(width as f32 * 0.5, height as f32 * 0.5 + 25.0);
     let scale = perspective_view_scale(
@@ -12520,6 +12861,19 @@ fn rasterize_depth_frame(
                 .fold(f32::NEG_INFINITY, f32::max)
                 .ceil()
                 .clamp(0.0, height.saturating_sub(1) as f32) as usize;
+            let texture_mips = triangle.texture.as_ref().map(|texture| {
+                let key = Arc::as_ptr(texture) as usize;
+                Arc::clone(
+                    &workspace
+                        .texture_mips
+                        .entry(key)
+                        .or_insert_with(|| (Arc::clone(texture), Arc::new(texture.mip_chain(3))))
+                        .1,
+                )
+            });
+            let texture_lod = triangle.texture.as_deref().map_or(0, |texture| {
+                triangle_texture_lod(raster_vertices, texture, 3)
+            });
             workspace.prepared.push(PreparedRasterTriangle {
                 object_id: triangle.object_id,
                 vertices: raster_vertices,
@@ -12530,7 +12884,8 @@ fn rasterize_depth_frame(
                 smooth_normals: triangle.smooth_normals,
                 transmission: triangle.transmission,
                 ior: triangle.ior,
-                texture: triangle.texture.clone(),
+                texture_mips,
+                texture_lod,
                 min_y,
                 max_y,
             });
@@ -12582,7 +12937,10 @@ fn rasterize_depth_frame(
                         triangle.transmission,
                         triangle.ior,
                         camera_position,
-                        triangle.texture.as_deref(),
+                        triangle
+                            .texture_mips
+                            .as_deref()
+                            .and_then(|levels| levels.get(triangle.texture_lod)),
                         triangle.object_id,
                         projection_mode,
                         size,
@@ -12599,6 +12957,31 @@ fn rasterize_depth_frame(
         color: FrameColor::Cpu(color),
         linear_depth,
     }
+}
+
+fn triangle_texture_lod(
+    vertices: [RasterVertex; 3],
+    texture: &TextureAsset,
+    maximum_levels: usize,
+) -> usize {
+    if maximum_levels <= 1 || texture.width == 0 || texture.height == 0 {
+        return 0;
+    }
+    let mut texels_per_pixel = 0.0_f32;
+    for edge in 0..3 {
+        let from = vertices[edge];
+        let to = vertices[(edge + 1) % 3];
+        let screen_pixels = from.position.distance(to.position).max(1.0e-4);
+        let texel_u = (to.uv[0] - from.uv[0]) * texture.width as f32;
+        let texel_v = (to.uv[1] - from.uv[1]) * texture.height as f32;
+        texels_per_pixel = texels_per_pixel.max(texel_u.hypot(texel_v) / screen_pixels);
+    }
+    texels_per_pixel
+        .max(1.0)
+        .log2()
+        .floor()
+        .max(0.0)
+        .min(maximum_levels.saturating_sub(1) as f32) as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15948,6 +16331,7 @@ mod tests {
             base_color: [0.42, 0.64, 0.78, 1.0],
             source_base_color: [0.42, 0.64, 0.78, 1.0],
             texture: None,
+            texture_cache_key: 0,
             gpu_texture: None,
             source_texture: None,
             shader: ShaderMode::Toon,
@@ -16031,6 +16415,7 @@ mod tests {
             pixels: vec![
                 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
             ],
+            cached_mips: Vec::new(),
         };
         assert_eq!(
             sample_texture_nearest(&texture, [0.1, 0.1]),
@@ -16040,6 +16425,37 @@ mod tests {
             sample_texture_nearest(&texture, [1.6, 0.1]),
             [0.0, 1.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn cpu_texture_lod_tracks_projected_texel_density() {
+        let vertex = |position: Pos2, uv: [f32; 2]| RasterVertex {
+            position,
+            camera_depth: 1.0,
+            world_position: [0.0; 3],
+            normal: [0.0, 0.0, 1.0],
+            uv,
+            color: [1.0; 4],
+        };
+        let texture = TextureAsset {
+            name: "large".into(),
+            width: 1024,
+            height: 1024,
+            pixels: vec![255; 1024 * 1024 * 4],
+            cached_mips: Vec::new(),
+        };
+        let close = [
+            vertex(Pos2::new(0.0, 0.0), [0.0, 0.0]),
+            vertex(Pos2::new(1024.0, 0.0), [1.0, 0.0]),
+            vertex(Pos2::new(0.0, 1024.0), [0.0, 1.0]),
+        ];
+        let distant = [
+            vertex(Pos2::new(0.0, 0.0), [0.0, 0.0]),
+            vertex(Pos2::new(64.0, 0.0), [1.0, 0.0]),
+            vertex(Pos2::new(0.0, 64.0), [0.0, 1.0]),
+        ];
+        assert_eq!(triangle_texture_lod(close, &texture, 3), 0);
+        assert_eq!(triangle_texture_lod(distant, &texture, 3), 2);
     }
 
     #[test]
@@ -16522,6 +16938,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![red, red, red, 255],
+            cached_mips: Vec::new(),
         };
         let a = texture("a", 255);
         let b = texture("b", 0);
@@ -16543,6 +16960,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 pixels,
+                cached_mips: Vec::new(),
             })
         };
         let generation = worker.submit_latest(
@@ -16574,6 +16992,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![210, 120, 45, 173],
+            cached_mips: Vec::new(),
         };
         let result = apply_compositor_math(texture, 2, 0.0);
         assert_eq!(result.pixels, vec![0, 0, 0, 173]);
@@ -16620,7 +17039,27 @@ mod tests {
         assert!(report.starts_with("Stage\tLatest\tEMA\tMaximum\tSamples\n"));
         assert!(report.contains("Control → presented frame\t17.000 ms"));
         assert!(report.contains("Vulkan graph encode + submission"));
-        assert_eq!(report.lines().count(), 13);
+        assert!(report.contains("GPU resource loading / upload"));
+        assert!(report.contains("GPU mesh-buffer upload"));
+        assert!(report.contains("GPU texture + mip upload"));
+        assert!(report.contains("Viewport target allocation"));
+        assert!(report.contains("Shadow target allocation"));
+        assert!(report.contains("Vulkan renderer initialization"));
+        assert_eq!(report.lines().count(), 19);
+    }
+
+    #[test]
+    fn loading_indicator_finishes_only_after_its_scene_revision_is_presented() {
+        let pending = BTreeMap::from([
+            ("first.glb".to_owned(), 4_u64),
+            ("second.glb".to_owned(), 7_u64),
+        ]);
+        assert!(completed_asset_loads(&pending, 3).is_empty());
+        assert_eq!(completed_asset_loads(&pending, 4), vec!["first.glb"]);
+        assert_eq!(
+            completed_asset_loads(&pending, 7),
+            vec!["first.glb", "second.glb"]
+        );
     }
 
     #[test]
@@ -16630,6 +17069,7 @@ mod tests {
             width: 8,
             height: 4,
             pixels: vec![255; 8 * 4 * 4],
+            cached_mips: Vec::new(),
         });
         let resized = resize_texture_for_lod(&texture, 4);
         assert_eq!((resized.width, resized.height), (4, 2));
@@ -16642,6 +17082,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![30, 90, 210, 128],
+            cached_mips: Vec::new(),
         };
         let red = extract_compositor_channel(source.clone(), 0);
         let green = extract_compositor_channel(source.clone(), 1);
@@ -16660,6 +17101,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![32, 128, 230, 77],
+            cached_mips: Vec::new(),
         };
         let linear = convert_compositor_color_space(source.clone(), 0, 1);
         let round_trip = convert_compositor_color_space(linear, 1, 0);

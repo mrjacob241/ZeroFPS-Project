@@ -301,6 +301,7 @@ fn decoded_image(name: String, image: &::gltf::image::Data) -> Result<TextureAss
         width: image.width,
         height: image.height,
         pixels,
+        cached_mips: Vec::new(),
     })
 }
 

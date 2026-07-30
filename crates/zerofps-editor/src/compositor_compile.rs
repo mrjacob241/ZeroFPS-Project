@@ -243,6 +243,7 @@ impl Compiler<'_> {
                         width: image.width(),
                         height: image.height(),
                         pixels: image.into_raw(),
+                        cached_mips: Vec::new(),
                     });
                     self.app
                         .compositor_image_cache

@@ -467,6 +467,7 @@ impl FloatImage {
             width: self.width,
             height: self.height,
             pixels: self.pixels.iter().copied().map(to_u8).collect(),
+            cached_mips: Vec::new(),
         }
     }
 }
@@ -992,6 +993,7 @@ mod tests {
             width,
             height,
             pixels: pixels.iter().flatten().copied().collect(),
+            cached_mips: Vec::new(),
         })
     }
 
