@@ -8891,29 +8891,39 @@ impl EditorApp {
                     })
                 })
                 .collect::<Vec<_>>();
-            let floor_height = self
+            let scene_body_position = self
+                .scene
+                .tree
+                .node(root_id)
+                .ok()
+                .map(|node| node.global_transform().translation)
+                .unwrap_or(authored.translation);
+            let general_body_colliders = self
+                .scene
+                .tree
+                .iter()
+                .filter(|(id, _)| self.node_is_in_subtree(root_id, *id))
+                .flat_map(|(_, node)| {
+                    let transform = node.global_transform();
+                    node.components
+                        .iter()
+                        .filter_map(move |component| world_collider(transform, component))
+                })
+                .collect::<Vec<_>>();
+            let general_external_colliders = self
                 .scene
                 .tree
                 .iter()
                 .filter(|(id, _)| !self.node_is_in_subtree(root_id, *id))
-                .filter_map(|(_, node)| {
+                .flat_map(|(_, node)| {
+                    let transform = node.global_transform();
                     node.components
                         .iter()
-                        .find_map(|component| match component {
-                            Component::Collider { shape, center, .. }
-                                if ColliderShape::from_storage(shape) == ColliderShape::Flat =>
-                            {
-                                let transform = node.global_transform();
-                                let world_center = transform.translation
-                                    + transform
-                                        .rotation
-                                        .rotate(transform.scale.component_mul(*center));
-                                Some(world_center.z)
-                            }
-                            _ => None,
-                        })
+                        .filter_map(move |component| world_collider(transform, component))
                 })
-                .max_by(f32::total_cmp);
+                .collect::<Vec<_>>();
+            let support_surface =
+                collider_support_surface(scene_body_position, &general_external_colliders);
             let body_mass = body_colliders
                 .iter()
                 .map(|(_, _, _, _, _, _, _, mass, _, _)| *mass)
@@ -8953,7 +8963,7 @@ impl EditorApp {
             if gravity {
                 state.linear_velocity.z -= 9.81 * dt;
             }
-            if let Some(floor_z) = floor_height {
+            if let Some((floor_z, surface_friction)) = support_surface {
                 let angular_radians = state.angular_velocity * std::f32::consts::PI / 180.0;
                 let mut contact_force = CoreVec3::ZERO;
                 let mut contact_torque = CoreVec3::ZERO;
@@ -9031,9 +9041,11 @@ impl EditorApp {
                             )
                         })
                         .unwrap_or(body_contact_mass);
+                    let wheel_friction =
+                        collider_friction_coefficient(*shape, *rotation, *friction, tangent);
                     let friction_force = contact_friction_force(
                         tangent,
-                        collider_friction_coefficient(*shape, *rotation, *friction, tangent),
+                        (wheel_friction * surface_friction).sqrt(),
                         support_load,
                         effective_contact_mass,
                         dt,
@@ -9067,6 +9079,14 @@ impl EditorApp {
                     );
                 }
             }
+            resolve_general_collider_contacts(
+                &mut state.position,
+                &mut state.linear_velocity,
+                scene_body_position,
+                &general_body_colliders,
+                &general_external_colliders,
+                dt,
+            );
             state.position = state.position + state.linear_velocity * dt;
             state.rotation_degrees = state.rotation_degrees + state.angular_velocity * dt;
             state.linear_velocity =
@@ -15147,6 +15167,248 @@ fn collider_vertical_extent(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WorldCollider {
+    center: CoreVec3,
+    half_extents: CoreVec3,
+    restitution: f32,
+    friction: f32,
+    shape: ColliderShape,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ColliderContact {
+    normal: CoreVec3,
+    penetration: f32,
+    restitution: f32,
+    friction: f32,
+}
+
+fn world_collider(transform: Transform, component: &Component) -> Option<WorldCollider> {
+    let Component::Collider {
+        shape,
+        center,
+        half_extents,
+        radius,
+        height,
+        restitution,
+        friction,
+        ..
+    } = component
+    else {
+        return None;
+    };
+    let shape = ColliderShape::from_storage(shape);
+    let center = transform.translation
+        + transform
+            .rotation
+            .rotate(transform.scale.component_mul(*center));
+    let scale = CoreVec3::new(
+        transform.scale.x.abs(),
+        transform.scale.y.abs(),
+        transform.scale.z.abs(),
+    );
+    let half_extents = match shape {
+        ColliderShape::Sphere => {
+            let radius = radius.max(0.001) * scale.x.max(scale.y).max(scale.z);
+            CoreVec3::new(radius, radius, radius)
+        }
+        ColliderShape::Cylinder => {
+            let axis = transform
+                .rotation
+                .rotate(CoreVec3::new(0.0, 0.0, 1.0))
+                .normalized();
+            let radial = radius.max(0.001) * scale.x.max(scale.y);
+            let axial = (height.max(0.002) * 0.5) * scale.z;
+            CoreVec3::new(
+                axial * axis.x.abs() + radial * (1.0 - axis.x * axis.x).max(0.0).sqrt(),
+                axial * axis.y.abs() + radial * (1.0 - axis.y * axis.y).max(0.0).sqrt(),
+                axial * axis.z.abs() + radial * (1.0 - axis.z * axis.z).max(0.0).sqrt(),
+            )
+        }
+        ColliderShape::Box | ColliderShape::Flat => {
+            let scaled = scale.component_mul(*half_extents);
+            let x = transform.rotation.rotate(CoreVec3::new(scaled.x, 0.0, 0.0));
+            let y = transform.rotation.rotate(CoreVec3::new(0.0, scaled.y, 0.0));
+            let z = transform.rotation.rotate(CoreVec3::new(0.0, 0.0, scaled.z));
+            CoreVec3::new(
+                x.x.abs() + y.x.abs() + z.x.abs(),
+                x.y.abs() + y.y.abs() + z.y.abs(),
+                x.z.abs() + y.z.abs() + z.z.abs(),
+            )
+        }
+    };
+    Some(WorldCollider {
+        center,
+        half_extents,
+        restitution: restitution.clamp(0.0, 1.0),
+        friction: ((friction.x.max(0.0) + friction.y.max(0.0) + friction.z.max(0.0)) / 3.0)
+            .max(0.0),
+        shape,
+    })
+}
+
+fn collider_pair_contact(a: WorldCollider, b: WorldCollider) -> Option<ColliderContact> {
+    if a.shape == ColliderShape::Sphere && b.shape == ColliderShape::Sphere {
+        let delta = a.center - b.center;
+        let distance = delta.length();
+        let combined_radius = a.half_extents.x + b.half_extents.x;
+        if distance >= combined_radius {
+            return None;
+        }
+        return Some(ColliderContact {
+            normal: if distance > 1.0e-6 {
+                delta * (1.0 / distance)
+            } else {
+                CoreVec3::Z
+            },
+            penetration: combined_radius - distance,
+            restitution: a.restitution.max(b.restitution),
+            friction: (a.friction * b.friction).sqrt(),
+        });
+    }
+    if a.shape == ColliderShape::Sphere && b.shape != ColliderShape::Sphere {
+        return sphere_bounds_contact(a, b);
+    }
+    if b.shape == ColliderShape::Sphere && a.shape != ColliderShape::Sphere {
+        return sphere_bounds_contact(b, a).map(|contact| ColliderContact {
+            normal: contact.normal * -1.0,
+            ..contact
+        });
+    }
+    let delta = a.center - b.center;
+    let overlap = CoreVec3::new(
+        a.half_extents.x + b.half_extents.x - delta.x.abs(),
+        a.half_extents.y + b.half_extents.y - delta.y.abs(),
+        a.half_extents.z + b.half_extents.z - delta.z.abs(),
+    );
+    if overlap.x <= 0.0 || overlap.y <= 0.0 || overlap.z <= 0.0 {
+        return None;
+    }
+    let (normal, penetration) = if overlap.x <= overlap.y && overlap.x <= overlap.z {
+        (
+            CoreVec3::new(if delta.x < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0),
+            overlap.x,
+        )
+    } else if overlap.y <= overlap.z {
+        (
+            CoreVec3::new(0.0, if delta.y < 0.0 { -1.0 } else { 1.0 }, 0.0),
+            overlap.y,
+        )
+    } else {
+        (
+            CoreVec3::new(0.0, 0.0, if delta.z < 0.0 { -1.0 } else { 1.0 }),
+            overlap.z,
+        )
+    };
+    Some(ColliderContact {
+        normal,
+        penetration,
+        restitution: a.restitution.max(b.restitution),
+        friction: (a.friction * b.friction).sqrt(),
+    })
+}
+
+fn sphere_bounds_contact(sphere: WorldCollider, bounds: WorldCollider) -> Option<ColliderContact> {
+    let minimum = bounds.center - bounds.half_extents;
+    let maximum = bounds.center + bounds.half_extents;
+    let closest = CoreVec3::new(
+        sphere.center.x.clamp(minimum.x, maximum.x),
+        sphere.center.y.clamp(minimum.y, maximum.y),
+        sphere.center.z.clamp(minimum.z, maximum.z),
+    );
+    let delta = sphere.center - closest;
+    let distance = delta.length();
+    let radius = sphere.half_extents.x;
+    if distance >= radius {
+        return None;
+    }
+    if distance > 1.0e-6 {
+        return Some(ColliderContact {
+            normal: delta * (1.0 / distance),
+            penetration: radius - distance,
+            restitution: sphere.restitution.max(bounds.restitution),
+            friction: (sphere.friction * bounds.friction).sqrt(),
+        });
+    }
+    // The center is inside the bounds. The AABB minimum-translation axis
+    // provides a stable escape direction instead of an undefined zero normal.
+    let distances = [
+        (sphere.center.x - minimum.x, CoreVec3::new(-1.0, 0.0, 0.0)),
+        (maximum.x - sphere.center.x, CoreVec3::X),
+        (sphere.center.y - minimum.y, CoreVec3::new(0.0, -1.0, 0.0)),
+        (maximum.y - sphere.center.y, CoreVec3::Y),
+        (sphere.center.z - minimum.z, CoreVec3::new(0.0, 0.0, -1.0)),
+        (maximum.z - sphere.center.z, CoreVec3::Z),
+    ];
+    let (surface_distance, normal) = distances
+        .into_iter()
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .unwrap();
+    Some(ColliderContact {
+        normal,
+        penetration: radius + surface_distance,
+        restitution: sphere.restitution.max(bounds.restitution),
+        friction: (sphere.friction * bounds.friction).sqrt(),
+    })
+}
+
+fn collider_support_surface(position: CoreVec3, colliders: &[WorldCollider]) -> Option<(f32, f32)> {
+    colliders
+        .iter()
+        .filter(|collider| {
+            matches!(collider.shape, ColliderShape::Box | ColliderShape::Flat)
+                && position.x >= collider.center.x - collider.half_extents.x - f32::EPSILON
+                && position.x <= collider.center.x + collider.half_extents.x + f32::EPSILON
+                && position.y >= collider.center.y - collider.half_extents.y - f32::EPSILON
+                && position.y <= collider.center.y + collider.half_extents.y + f32::EPSILON
+        })
+        .map(|collider| {
+            (
+                collider.center.z + collider.half_extents.z,
+                collider.friction,
+            )
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+}
+
+fn resolve_general_collider_contacts(
+    position: &mut CoreVec3,
+    velocity: &mut CoreVec3,
+    scene_body_position: CoreVec3,
+    body_colliders: &[WorldCollider],
+    external_colliders: &[WorldCollider],
+    dt: f32,
+) -> usize {
+    let mut resolved = 0;
+    for body in body_colliders {
+        for external in external_colliders {
+            let shifted_body = WorldCollider {
+                center: body.center + (*position - scene_body_position),
+                ..*body
+            };
+            let Some(contact) = collider_pair_contact(shifted_body, *external) else {
+                continue;
+            };
+            *position = *position + contact.normal * contact.penetration;
+            let inward_speed = velocity.dot(contact.normal);
+            if inward_speed < 0.0 {
+                *velocity =
+                    *velocity - contact.normal * ((1.0 + contact.restitution) * inward_speed);
+            }
+            let normal_speed = inward_speed.abs().max(9.81 * dt);
+            let tangent = *velocity - contact.normal * velocity.dot(contact.normal);
+            let tangent_speed = tangent.length();
+            if tangent_speed > 1.0e-6 {
+                let removed_speed = (contact.friction * normal_speed).min(tangent_speed);
+                *velocity = *velocity - tangent * (removed_speed / tangent_speed);
+            }
+            resolved += 1;
+        }
+    }
+    resolved
+}
+
 fn force_cut_scalar(value: f32, cutoff: f32) -> f32 {
     if value.abs() <= cutoff.max(0.0) {
         0.0
@@ -15925,6 +16187,85 @@ mod tests {
         };
         assert_eq!(half_extents, CoreVec3::new(2.0, 2.0, 0.005));
         assert_eq!(height, 0.01);
+    }
+
+    #[test]
+    fn arbitrary_collider_pairs_report_separating_contact() {
+        let collider = |center, half_extents, shape| WorldCollider {
+            center,
+            half_extents,
+            restitution: 0.0,
+            friction: 0.8,
+            shape,
+        };
+        let car = collider(
+            CoreVec3::new(0.0, 0.0, 1.0),
+            CoreVec3::new(1.0, 0.5, 0.5),
+            ColliderShape::Box,
+        );
+        let circuit = collider(
+            CoreVec3::ZERO,
+            CoreVec3::new(45.0, 32.5, 0.6),
+            ColliderShape::Box,
+        );
+        let contact = collider_pair_contact(car, circuit).expect("car intersects circuit surface");
+        assert_eq!(contact.normal, CoreVec3::Z);
+        assert!((contact.penetration - 0.1).abs() < 1.0e-6);
+        let separated = WorldCollider {
+            center: CoreVec3::new(0.0, 0.0, 2.0),
+            ..car
+        };
+        assert!(collider_pair_contact(separated, circuit).is_none());
+    }
+
+    #[test]
+    fn general_contact_stops_inward_motion_and_corrects_penetration() {
+        let body = WorldCollider {
+            center: CoreVec3::new(0.0, 0.0, 0.4),
+            half_extents: CoreVec3::new(0.5, 0.5, 0.5),
+            restitution: 0.0,
+            friction: 0.8,
+            shape: ColliderShape::Sphere,
+        };
+        let floor = WorldCollider {
+            center: CoreVec3::ZERO,
+            half_extents: CoreVec3::new(10.0, 10.0, 0.05),
+            restitution: 0.0,
+            friction: 0.8,
+            shape: ColliderShape::Flat,
+        };
+        let mut position = CoreVec3::ZERO;
+        let mut velocity = CoreVec3::new(2.0, 0.0, -3.0);
+        assert_eq!(
+            resolve_general_collider_contacts(
+                &mut position,
+                &mut velocity,
+                CoreVec3::ZERO,
+                &[body],
+                &[floor],
+                1.0 / 60.0,
+            ),
+            1
+        );
+        assert!(position.z > 0.0);
+        assert!(velocity.z >= 0.0);
+        assert!(velocity.x < 2.0);
+    }
+
+    #[test]
+    fn box_collider_exposes_bounded_surface_for_wheel_friction() {
+        let circuit = WorldCollider {
+            center: CoreVec3::new(0.0, 0.0, -0.2),
+            half_extents: CoreVec3::new(45.0, 32.5, 0.2),
+            restitution: 0.0,
+            friction: 0.8,
+            shape: ColliderShape::Box,
+        };
+        assert_eq!(
+            collider_support_surface(CoreVec3::new(34.0, 0.0, 2.0), &[circuit]),
+            Some((0.0, 0.8))
+        );
+        assert!(collider_support_surface(CoreVec3::new(50.0, 0.0, 2.0), &[circuit]).is_none());
     }
 
     #[test]
