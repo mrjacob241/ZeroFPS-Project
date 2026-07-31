@@ -257,7 +257,18 @@ pub enum Component {
         primitive: Option<usize>,
     },
     Camera {
+        #[serde(default = "default_camera_field_of_view")]
         field_of_view_degrees: f32,
+        #[serde(default = "default_camera_projection")]
+        projection: String,
+        #[serde(default = "default_camera_aspect_ratio")]
+        aspect_ratio: f32,
+        #[serde(default = "default_camera_near_clip")]
+        near_clip: f32,
+        #[serde(default = "default_camera_far_clip")]
+        far_clip: f32,
+        #[serde(default = "default_camera_orthographic_size")]
+        orthographic_size: f32,
     },
     Light {
         intensity: f32,
@@ -302,6 +313,9 @@ pub enum Component {
         automatic_mass: bool,
         #[serde(default = "default_collider_friction")]
         friction: Vec3,
+        /// Percentage by which the shape is inflated for friction contact only.
+        #[serde(default = "default_collider_friction_margin_percent")]
+        friction_margin_percent: f32,
         /// Cylinder-only rotational joint: "none", "wheel", or "engine".
         #[serde(default)]
         joint: String,
@@ -318,6 +332,30 @@ pub enum Component {
     Marker {
         kind: String,
     },
+}
+
+fn default_camera_field_of_view() -> f32 {
+    60.0
+}
+
+fn default_camera_projection() -> String {
+    "perspective".into()
+}
+
+fn default_camera_aspect_ratio() -> f32 {
+    16.0 / 9.0
+}
+
+fn default_camera_near_clip() -> f32 {
+    0.1
+}
+
+fn default_camera_far_clip() -> f32 {
+    1_000.0
+}
+
+fn default_camera_orthographic_size() -> f32 {
+    10.0
 }
 
 fn default_collider_half_extents() -> Vec3 {
@@ -361,7 +399,11 @@ fn default_collider_mass() -> f32 {
 }
 
 fn default_collider_friction() -> Vec3 {
-    Vec3::new(0.8, 0.8, 0.8)
+    Vec3::new(100.0, 100.0, 100.0)
+}
+
+fn default_collider_friction_margin_percent() -> f32 {
+    5.0
 }
 
 fn default_true() -> bool {

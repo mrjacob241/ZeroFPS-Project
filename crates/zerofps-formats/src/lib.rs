@@ -419,6 +419,7 @@ mod tests {
                     mass: 5_301.4375,
                     automatic_mass: true,
                     friction: Vec3::new(0.05, 0.8, 0.8),
+                    friction_margin_percent: 5.0,
                     joint: "engine".into(),
                 },
             )
@@ -438,6 +439,7 @@ mod tests {
                 radius: 0.5,
                 height: 1.0,
                 restitution: 0.0,
+                friction_margin_percent: 5.0,
                 ..
             } if half_extents == Vec3::new(0.5, 0.5, 0.5)
         ));

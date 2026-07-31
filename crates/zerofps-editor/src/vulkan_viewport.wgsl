@@ -1,8 +1,12 @@
 struct Camera {
     yaw: f32,
     pitch: f32,
+    roll: f32,
     zoom: f32,
     grid_spacing: f32,
+    _camera_padding_0: f32,
+    _camera_padding_1: f32,
+    _camera_padding_2: f32,
     camera_target: vec4<f32>,
     viewport: vec2<f32>,
     projection: u32,
@@ -238,9 +242,13 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let cy = cos(camera.yaw);
     let sp = sin(camera.pitch);
     let cp = cos(camera.pitch);
-    let view_x = point.x * cy - point.y * sy;
+    let base_x = point.x * cy - point.y * sy;
     let forward = point.x * sy + point.y * cy;
-    let view_y = point.z * cp - forward * sp;
+    let base_y = point.z * cp - forward * sp;
+    let sr = sin(camera.roll);
+    let cr = cos(camera.roll);
+    let view_x = base_x * cr - base_y * sr;
+    let view_y = base_x * sr + base_y * cr;
     let view_depth = point.z * sp + forward * cp;
     let camera_distance = 20.0 * camera.grid_spacing;
     let depth = camera_distance + view_depth;

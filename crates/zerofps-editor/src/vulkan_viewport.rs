@@ -40,8 +40,10 @@ pub struct GpuBatch {
 struct CameraUniform {
     yaw: f32,
     pitch: f32,
+    roll: f32,
     zoom: f32,
     grid_spacing: f32,
+    camera_padding: [f32; 3],
     target: [f32; 4],
     viewport: [f32; 2],
     projection: u32,
@@ -342,7 +344,7 @@ impl VulkanViewport {
     pub fn render_resident(
         &mut self,
         size: Vec2,
-        camera: (f32, f32, f32, Vec3, f32, u32),
+        camera: (f32, f32, f32, f32, Vec3, f32, u32),
         batches: &[GpuBatch],
         global_light_enabled: bool,
         point_lights: &[ViewportLight],
@@ -442,11 +444,13 @@ impl VulkanViewport {
         let uniform = CameraUniform {
             yaw: camera.0,
             pitch: camera.1,
-            zoom: camera.2,
-            grid_spacing: camera.4,
-            target: [camera.3.x, camera.3.y, camera.3.z, 0.0],
+            roll: camera.2,
+            zoom: camera.3,
+            grid_spacing: camera.5,
+            camera_padding: [0.0; 3],
+            target: [camera.4.x, camera.4.y, camera.4.z, 0.0],
             viewport: [width as f32, height as f32],
-            projection: camera.5,
+            projection: camera.6,
             padding: 0,
             global_light_enabled: u32::from(global_light_enabled),
             point_light_count: point_lights.len().min(MAX_VIEWPORT_LIGHTS) as u32,
@@ -1430,7 +1434,7 @@ mod tests {
         let color = renderer
             .render_resident(
                 Vec2::new(128.0, 128.0),
-                (0.0, 0.0, 1.0, Vec3::ZERO, 1.0, 1),
+                (0.0, 0.0, 0.0, 1.0, Vec3::ZERO, 1.0, 1),
                 &batches,
                 true,
                 &lights,

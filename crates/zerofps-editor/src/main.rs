@@ -29,7 +29,7 @@ use zerofps_assets::{
 };
 use zerofps_core::{
     Attribute, AttributeDeclaration, AttributeKey, Component, GeometryTree, NodeId, Quat,
-    Transform, Vec3 as CoreVec3,
+    ReparentMode, Transform, Vec3 as CoreVec3,
 };
 use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
 
@@ -204,6 +204,11 @@ impl EditorScene {
             }),
             ObjectKind::Camera => Some(Component::Camera {
                 field_of_view_degrees: 60.0,
+                projection: "perspective".into(),
+                aspect_ratio: 16.0 / 9.0,
+                near_clip: 0.1,
+                far_clip: 1_000.0,
+                orthographic_size: 10.0,
             }),
             ObjectKind::Empty => None,
         };
@@ -238,6 +243,10 @@ impl EditorScene {
                 .map(|v| v.value),
             Some(Attribute::Bool(true))
         )
+    }
+
+    fn participates_in_physics(&self, id: NodeId) -> bool {
+        self.kind(id) != ObjectKind::Camera
     }
 
     fn remove_selected(&mut self) {
@@ -316,10 +325,15 @@ enum PlayState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
     Assets,
-    Inputs,
     Scripts,
     Console,
     Telemetry,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Inspector,
+    Inputs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -576,6 +590,8 @@ enum NodeSettings {
         throttle: f32,
         torque: f32,
         reverse: bool,
+        auto_braking: bool,
+        max_rpm: f32,
     },
     ObjectTransform {
         object_index: usize,
@@ -772,6 +788,8 @@ impl NodeSettings {
                 throttle: 0.0,
                 torque: 100.0,
                 reverse: false,
+                auto_braking: false,
+                max_rpm: 6_000.0,
             },
             30 => Self::Algebra {
                 expression: "x + y * z".into(),
@@ -845,6 +863,15 @@ struct PreviewTriangle {
     transmission: f32,
     ior: f32,
     casts_shadows: bool,
+}
+
+#[derive(Clone)]
+struct SceneCameraPreview {
+    transform: Transform,
+    perspective: bool,
+    field_of_view_degrees: f32,
+    aspect_ratio: f32,
+    orthographic_size: f32,
 }
 
 const MAX_VIEWPORT_LIGHTS: usize = 8;
@@ -926,7 +953,7 @@ struct RenderJob {
     key: DepthCacheKey,
     viewport_size: Vec2,
     triangles: Arc<Vec<PreviewTriangle>>,
-    camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     lighting: ViewportLighting,
     show_grid: bool,
     mode: ViewportMode,
@@ -939,7 +966,7 @@ struct RenderJob {
 struct RenderResult {
     key: DepthCacheKey,
     frame: DepthFrame,
-    camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     triangles: Arc<Vec<PreviewTriangle>>,
     show_grid: bool,
     mode: ViewportMode,
@@ -1007,7 +1034,7 @@ struct DisplayWorker {
 }
 
 struct PresentedView {
-    camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     triangles: Arc<Vec<PreviewTriangle>>,
     show_grid: bool,
     mode: ViewportMode,
@@ -1376,7 +1403,7 @@ impl DisplayWorker {
                                 }
                             };
                             prepare_time = prepare_started.elapsed();
-                            let projection = match job.camera.5 {
+                            let projection = match job.camera.6 {
                                 ProjectionMode::Perspective => 0,
                                 ProjectionMode::Orthographic => 1,
                             };
@@ -1389,6 +1416,7 @@ impl DisplayWorker {
                                         job.camera.2,
                                         job.camera.3,
                                         job.camera.4,
+                                        job.camera.5,
                                         projection,
                                     ),
                                     &batches,
@@ -1592,6 +1620,7 @@ struct DepthCacheKey {
     size: [usize; 2],
     yaw: f32,
     pitch: f32,
+    roll: f32,
     zoom: f32,
     target: CoreVec3,
     grid_spacing: f32,
@@ -1615,6 +1644,7 @@ struct EditorApp {
     play_state: PlayState,
     build_started: Option<Instant>,
     bottom_tab: BottomTab,
+    inspector_tab: InspectorTab,
     material_tab: MaterialTab,
     compositor_pan: Vec2,
     compositor_zoom: f32,
@@ -1679,6 +1709,7 @@ struct EditorApp {
     texture_paint_heatmap: bool,
     advanced: bool,
     global_light_enabled: bool,
+    camera_preview_visible: bool,
     global_shadow_resolution: u32,
     shadow_quality: usize,
     shadow_blur_radius: usize,
@@ -1694,6 +1725,7 @@ struct EditorApp {
     camera_zoom: f32,
     camera_target: CoreVec3,
     hierarchy_filter: String,
+    hierarchy_drag_candidate: Option<(NodeId, Instant)>,
     logs: Vec<LogEntry>,
     project_path: PathBuf,
     project_has_destination: bool,
@@ -1747,6 +1779,7 @@ impl EditorApp {
             play_state: PlayState::Editing,
             build_started: None,
             bottom_tab: BottomTab::Assets,
+            inspector_tab: InspectorTab::Inspector,
             material_tab: MaterialTab::Shader,
             compositor_pan: Vec2::ZERO,
             compositor_zoom: 1.0,
@@ -1819,6 +1852,7 @@ impl EditorApp {
             texture_paint_heatmap: true,
             advanced: false,
             global_light_enabled: true,
+            camera_preview_visible: false,
             global_shadow_resolution: 512,
             shadow_quality: 3,
             shadow_blur_radius: 1,
@@ -1834,6 +1868,7 @@ impl EditorApp {
             camera_zoom: 1.0,
             camera_target: CoreVec3::ZERO,
             hierarchy_filter: String::new(),
+            hierarchy_drag_candidate: None,
             logs: vec![
                 LogEntry {
                     level: "INFO",
@@ -2544,6 +2579,30 @@ impl EditorApp {
         self.redo_stack.clear();
         self.project_dirty = true;
         self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    fn record_camera_only_undo(&mut self, previous: GeometryTree) {
+        self.undo_stack.push(previous);
+        if self.undo_stack.len() > 100 {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+        self.project_dirty = true;
+        self.viewport_requested_key = None;
+    }
+
+    fn subtree_affects_render_or_shadows(&self, id: NodeId) -> bool {
+        let Ok(node) = self.scene.tree.node(id) else {
+            return false;
+        };
+        node.components
+            .iter()
+            .any(|component| matches!(component, Component::Model { .. } | Component::Light { .. }))
+            || node
+                .children()
+                .iter()
+                .copied()
+                .any(|child| self.subtree_affects_render_or_shadows(child))
     }
 
     fn undo(&mut self) {
@@ -3482,12 +3541,16 @@ impl EditorApp {
                     throttle,
                     torque,
                     reverse,
+                    auto_braking,
+                    max_rpm,
                 } => {
                     for (suffix, value) in [
                         ("object_index", object_index.to_string()),
                         ("engine_throttle", throttle.to_string()),
                         ("engine_torque", torque.to_string()),
                         ("engine_reverse", reverse.to_string()),
+                        ("engine_auto_braking", auto_braking.to_string()),
+                        ("engine_max_rpm", max_rpm.to_string()),
                     ] {
                         project
                             .project
@@ -4018,6 +4081,18 @@ impl EditorApp {
                             .get(&format!("compositor.node.{id}.engine_reverse"))
                             .and_then(|value| value.parse().ok())
                             .unwrap_or(false),
+                        auto_braking: properties
+                            .get(&format!("compositor.node.{id}.engine_auto_braking"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(false),
+                        max_rpm: properties
+                            .get(&format!("compositor.node.{id}.engine_max_rpm"))
+                            .or_else(|| {
+                                properties
+                                    .get(&format!("compositor.node.{id}.engine_throttle_rpm_ratio"))
+                            })
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(6_000.0),
                     },
                     30 => NodeSettings::Algebra {
                         expression: properties
@@ -5184,6 +5259,8 @@ impl EditorApp {
                     ref mut throttle,
                     ref mut torque,
                     ref mut reverse,
+                    ref mut auto_braking,
+                    ref mut max_rpm,
                     ..
                 } = self.compositor_nodes[pos].settings
                 else {
@@ -5205,6 +5282,20 @@ impl EditorApp {
                     )
                     .changed();
                 changed |= ui.checkbox(reverse, "Reverse direction").changed();
+                changed |= ui.checkbox(auto_braking, "Auto-Braking").changed();
+                changed |= ui
+                    .add_enabled(
+                        *auto_braking,
+                        egui::DragValue::new(max_rpm)
+                            .range(0.0..=1_000_000.0)
+                            .speed(50.0)
+                            .suffix(" RPM")
+                            .prefix("Max RPM "),
+                    )
+                    .on_hover_text(
+                        "Available when Auto-Braking is enabled. Throttle selects a target up to this RPM; the engine accelerates toward it and applies reverse torque above it.",
+                    )
+                    .changed();
                 ui.small("Drives an Engine cylinder around its local Z axle.");
             }
             _ => {}
@@ -5401,23 +5492,13 @@ impl EditorApp {
                                 ui.close_menu();
                             }
                         });
+                        ui.menu_button("Camera", |ui| {
+                            if ui.button("Camera").clicked() {
+                                self.add_camera_object();
+                                ui.close_menu();
+                            }
+                        });
                     });
-                    let global_light = ui.selectable_label(
-                        self.global_light_enabled,
-                        if self.global_light_enabled {
-                            "☀ Global Light"
-                        } else {
-                            "○ Global Light"
-                        },
-                    );
-                    if global_light
-                        .on_hover_text("Toggle the editor's global directional light")
-                        .clicked()
-                    {
-                        self.global_light_enabled = !self.global_light_enabled;
-                        self.scene_revision = self.scene_revision.wrapping_add(1);
-                        self.project_dirty = true;
-                    }
                     for title in ["Scene", "Build", "Window"] {
                         ui.menu_button(title, |ui| {
                             ui.label(format!("{title} commands"));
@@ -5791,8 +5872,31 @@ impl EditorApp {
                     )
                     .show(ui, |ui| {
                         let roots = self.scene.tree.roots().to_vec();
+                        let mut reparent = None;
                         for root in roots {
-                            self.object_tree(ui, root, 0);
+                            if let Some(operation) = self.object_tree(ui, root, 0) {
+                                reparent = Some(operation);
+                            }
+                        }
+                        if egui::DragAndDrop::has_payload_of_type::<NodeId>(ui.ctx()) {
+                            let (_, dropped) = ui.dnd_drop_zone::<NodeId, _>(
+                                egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 5)),
+                                |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.centered_and_justified(|ui| {
+                                        ui.weak("Drop here to move to scene root");
+                                    });
+                                },
+                            );
+                            if let Some(child) = dropped {
+                                reparent = Some((*child, None));
+                            }
+                        }
+                        if let Some((child, parent)) = reparent {
+                            self.reparent_hierarchy_object(child, parent);
+                        }
+                        if !ui.input(|input| input.pointer.primary_down()) {
+                            self.hierarchy_drag_candidate = None;
                         }
                         ui.add_space(10.0);
                         if ui.button("+ Add object").clicked() {
@@ -5805,46 +5909,139 @@ impl EditorApp {
             });
     }
 
-    fn object_tree(&mut self, ui: &mut egui::Ui, id: NodeId, depth: usize) {
+    fn object_tree(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: NodeId,
+        depth: usize,
+    ) -> Option<(NodeId, Option<NodeId>)> {
         let Ok(object) = self.scene.tree.node(id) else {
-            return;
+            return None;
         };
         let name = object.name.clone();
         let children = object.children().to_vec();
         let kind = self.scene.kind(id);
-        ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 13.0);
-            if !children.is_empty() {
-                ui.small("⌄");
-            } else {
-                ui.add_space(11.0);
-            }
-            let selected = self.scene.selected == Some(id);
-            if ui
-                .selectable_label(selected, format!("{}  {}", kind.icon(), name))
-                .clicked()
-            {
+        let (_, dropped) = ui.dnd_drop_zone::<NodeId, _>(egui::Frame::new(), |ui| {
+            let response = ui
+                .horizontal(|ui| {
+                    ui.add_space(depth as f32 * 13.0);
+                    if !children.is_empty() {
+                        ui.small("⌄");
+                    } else {
+                        ui.add_space(11.0);
+                    }
+                    let selected = self.scene.selected == Some(id);
+                    ui.selectable_label(selected, format!("{}  {}", kind.icon(), name))
+                })
+                .inner;
+            let drag_response = ui.interact(
+                response.rect,
+                Id::new(("hierarchy_object_drag", id)),
+                Sense::click_and_drag(),
+            );
+            let row_response = drag_response | response;
+            if row_response.clicked() {
                 self.scene.selected = Some(id);
             }
+            if row_response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
+                self.hierarchy_drag_candidate = Some((id, Instant::now()));
+            }
+            if let Some((candidate, started)) = self.hierarchy_drag_candidate
+                && candidate == id
+                && ui.input(|input| input.pointer.primary_down())
+            {
+                const DRAG_HOLD: Duration = Duration::from_millis(220);
+                if started.elapsed() >= DRAG_HOLD && row_response.dragged() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), id);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else {
+                    ui.ctx()
+                        .request_repaint_after(DRAG_HOLD.saturating_sub(started.elapsed()));
+                }
+            }
         });
+        let mut reparent = dropped.map(|child| (*child, Some(id)));
         for child in children {
-            self.object_tree(ui, child, depth + 1);
+            if let Some(operation) = self.object_tree(ui, child, depth + 1) {
+                reparent = Some(operation);
+            }
+        }
+        reparent
+    }
+
+    fn reparent_hierarchy_object(&mut self, child: NodeId, parent: Option<NodeId>) {
+        if self
+            .scene
+            .tree
+            .node(child)
+            .ok()
+            .and_then(|node| node.parent())
+            == parent
+        {
+            return;
+        }
+        let previous = self.scene.tree.clone();
+        match self
+            .scene
+            .tree
+            .reparent(child, parent, ReparentMode::KeepGlobal)
+        {
+            Ok(()) => {
+                self.scene.selected = Some(child);
+                self.record_undo(previous);
+                self.scene_revision = self.scene_revision.wrapping_add(1);
+                self.project_dirty = true;
+                self.logs.push(LogEntry {
+                    level: "SCENE",
+                    color: Color32::from_rgb(103, 191, 255),
+                    message: match parent {
+                        Some(parent) => format!(
+                            "Moved object under {}",
+                            self.scene
+                                .tree
+                                .node(parent)
+                                .map(|node| node.name.as_str())
+                                .unwrap_or("parent")
+                        ),
+                        None => "Moved object to scene root".into(),
+                    },
+                });
+            }
+            Err(error) => self.logs.push(LogEntry {
+                level: "ERROR",
+                color: Color32::from_rgb(235, 91, 91),
+                message: format!("Could not reparent object: {error}"),
+            }),
         }
     }
 
     fn inspector(&mut self, ctx: &egui::Context) {
-        let selected_object_index = self
-            .scene
-            .selected
-            .and_then(|selected| self.scene.tree.iter().position(|(id, _)| id == selected));
-        let mut compositor_handle_changed = false;
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(300.0)
             .width_range(240.0..=430.0)
             .frame(panel_frame(Color32::from_rgb(28, 30, 37)))
             .show(ctx, |ui| {
-                section_title(ui, "INSPECTOR", "⋮");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Inspector,
+                        "Inspector",
+                    );
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Inputs,
+                        "Inputs",
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.weak("⋮");
+                    });
+                });
+                ui.separator();
+                if self.inspector_tab == InspectorTab::Inputs {
+                    self.object_handles_panel(ui);
+                    return;
+                }
                 let inspector_height = ui.available_height();
                 let inspector_size = Vec2::new(ui.available_width(), inspector_height);
                 ui.allocate_ui(inspector_size, |ui| {
@@ -5894,6 +6091,25 @@ impl EditorApp {
                                     } => {
                                         Some((*intensity, *color, *radius, *shadow_resolution))
                                     }
+                                    _ => None,
+                                });
+                            let mut camera_component =
+                                node.components.iter().find_map(|component| match component {
+                                    Component::Camera {
+                                        field_of_view_degrees,
+                                        projection,
+                                        aspect_ratio,
+                                        near_clip,
+                                        far_clip,
+                                        orthographic_size,
+                                    } => Some((
+                                        *field_of_view_degrees,
+                                        projection.clone(),
+                                        *aspect_ratio,
+                                        *near_clip,
+                                        *far_clip,
+                                        *orthographic_size,
+                                    )),
                                     _ => None,
                                 });
                             let mut visible = self.scene.visible(id);
@@ -6082,6 +6298,118 @@ impl EditorApp {
                                     lighting_only_changed = true;
                                 }
                             }
+                            if let Some((
+                                ref mut field_of_view,
+                                ref mut projection,
+                                ref mut aspect_ratio,
+                                ref mut near_clip,
+                                ref mut far_clip,
+                                ref mut orthographic_size,
+                            )) = camera_component
+                            {
+                                let mut camera_changed = false;
+                                egui::CollapsingHeader::new(RichText::new("Camera").strong())
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        ui.label("Scene camera");
+                                        egui::ComboBox::from_id_salt(("camera_projection", id))
+                                            .selected_text(if projection == "orthographic" {
+                                                "Orthographic"
+                                            } else {
+                                                "Perspective"
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                camera_changed |= ui
+                                                    .selectable_value(
+                                                        projection,
+                                                        "perspective".into(),
+                                                        "Perspective",
+                                                    )
+                                                    .changed();
+                                                camera_changed |= ui
+                                                    .selectable_value(
+                                                        projection,
+                                                        "orthographic".into(),
+                                                        "Orthographic",
+                                                    )
+                                                    .changed();
+                                            });
+                                        if projection == "perspective" {
+                                            camera_changed |= ui
+                                                .add(
+                                                    egui::Slider::new(field_of_view, 1.0..=179.0)
+                                                        .text("Field of view")
+                                                        .suffix("°"),
+                                                )
+                                                .changed();
+                                        } else {
+                                            camera_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(orthographic_size)
+                                                        .speed(0.1)
+                                                        .range(0.001..=f32::MAX)
+                                                        .prefix("Size "),
+                                                )
+                                                .changed();
+                                        }
+                                        camera_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(aspect_ratio)
+                                                    .speed(0.01)
+                                                    .range(0.1..=10.0)
+                                                    .prefix("Aspect "),
+                                            )
+                                            .on_hover_text("Output width divided by output height")
+                                            .changed();
+                                        camera_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(near_clip)
+                                                    .speed(0.01)
+                                                    .range(0.0001..=f32::MAX)
+                                                    .prefix("Near clip "),
+                                            )
+                                            .changed();
+                                        camera_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(far_clip)
+                                                    .speed(1.0)
+                                                    .range(0.001..=f32::MAX)
+                                                    .prefix("Far clip "),
+                                            )
+                                            .changed();
+                                        ui.small("Local +Y is forward · local +Z is up");
+                                    });
+                                if camera_changed {
+                                    *field_of_view = field_of_view.clamp(1.0, 179.0);
+                                    *aspect_ratio = aspect_ratio.clamp(0.1, 10.0);
+                                    *near_clip = near_clip.max(0.0001);
+                                    *far_clip = far_clip.max(*near_clip + 0.0001);
+                                    *orthographic_size = orthographic_size.max(0.001);
+                                    if let Ok(node) = self.scene.tree.node_mut(id)
+                                        && let Some(Component::Camera {
+                                            field_of_view_degrees: stored_fov,
+                                            projection: stored_projection,
+                                            aspect_ratio: stored_aspect,
+                                            near_clip: stored_near,
+                                            far_clip: stored_far,
+                                            orthographic_size: stored_size,
+                                        }) = node
+                                            .components
+                                            .iter_mut()
+                                            .find(|component| {
+                                                matches!(component, Component::Camera { .. })
+                                            })
+                                    {
+                                        *stored_fov = *field_of_view;
+                                        *stored_projection = projection.clone();
+                                        *stored_aspect = *aspect_ratio;
+                                        *stored_near = *near_clip;
+                                        *stored_far = *far_clip;
+                                        *stored_size = *orthographic_size;
+                                    }
+                                    changed = true;
+                                }
+                            }
                             egui::CollapsingHeader::new(RichText::new("Mesh Renderer").strong())
                                 .default_open(true)
                                 .show(ui, |ui| {
@@ -6171,6 +6499,17 @@ impl EditorApp {
                             egui::CollapsingHeader::new(RichText::new("Collider").strong())
                                 .default_open(true)
                                 .show(ui, |ui| {
+                                    if kind == ObjectKind::Camera {
+                                        ui.weak(
+                                            "Cameras are weightless editor/game viewpoints and do not participate in collisions.",
+                                        );
+                                        if collider_component.is_some() {
+                                            collider_component = None;
+                                            remove_collider = true;
+                                            collider_changed = true;
+                                        }
+                                        return;
+                                    }
                                     if collider_component.is_none() {
                                         ui.small(
                                             "Colliders are independent from visible mesh geometry.",
@@ -6220,6 +6559,7 @@ impl EditorApp {
                                         mass,
                                         automatic_mass,
                                         friction,
+                                        friction_margin_percent,
                                         joint,
                                         ..
                                     }) = collider_component.as_mut()
@@ -6458,17 +6798,32 @@ impl EditorApp {
                                     }
                                     egui::CollapsingHeader::new("Friction")
                                         .default_open(true)
-                                        .show(ui, |ui| match selected_shape {
+                                        .show(ui, |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(friction_margin_percent)
+                                                        .range(0.0..=100.0)
+                                                        .speed(0.25)
+                                                        .suffix(" %")
+                                                        .prefix("Contact tolerance "),
+                                                )
+                                                .on_hover_text(
+                                                    "Inflates this collider only while detecting friction contact; collision boundaries remain unchanged.",
+                                                )
+                                                .changed()
+                                            {
+                                                collider_changed = true;
+                                            }
+                                            match selected_shape {
                                             ColliderShape::Sphere => {
                                                 let mut isotropic =
                                                     (friction.x + friction.y + friction.z) / 3.0;
                                                 if ui
                                                     .add(
-                                                        egui::Slider::new(
-                                                            &mut isotropic,
-                                                            0.0..=2.0,
-                                                        )
-                                                        .text("All directions"),
+                                                        egui::DragValue::new(&mut isotropic)
+                                                            .range(0.0..=f32::MAX)
+                                                            .speed(1.0)
+                                                            .prefix("All directions "),
                                                     )
                                                     .changed()
                                                 {
@@ -6486,8 +6841,10 @@ impl EditorApp {
                                                 ] {
                                                     if ui
                                                         .add(
-                                                            egui::Slider::new(value, 0.0..=2.0)
-                                                                .text(label),
+                                                            egui::DragValue::new(value)
+                                                                .range(0.0..=f32::MAX)
+                                                                .speed(1.0)
+                                                                .prefix(format!("{label} ")),
                                                         )
                                                         .changed()
                                                     {
@@ -6503,14 +6860,17 @@ impl EditorApp {
                                                 ] {
                                                     if ui
                                                         .add(
-                                                            egui::Slider::new(value, 0.0..=2.0)
-                                                                .text(label),
+                                                            egui::DragValue::new(value)
+                                                                .range(0.0..=f32::MAX)
+                                                                .speed(1.0)
+                                                                .prefix(format!("{label} ")),
                                                         )
                                                         .changed()
                                                     {
                                                         collider_changed = true;
                                                     }
                                                 }
+                                            }
                                             }
                                         });
                                     ui.horizontal(|ui| {
@@ -6937,67 +7297,6 @@ impl EditorApp {
                                         .weak(),
                                 );
                             });
-                            if let Some(object_index) = selected_object_index {
-                                let has_handles = self.compositor_nodes.iter().any(|node| {
-                                    matches!(
-                                        node.settings,
-                                        NodeSettings::ObjectHandle {
-                                            object_index: target,
-                                            ..
-                                        } if target == object_index
-                                    )
-                                });
-                                if has_handles {
-                                    egui::CollapsingHeader::new(
-                                        RichText::new("Object Handles").strong(),
-                                    )
-                                    .default_open(true)
-                                    .show(ui, |ui| {
-                                        for node in &mut self.compositor_nodes {
-                                            let NodeSettings::ObjectHandle {
-                                                object_index: target,
-                                                label,
-                                                control,
-                                                value,
-                                                minimum,
-                                                maximum,
-                                                source_handle,
-                                            } = &mut node.settings
-                                            else {
-                                                continue;
-                                            };
-                                            if *target != object_index {
-                                                continue;
-                                            }
-                                            ui.label(label.as_str());
-                                            let response = if *control == 0 {
-                                                ui.add_enabled(
-                                                    source_handle.is_none(),
-                                                    egui::Slider::new(value, *minimum..=*maximum)
-                                                        .show_value(true),
-                                                )
-                                            } else {
-                                                ui.add_enabled(
-                                                    source_handle.is_none(),
-                                                    egui::DragValue::new(value)
-                                                        .range(*minimum..=*maximum)
-                                                        .speed(
-                                                            ((*maximum - *minimum).abs() / 100.0)
-                                                                .max(0.001),
-                                                        ),
-                                                )
-                                            };
-                                            if source_handle.is_some() {
-                                                ui.small("Copied from another Object Handle");
-                                            }
-                                            if response.changed() {
-                                                compositor_handle_changed = true;
-                                                self.project_dirty = true;
-                                            }
-                                        }
-                                    });
-                                }
-                            }
                             if self.advanced {
                                 egui::CollapsingHeader::new("Advanced")
                                     .default_open(true)
@@ -7013,7 +7312,15 @@ impl EditorApp {
                                     });
                             }
                             if changed {
-                                self.record_undo(previous);
+                                if kind == ObjectKind::Camera
+                                    && !self.subtree_affects_render_or_shadows(id)
+                                {
+                                    // A leaf camera has no renderable mesh and cannot alter a
+                                    // shadow map. Its view tuple already invalidates the viewport.
+                                    self.record_camera_only_undo(previous);
+                                } else {
+                                    self.record_undo(previous);
+                                }
                             } else if lighting_only_changed {
                                 self.undo_stack.push(previous);
                                 if self.undo_stack.len() > 100 {
@@ -7031,13 +7338,6 @@ impl EditorApp {
                         });
                 });
             });
-        if compositor_handle_changed {
-            self.compositor_control_started = Some(Instant::now());
-            self.invalidate_all_object_handles();
-            // Vulkan work is coalesced by latest-request workers, so an
-            // additional UI debounce only adds visible control latency.
-            self.compositor_apply_due = Some(Instant::now());
-        }
     }
 
     fn bottom_panel(&mut self, ctx: &egui::Context) {
@@ -7049,7 +7349,6 @@ impl EditorApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     tab(ui, &mut self.bottom_tab, BottomTab::Assets, "Assets");
-                    tab(ui, &mut self.bottom_tab, BottomTab::Inputs, "Inputs");
                     tab(ui, &mut self.bottom_tab, BottomTab::Scripts, "Scripts");
                     tab(ui, &mut self.bottom_tab, BottomTab::Console, "Console");
                     tab(ui, &mut self.bottom_tab, BottomTab::Telemetry, "Telemetry");
@@ -7060,7 +7359,6 @@ impl EditorApp {
                 ui.separator();
                 match self.bottom_tab {
                     BottomTab::Assets => self.assets_panel(ui),
-                    BottomTab::Inputs => self.object_handles_panel(ui),
                     BottomTab::Scripts => scripts_panel(ui),
                     BottomTab::Console => console_panel(ui, &self.logs),
                     BottomTab::Telemetry => telemetry_panel(ui, self.play_state, &self.performance),
@@ -7323,6 +7621,24 @@ impl EditorApp {
         });
     }
 
+    fn add_camera_object(&mut self) {
+        let previous = self.scene.tree.clone();
+        let id = self.scene.add("Camera", ObjectKind::Camera, None);
+        let mut transform = Transform::IDENTITY;
+        transform.translation = self.camera_target
+            + CoreVec3::new(0.0, -self.grid_spacing * 4.0, self.grid_spacing * 2.0);
+        let _ = self.scene.tree.set_local_transform(id, transform);
+        self.scene.selected = Some(id);
+        self.record_undo(previous);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+        self.logs.push(LogEntry {
+            level: "SCENE",
+            color: Color32::from_rgb(255, 210, 48),
+            message: "Added `Camera` to the scene".into(),
+        });
+    }
+
     fn viewport_lighting(&self, _triangles: &[PreviewTriangle]) -> ViewportLighting {
         let points = self
             .scene
@@ -7494,6 +7810,8 @@ impl EditorApp {
                         throttle: 0.0,
                         torque: 100.0,
                         reverse: false,
+                        auto_braking: false,
+                        max_rpm: 6_000.0,
                     },
                     position: Vec2::new(340.0, 340.0),
                 });
@@ -7937,6 +8255,7 @@ impl EditorApp {
                         scale,
                         self.camera_yaw,
                         self.camera_pitch,
+                        0.0,
                         self.camera_target,
                         self.projection_mode,
                         self.grid_spacing,
@@ -8677,7 +8996,7 @@ impl EditorApp {
     }
 
     fn step_object_simulators(&mut self, dt: f32) {
-        let simulators = self
+        let mut simulators = self
             .compositor_nodes
             .iter()
             .filter_map(|node| match node.settings {
@@ -8703,6 +9022,13 @@ impl EditorApp {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        // A camera is a viewpoint, not a rigid body. Keep this runtime guard so
+        // legacy projects cannot give one mass, gravity, or collision response
+        // through an Object Simulator node.
+        simulators.retain(|(_, object_index, ..)| {
+            self.object_node_id(*object_index)
+                .is_some_and(|id| self.scene.participates_in_physics(id))
+        });
         let simulator_roots = simulators
             .iter()
             .filter_map(|simulator| {
@@ -8847,6 +9173,7 @@ impl EditorApp {
                 .tree
                 .iter()
                 .filter(|(id, _)| self.node_is_in_subtree(root_id, *id))
+                .filter(|(id, _)| self.scene.participates_in_physics(*id))
                 .filter_map(|(collider_id, node)| {
                     let transform = node.global_transform();
                     node.components.iter().find_map(|component| {
@@ -8856,6 +9183,7 @@ impl EditorApp {
                             restitution,
                             shape,
                             friction,
+                            friction_margin_percent,
                             mass,
                             radius,
                             joint,
@@ -8886,6 +9214,7 @@ impl EditorApp {
                             mass.max(0.0),
                             radius.max(0.001)
                                 * transform.scale.x.abs().max(transform.scale.y.abs()),
+                            friction_margin_percent.max(0.0),
                             CylinderJoint::from_storage(joint),
                         ))
                     })
@@ -8903,6 +9232,7 @@ impl EditorApp {
                 .tree
                 .iter()
                 .filter(|(id, _)| self.node_is_in_subtree(root_id, *id))
+                .filter(|(id, _)| self.scene.participates_in_physics(*id))
                 .flat_map(|(_, node)| {
                     let transform = node.global_transform();
                     node.components
@@ -8915,6 +9245,7 @@ impl EditorApp {
                 .tree
                 .iter()
                 .filter(|(id, _)| !self.node_is_in_subtree(root_id, *id))
+                .filter(|(id, _)| self.scene.participates_in_physics(*id))
                 .flat_map(|(_, node)| {
                     let transform = node.global_transform();
                     node.components
@@ -8926,7 +9257,7 @@ impl EditorApp {
                 collider_support_surface(scene_body_position, &general_external_colliders);
             let body_mass = body_colliders
                 .iter()
-                .map(|(_, _, _, _, _, _, _, mass, _, _)| *mass)
+                .map(|(_, _, _, _, _, _, _, mass, _, _, _)| *mass)
                 .sum::<f32>();
             let body_mass = if body_mass > 1.0e-6 {
                 body_mass
@@ -8963,7 +9294,7 @@ impl EditorApp {
             if gravity {
                 state.linear_velocity.z -= 9.81 * dt;
             }
-            if let Some((floor_z, surface_friction)) = support_surface {
+            if let Some((floor_z, surface_friction, surface_friction_tolerance)) = support_surface {
                 let angular_radians = state.angular_velocity * std::f32::consts::PI / 180.0;
                 let mut contact_force = CoreVec3::ZERO;
                 let mut contact_torque = CoreVec3::ZERO;
@@ -8972,8 +9303,11 @@ impl EditorApp {
                 const CONTACT_SKIN: f32 = 1.0e-4;
                 let active_contact_count = body_colliders
                     .iter()
-                    .filter(|(_, center, extent_z, ..)| {
-                        floor_z - (center.z - extent_z) >= -CONTACT_SKIN
+                    .filter(|(_, center, extent_z, _, _, _, _, _, _, margin, _)| {
+                        let tolerance = (friction_contact_tolerance(*extent_z, *margin)
+                            + surface_friction_tolerance)
+                            .max(CONTACT_SKIN);
+                        floor_z - (center.z - extent_z) >= -tolerance
                     })
                     .count();
                 let (active_contacts, has_active_contact) =
@@ -8990,11 +9324,16 @@ impl EditorApp {
                     friction,
                     collider_mass,
                     radius,
+                    friction_margin_percent,
                     joint,
                 ) in &body_colliders
                 {
                     let penetration = floor_z - (center.z - extent_z);
-                    if penetration < -CONTACT_SKIN {
+                    let tolerance =
+                        (friction_contact_tolerance(*extent_z, *friction_margin_percent)
+                            + surface_friction_tolerance)
+                            .max(CONTACT_SKIN);
+                    if penetration < -tolerance {
                         continue;
                     }
                     maximum_penetration = maximum_penetration.max(penetration.max(0.0));
@@ -9150,6 +9489,7 @@ impl EditorApp {
             .scene
             .tree
             .iter()
+            .filter(|(id, _)| self.scene.participates_in_physics(*id))
             .filter_map(|(id, object)| {
                 object
                     .components
@@ -9167,7 +9507,11 @@ impl EditorApp {
             })
             .collect::<BTreeSet<_>>();
         for root in &roots {
-            let torque = self.object_engine_torque(*root);
+            let current_angular_velocity = self
+                .joint_simulation_states
+                .get(root)
+                .map_or(0.0, |state| state.angular_velocity);
+            let torque = self.object_engine_torque(*root, current_angular_velocity);
             let Some((base_rotation, axle, inertia, joint)) =
                 self.scene.tree.node(*root).ok().and_then(|object| {
                     let transform = object.global_transform();
@@ -9237,7 +9581,7 @@ impl EditorApp {
             .retain(|root, _| roots.contains(root));
     }
 
-    fn object_engine_torque(&mut self, root: NodeId) -> CoreVec3 {
+    fn object_engine_torque(&mut self, root: NodeId, angular_velocity: f32) -> CoreVec3 {
         let engines = self
             .compositor_nodes
             .iter()
@@ -9247,8 +9591,10 @@ impl EditorApp {
                     throttle,
                     torque,
                     reverse,
+                    auto_braking,
+                    max_rpm,
                 } if self.object_node_id(object_index) == Some(root) => {
-                    Some((node.id, throttle, torque, reverse))
+                    Some((node.id, throttle, torque, reverse, auto_braking, max_rpm))
                 }
                 _ => None,
             })
@@ -9278,20 +9624,35 @@ impl EditorApp {
             .normalized();
         engines
             .into_iter()
-            .map(|(node_id, mut throttle, mut torque, reverse)| {
-                for (input, value) in [(0, &mut throttle), (1, &mut torque)] {
-                    if let Ok((source, output)) = self.compositor_input_source(node_id, input) {
-                        let mut visiting = BTreeSet::new();
-                        if let Some(resolved) =
-                            self.scalar_node_value(source, output, &mut visiting)
-                        {
-                            *value = resolved;
+            .map(
+                |(node_id, mut throttle, mut torque, reverse, auto_braking, max_rpm)| {
+                    for (input, value) in [(0, &mut throttle), (1, &mut torque)] {
+                        if let Ok((source, output)) = self.compositor_input_source(node_id, input) {
+                            let mut visiting = BTreeSet::new();
+                            if let Some(resolved) =
+                                self.scalar_node_value(source, output, &mut visiting)
+                            {
+                                *value = resolved;
+                            }
                         }
                     }
-                }
-                let direction = if reverse { -1.0 } else { 1.0 };
-                axle * throttle.clamp(-1.0, 1.0) * torque.max(0.0) * direction
-            })
+                    let direction = if reverse { -1.0 } else { 1.0 };
+                    let throttle = throttle.clamp(-1.0, 1.0);
+                    let maximum_torque = torque.max(0.0);
+                    let applied_torque = if auto_braking {
+                        smooth_rpm_governor_torque(
+                            throttle,
+                            angular_velocity,
+                            maximum_torque,
+                            max_rpm,
+                            direction,
+                        )
+                    } else {
+                        throttle * maximum_torque * direction
+                    };
+                    axle * applied_torque
+                },
+            )
             .fold(CoreVec3::ZERO, |sum, torque| sum + torque)
     }
 
@@ -9791,6 +10152,7 @@ impl EditorApp {
                     projection_scale,
                     self.camera_yaw,
                     self.camera_pitch,
+                    0.0,
                     self.camera_target,
                     self.projection_mode,
                     self.grid_spacing,
@@ -9878,7 +10240,7 @@ impl EditorApp {
         };
         let center = viewport.center();
         let projection_scale = viewport.width().min(viewport.height()) * 0.18 * self.camera_zoom;
-        let (right, up, forward) = camera_basis(self.camera_yaw, self.camera_pitch);
+        let (right, up, forward) = camera_basis(self.camera_yaw, self.camera_pitch, 0.0);
         let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * self.grid_spacing.max(1.0e-4);
         let camera_origin = self.camera_target - forward * camera_distance;
         let screen_x = (pointer.x - center.x) / projection_scale;
@@ -10959,10 +11321,47 @@ impl EditorApp {
                                     "Wireframe",
                                 );
                             });
+                        if ui
+                            .selectable_label(self.camera_preview_visible, "📷")
+                            .on_hover_text("Realtime camera preview on/off")
+                            .clicked()
+                        {
+                            self.camera_preview_visible = !self.camera_preview_visible;
+                        }
+                        if ui
+                            .selectable_label(self.global_light_enabled, "☀")
+                            .on_hover_text("Global light on/off")
+                            .clicked()
+                        {
+                            self.global_light_enabled = !self.global_light_enabled;
+                            self.scene_revision = self.scene_revision.wrapping_add(1);
+                            self.project_dirty = true;
+                        }
                     });
                 });
                 let available = ui.available_size();
                 let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
+                let scene_camera = self
+                    .camera_preview_visible
+                    .then(|| self.active_scene_camera())
+                    .flatten();
+                let render_rect = scene_camera.as_ref().map_or(response.rect, |camera| {
+                    fit_aspect_rect(response.rect, camera.aspect_ratio)
+                });
+                let render_camera = scene_camera.as_ref().map_or(
+                    (
+                        self.camera_yaw,
+                        self.camera_pitch,
+                        0.0,
+                        self.camera_zoom,
+                        self.camera_target,
+                        self.grid_spacing,
+                        self.projection_mode,
+                    ),
+                    |camera| {
+                        scene_camera_render_view(camera, render_rect.size(), self.grid_spacing)
+                    },
+                );
                 self.viewport_focused = response.hovered();
                 let pointer_delta = ui.input(|input| input.pointer.delta());
                 if matches!(self.active_tool, Tool::FieldPaint | Tool::TexturePaint) {
@@ -11092,22 +11491,23 @@ impl EditorApp {
                 let viewport_texture = {
                     let key = DepthCacheKey {
                         size: [
-                            response.rect.width().round().max(1.0) as usize,
-                            response.rect.height().round().max(1.0) as usize,
+                            render_rect.width().round().max(1.0) as usize,
+                            render_rect.height().round().max(1.0) as usize,
                         ],
-                        yaw: self.camera_yaw,
-                        pitch: self.camera_pitch,
-                        zoom: self.camera_zoom,
-                        target: self.camera_target,
+                        yaw: render_camera.0,
+                        pitch: render_camera.1,
+                        roll: render_camera.2,
+                        zoom: render_camera.3,
+                        target: render_camera.4,
                         grid_spacing: self.grid_spacing,
-                        projection: self.projection_mode,
+                        projection: render_camera.6,
                         scene_revision: self.scene_revision,
                         texture_revision: self.texture_revision,
                         global_light_enabled: self.global_light_enabled,
                         global_shadow_resolution: self.global_shadow_resolution,
                         shadow_quality: self.shadow_quality,
                         shadow_blur_radius: self.shadow_blur_radius,
-                        show_grid: self.show_grid,
+                        show_grid: self.show_grid && scene_camera.is_none(),
                         mode: self.viewport_mode,
                         tool: self.active_tool,
                         device: self.render_device,
@@ -11233,18 +11633,11 @@ impl EditorApp {
                     {
                         self.display_worker.submit_latest(RenderJob {
                             key,
-                            viewport_size: response.rect.size(),
+                            viewport_size: render_rect.size(),
                             triangles: Arc::clone(&preview),
-                            camera: (
-                                self.camera_yaw,
-                                self.camera_pitch,
-                                self.camera_zoom,
-                                self.camera_target,
-                                self.grid_spacing,
-                                self.projection_mode,
-                            ),
+                            camera: render_camera,
                             lighting: lighting.clone(),
-                            show_grid: self.show_grid,
+                            show_grid: self.show_grid && scene_camera.is_none(),
                             mode: self.viewport_mode,
                             tool: self.active_tool,
                             reusable_depth: std::mem::take(&mut self.viewport_depth),
@@ -11258,10 +11651,18 @@ impl EditorApp {
                         .or_else(|| self.viewport_color.as_ref().map(TextureHandle::id))
                 };
                 if let Some(presented) = &self.presented_view {
-                    let collider_wireframe = self.selected_collider_wireframe();
+                    painter.rect_filled(response.rect, 0.0, Color32::BLACK);
+                    let collider_wireframe = scene_camera
+                        .is_none()
+                        .then(|| self.selected_collider_wireframe())
+                        .unwrap_or_default();
+                    let camera_wireframes = scene_camera
+                        .is_none()
+                        .then(|| self.camera_wireframes())
+                        .unwrap_or_default();
                     draw_viewport(
                         &painter,
-                        response.rect,
+                        render_rect,
                         presented.show_grid,
                         presented.tool,
                         presented.camera,
@@ -11269,8 +11670,23 @@ impl EditorApp {
                         presented.mode,
                         viewport_texture,
                         &collider_wireframe,
-                        &lighting.points,
+                        &camera_wireframes,
+                        if scene_camera.is_some() {
+                            &[]
+                        } else {
+                            &lighting.points
+                        },
                     );
+                    if self.camera_preview_visible && scene_camera.is_none() {
+                        painter.rect_filled(response.rect, 0.0, Color32::BLACK);
+                        painter.text(
+                            response.rect.center(),
+                            Align2::CENTER_CENTER,
+                            "No visible Camera",
+                            FontId::proportional(14.0),
+                            Color32::from_rgb(235, 190, 80),
+                        );
+                    }
                 } else {
                     painter.rect_filled(response.rect, 0.0, Color32::from_rgb(21, 24, 31));
                 }
@@ -11313,6 +11729,82 @@ impl EditorApp {
                 })
             })
             .collect()
+    }
+
+    fn camera_wireframes(&self) -> Vec<[[f32; 3]; 2]> {
+        let mut output = Vec::new();
+        for (id, node) in self.scene.tree.iter() {
+            if !self.scene.visible(id) {
+                continue;
+            }
+            let Some(Component::Camera { .. }) = node
+                .components
+                .iter()
+                .find(|component| matches!(component, Component::Camera { .. }))
+            else {
+                continue;
+            };
+            // Camera geometry is an editor gizmo, not a renderable frustum. Its
+            // base shape ignores camera and grid settings; only authored object
+            // scale is allowed to resize it.
+            let depth = 1.0;
+            let half_height = 0.35;
+            let half_width = 0.55;
+            let apex = CoreVec3::ZERO;
+            let corners = [
+                CoreVec3::new(-half_width, depth, -half_height),
+                CoreVec3::new(half_width, depth, -half_height),
+                CoreVec3::new(half_width, depth, half_height),
+                CoreVec3::new(-half_width, depth, half_height),
+            ];
+            let transform = node.global_transform();
+            let world = |point: CoreVec3| {
+                let point = transform.translation
+                    + transform
+                        .rotation
+                        .rotate(transform.scale.component_mul(point));
+                [point.x, point.y, point.z]
+            };
+            for corner in corners {
+                output.push([world(apex), world(corner)]);
+            }
+            for index in 0..4 {
+                output.push([world(corners[index]), world(corners[(index + 1) % 4])]);
+            }
+            // A small roof chevron makes the camera's up direction readable.
+            let roof_center = CoreVec3::new(0.0, depth, half_height * 1.3);
+            output.push([world(corners[2]), world(roof_center)]);
+            output.push([world(roof_center), world(corners[3])]);
+        }
+        output
+    }
+
+    fn active_scene_camera(&self) -> Option<SceneCameraPreview> {
+        self.scene.tree.iter().find_map(|(id, node)| {
+            if !self.scene.visible(id) {
+                return None;
+            }
+            node.components.iter().find_map(|component| {
+                let Component::Camera {
+                    field_of_view_degrees,
+                    projection,
+                    aspect_ratio,
+                    near_clip: _,
+                    far_clip: _,
+                    orthographic_size,
+                } = component
+                else {
+                    return None;
+                };
+                Some(SceneCameraPreview {
+                    transform: node.global_transform(),
+                    perspective: projection != "orthographic",
+                    field_of_view_degrees: *field_of_view_degrees,
+                    aspect_ratio: aspect_ratio.clamp(0.1, 10.0),
+                    orthographic_size: orthographic_size.max(0.001),
+                })
+            })
+        })
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
@@ -12772,7 +13264,7 @@ struct PreparedRasterTriangle {
 fn rasterize_depth_frame(
     viewport_size: Vec2,
     triangles: &[PreviewTriangle],
-    camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     lighting: &ViewportLighting,
     mut linear_depth: Vec<f32>,
     workspace: &mut RasterWorkspace,
@@ -12791,7 +13283,7 @@ fn rasterize_depth_frame(
     workspace
         .texture_mips
         .retain(|key, _| live_textures.contains(key));
-    let (yaw, pitch, zoom, camera_target, grid_spacing, projection_mode) = camera;
+    let (yaw, pitch, roll, zoom, camera_target, grid_spacing, projection_mode) = camera;
     let center = Pos2::new(width as f32 * 0.5, height as f32 * 0.5 + 25.0);
     let scale = perspective_view_scale(
         viewport_size.x.min(viewport_size.y) * 0.18 * zoom,
@@ -12829,6 +13321,7 @@ fn rasterize_depth_frame(
             triangle,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -12844,12 +13337,13 @@ fn rasterize_depth_frame(
                     scale,
                     yaw,
                     pitch,
+                    roll,
                     camera_target,
                     projection_mode,
                     grid_spacing,
                 )?;
                 let camera_depth = PERSPECTIVE_CAMERA_DISTANCE * grid_spacing
-                    + view_depth(vertex.position, yaw, pitch, camera_target);
+                    + view_depth(vertex.position, yaw, pitch, roll, camera_target);
                 (position.x.is_finite()
                     && position.y.is_finite()
                     && camera_depth.is_finite()
@@ -13276,7 +13770,7 @@ impl ScreenBounds {
 fn raycast_depth_frame(
     viewport_size: Vec2,
     triangles: &[[[f32; 3]; 3]],
-    camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
 ) -> DepthFrame {
     const TILE_SIZE: usize = 16;
     let width = viewport_size.x.round().max(1.0) as usize;
@@ -13291,7 +13785,7 @@ fn raycast_depth_frame(
         };
     }
 
-    let (yaw, pitch, zoom, camera_target, grid_spacing, projection_mode) = camera;
+    let (yaw, pitch, roll, zoom, camera_target, grid_spacing, projection_mode) = camera;
     let center = Pos2::new(width as f32 * 0.5, height as f32 * 0.5 + 25.0);
     let scale = perspective_view_scale(
         viewport_size.x.min(viewport_size.y) * 0.18 * zoom,
@@ -13316,7 +13810,7 @@ fn raycast_depth_frame(
             ),
             centroid_depth: triangle
                 .iter()
-                .map(|point| view_depth(*point, yaw, pitch, camera_target))
+                .map(|point| view_depth(*point, yaw, pitch, roll, camera_target))
                 .sum::<f32>()
                 / 3.0,
             screen_bounds: None,
@@ -13339,6 +13833,7 @@ fn raycast_depth_frame(
             &source,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -13352,6 +13847,7 @@ fn raycast_depth_frame(
                     scale,
                     yaw,
                     pitch,
+                    roll,
                     camera_target,
                     projection_mode,
                     grid_spacing,
@@ -13405,7 +13901,7 @@ fn raycast_depth_frame(
         }
     }
 
-    let (right, up, forward) = camera_basis(yaw, pitch);
+    let (right, up, forward) = camera_basis(yaw, pitch, roll);
     let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * grid_spacing;
     let camera_origin = camera_target - forward * camera_distance;
     let near = PERSPECTIVE_NEAR * grid_spacing;
@@ -13490,12 +13986,15 @@ fn raycast_depth_frame(
     }
 }
 
-fn camera_basis(yaw: f32, pitch: f32) -> (CoreVec3, CoreVec3, CoreVec3) {
+fn camera_basis(yaw: f32, pitch: f32, roll: f32) -> (CoreVec3, CoreVec3, CoreVec3) {
     let (sin_yaw, cos_yaw) = yaw.sin_cos();
     let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let base_right = CoreVec3::new(cos_yaw, -sin_yaw, 0.0);
+    let base_up = CoreVec3::new(-sin_yaw * sin_pitch, -cos_yaw * sin_pitch, cos_pitch);
+    let (sin_roll, cos_roll) = roll.sin_cos();
     (
-        CoreVec3::new(cos_yaw, -sin_yaw, 0.0),
-        CoreVec3::new(-sin_yaw * sin_pitch, -cos_yaw * sin_pitch, cos_pitch),
+        base_right * cos_roll - base_up * sin_roll,
+        base_right * sin_roll + base_up * cos_roll,
         CoreVec3::new(sin_yaw * cos_pitch, cos_yaw * cos_pitch, sin_pitch),
     )
 }
@@ -13598,19 +14097,64 @@ fn ray_triangle_hit(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn fit_aspect_rect(outer: Rect, aspect: f32) -> Rect {
+    let aspect = aspect.clamp(0.1, 10.0);
+    let outer_aspect = outer.width() / outer.height().max(1.0);
+    let size = if outer_aspect > aspect {
+        Vec2::new(outer.height() * aspect, outer.height())
+    } else {
+        Vec2::new(outer.width(), outer.width() / aspect)
+    };
+    Rect::from_center_size(outer.center(), size)
+}
+
+fn scene_camera_render_view(
+    camera: &SceneCameraPreview,
+    viewport_size: Vec2,
+    grid_spacing: f32,
+) -> (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode) {
+    let forward = camera.transform.rotation.rotate(CoreVec3::Y).normalized();
+    let yaw = forward.x.atan2(forward.y);
+    let pitch = forward.z.clamp(-1.0, 1.0).asin();
+    let (base_right, base_up, _) = camera_basis(yaw, pitch, 0.0);
+    let actual_right = camera.transform.rotation.rotate(CoreVec3::X).normalized();
+    let roll = (-actual_right.dot(base_up)).atan2(actual_right.dot(base_right));
+    let grid_spacing = grid_spacing.max(1.0e-4);
+    let distance = PERSPECTIVE_CAMERA_DISTANCE * grid_spacing;
+    let target = camera.transform.translation + forward * distance;
+    let minimum_extent = viewport_size.x.min(viewport_size.y).max(1.0);
+    let (zoom, projection) = if camera.perspective {
+        let tan_half = (camera.field_of_view_degrees.clamp(1.0, 179.0).to_radians() * 0.5)
+            .tan()
+            .max(1.0e-4);
+        (
+            viewport_size.y.max(1.0) / (7.2 * tan_half * minimum_extent),
+            ProjectionMode::Perspective,
+        )
+    } else {
+        (
+            viewport_size.y.max(1.0)
+                / (camera.orthographic_size.max(0.001) * minimum_extent * 0.18),
+            ProjectionMode::Orthographic,
+        )
+    };
+    (yaw, pitch, roll, zoom, target, grid_spacing, projection)
+}
+
 fn draw_viewport(
     painter: &egui::Painter,
     rect: Rect,
     grid: bool,
     tool: Tool,
-    camera: (f32, f32, f32, CoreVec3, f32, ProjectionMode),
+    camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     triangles: &[PreviewTriangle],
     mode: ViewportMode,
     viewport_texture: Option<TextureId>,
     collider_wireframe: &[[[f32; 3]; 2]],
+    camera_wireframes: &[[[f32; 3]; 2]],
     point_lights: &[ViewportLight],
 ) {
-    let (yaw, pitch, zoom, camera_target, grid_spacing, projection_mode) = camera;
+    let (yaw, pitch, roll, zoom, camera_target, grid_spacing, projection_mode) = camera;
     painter.rect_filled(rect, 0.0, Color32::from_rgb(21, 24, 31));
     let center = rect.center() + Vec2::new(0.0, 25.0);
     let scale = perspective_view_scale(
@@ -13629,6 +14173,7 @@ fn draw_viewport(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -13639,6 +14184,7 @@ fn draw_viewport(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -13649,6 +14195,7 @@ fn draw_viewport(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -13669,6 +14216,7 @@ fn draw_viewport(
                 scale,
                 yaw,
                 pitch,
+                roll,
                 camera_target,
                 projection_mode,
                 grid_spacing,
@@ -13765,6 +14313,7 @@ fn draw_viewport(
                         scale,
                         yaw,
                         pitch,
+                        roll,
                         camera_target,
                         projection_mode,
                         grid_spacing,
@@ -13781,6 +14330,7 @@ fn draw_viewport(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -13822,11 +14372,28 @@ fn draw_viewport(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
         ) {
             painter.line_segment(projected, collider_stroke);
+        }
+    }
+    let camera_stroke = Stroke::new(2.0, Color32::from_rgb(255, 220, 64));
+    for &segment in camera_wireframes {
+        if let Some(projected) = project_segment(
+            segment,
+            center,
+            scale,
+            yaw,
+            pitch,
+            roll,
+            camera_target,
+            projection_mode,
+            grid_spacing,
+        ) {
+            painter.line_segment(projected, camera_stroke);
         }
     }
     for light in point_lights {
@@ -13836,6 +14403,7 @@ fn draw_viewport(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             grid_spacing,
@@ -14610,7 +15178,7 @@ fn homogeneous_projection(
     projection_mode: ProjectionMode,
     perspective_unit: f32,
 ) -> [f32; 3] {
-    let (view_x, view_y, depth) = view_coordinates(point, yaw, pitch, camera_target);
+    let (view_x, view_y, depth) = view_coordinates(point, yaw, pitch, 0.0, camera_target);
     match projection_mode {
         ProjectionMode::Perspective => {
             let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * perspective_unit;
@@ -14642,7 +15210,7 @@ fn perspective_ground_horizon(
 ) -> [f32; 3] {
     let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * perspective_unit;
     let direction_projection = |direction| {
-        let (view_x, view_y, depth) = view_coordinates(direction, yaw, pitch, CoreVec3::ZERO);
+        let (view_x, view_y, depth) = view_coordinates(direction, yaw, pitch, 0.0, CoreVec3::ZERO);
         [
             center.x * depth + scale * camera_distance * view_x,
             center.y * depth - scale * camera_distance * view_y,
@@ -14753,6 +15321,7 @@ fn projective_ground_line(
         [camera_target.x, camera_target.y, 0.0],
         yaw,
         pitch,
+        0.0,
         camera_target,
     );
     let forward_ground = CoreVec3::new(yaw.sin() * pitch.cos(), yaw.cos() * pitch.cos(), 0.0);
@@ -15105,11 +15674,7 @@ fn fitted_collider_from_bounds(bounds: ([f32; 3], [f32; 3]), shape: ColliderShap
     };
     let density = 1_000.0;
     let mass = collider_volume(shape, half_extents, radius, height) * density;
-    let friction = match shape {
-        ColliderShape::Sphere => CoreVec3::new(0.05, 0.05, 0.05),
-        ColliderShape::Cylinder => CoreVec3::new(0.05, 0.8, 0.8),
-        ColliderShape::Box | ColliderShape::Flat => CoreVec3::new(0.8, 0.8, 0.8),
-    };
+    let friction = CoreVec3::new(100.0, 100.0, 100.0);
     Component::Collider {
         shape: shape.storage_name().into(),
         center,
@@ -15127,6 +15692,7 @@ fn fitted_collider_from_bounds(bounds: ([f32; 3], [f32; 3]), shape: ColliderShap
         mass,
         automatic_mass: true,
         friction,
+        friction_margin_percent: 5.0,
         joint: CylinderJoint::None.storage_name().into(),
     }
 }
@@ -15173,7 +15739,9 @@ struct WorldCollider {
     half_extents: CoreVec3,
     restitution: f32,
     friction: f32,
+    friction_margin_percent: f32,
     shape: ColliderShape,
+    joint: CylinderJoint,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15193,6 +15761,8 @@ fn world_collider(transform: Transform, component: &Component) -> Option<WorldCo
         height,
         restitution,
         friction,
+        friction_margin_percent,
+        joint,
         ..
     } = component
     else {
@@ -15244,7 +15814,9 @@ fn world_collider(transform: Transform, component: &Component) -> Option<WorldCo
         restitution: restitution.clamp(0.0, 1.0),
         friction: ((friction.x.max(0.0) + friction.y.max(0.0) + friction.z.max(0.0)) / 3.0)
             .max(0.0),
+        friction_margin_percent: friction_margin_percent.max(0.0),
         shape,
+        joint: CylinderJoint::from_storage(joint),
     })
 }
 
@@ -15309,6 +15881,21 @@ fn collider_pair_contact(a: WorldCollider, b: WorldCollider) -> Option<ColliderC
     })
 }
 
+fn friction_contact_collider(collider: WorldCollider) -> WorldCollider {
+    let factor = 1.0 + collider.friction_margin_percent.max(0.0) * 0.01;
+    WorldCollider {
+        half_extents: collider.half_extents * factor,
+        // The expanded proxy is used only to discover a nearby friction pair.
+        // It must never add restitution or positional correction of its own.
+        restitution: 0.0,
+        ..collider
+    }
+}
+
+fn friction_contact_tolerance(extent_along_normal: f32, margin_percent: f32) -> f32 {
+    extent_along_normal.abs() * margin_percent.max(0.0) * 0.01
+}
+
 fn sphere_bounds_contact(sphere: WorldCollider, bounds: WorldCollider) -> Option<ColliderContact> {
     let minimum = bounds.center - bounds.half_extents;
     let maximum = bounds.center + bounds.half_extents;
@@ -15353,7 +15940,10 @@ fn sphere_bounds_contact(sphere: WorldCollider, bounds: WorldCollider) -> Option
     })
 }
 
-fn collider_support_surface(position: CoreVec3, colliders: &[WorldCollider]) -> Option<(f32, f32)> {
+fn collider_support_surface(
+    position: CoreVec3,
+    colliders: &[WorldCollider],
+) -> Option<(f32, f32, f32)> {
     colliders
         .iter()
         .filter(|collider| {
@@ -15367,6 +15957,10 @@ fn collider_support_surface(position: CoreVec3, colliders: &[WorldCollider]) -> 
             (
                 collider.center.z + collider.half_extents.z,
                 collider.friction,
+                friction_contact_tolerance(
+                    collider.half_extents.z,
+                    collider.friction_margin_percent,
+                ),
             )
         })
         .max_by(|left, right| left.0.total_cmp(&right.0))
@@ -15387,21 +15981,36 @@ fn resolve_general_collider_contacts(
                 center: body.center + (*position - scene_body_position),
                 ..*body
             };
-            let Some(contact) = collider_pair_contact(shifted_body, *external) else {
+            let collision_contact = collider_pair_contact(shifted_body, *external);
+            let friction_contact = collision_contact.or_else(|| {
+                collider_pair_contact(
+                    friction_contact_collider(shifted_body),
+                    friction_contact_collider(*external),
+                )
+            });
+            let Some(contact) = friction_contact else {
                 continue;
             };
-            *position = *position + contact.normal * contact.penetration;
             let inward_speed = velocity.dot(contact.normal);
-            if inward_speed < 0.0 {
-                *velocity =
-                    *velocity - contact.normal * ((1.0 + contact.restitution) * inward_speed);
+            if let Some(collision) = collision_contact {
+                *position = *position + collision.normal * collision.penetration;
+                if inward_speed < 0.0 {
+                    *velocity = *velocity
+                        - collision.normal * ((1.0 + collision.restitution) * inward_speed);
+                }
             }
-            let normal_speed = inward_speed.abs().max(9.81 * dt);
-            let tangent = *velocity - contact.normal * velocity.dot(contact.normal);
-            let tangent_speed = tangent.length();
-            if tangent_speed > 1.0e-6 {
-                let removed_speed = (contact.friction * normal_speed).min(tangent_speed);
-                *velocity = *velocity - tangent * (removed_speed / tangent_speed);
+            // Jointed cylinders have a rotating contact surface. Their
+            // tangential impulse and reaction torque are resolved by the
+            // wheel-aware support solver; treating them as static shapes here
+            // would immediately cancel engine traction.
+            if body.shape != ColliderShape::Cylinder || body.joint == CylinderJoint::None {
+                let normal_speed = inward_speed.abs().max(9.81 * dt);
+                let tangent = *velocity - contact.normal * velocity.dot(contact.normal);
+                let tangent_speed = tangent.length();
+                if tangent_speed > 1.0e-6 {
+                    let removed_speed = (contact.friction * normal_speed).min(tangent_speed);
+                    *velocity = *velocity - tangent * (removed_speed / tangent_speed);
+                }
             }
             resolved += 1;
         }
@@ -15415,6 +16024,24 @@ fn force_cut_scalar(value: f32, cutoff: f32) -> f32 {
     } else {
         value
     }
+}
+
+fn smooth_rpm_governor_torque(
+    throttle: f32,
+    angular_velocity: f32,
+    maximum_torque: f32,
+    max_rpm: f32,
+    direction: f32,
+) -> f32 {
+    let throttle = throttle.clamp(-1.0, 1.0);
+    let max_rpm = max_rpm.max(0.0);
+    let target_rpm = throttle * direction.signum() * max_rpm;
+    let current_rpm = angular_velocity * 60.0 / std::f32::consts::TAU;
+    let transition_rpm = (max_rpm * 0.05).max(50.0);
+    let normalized_error = ((target_rpm - current_rpm) / transition_rpm).clamp(-1.0, 1.0);
+    let magnitude = normalized_error.abs();
+    let smooth_magnitude = magnitude * magnitude * (3.0 - 2.0 * magnitude);
+    normalized_error.signum() * maximum_torque.max(0.0) * smooth_magnitude
 }
 
 fn force_cut_vector(value: CoreVec3, cutoff: f32) -> CoreVec3 {
@@ -15471,6 +16098,40 @@ fn contact_friction_force(
     let coulomb_limit = coefficient.max(0.0) * normal_force.max(0.0);
     let stop_force = effective_mass.max(0.0) * speed / dt.max(1.0e-6);
     tangent_velocity.normalized() * -coulomb_limit.min(stop_force)
+}
+
+fn cylinder_box_traction_force(
+    cylinder: WorldCollider,
+    box_collider: WorldCollider,
+    axle: CoreVec3,
+    angular_velocity: f32,
+    body_velocity: CoreVec3,
+    normal_force: f32,
+    effective_mass: f32,
+    dt: f32,
+) -> Option<CoreVec3> {
+    if cylinder.shape != ColliderShape::Cylinder
+        || !matches!(box_collider.shape, ColliderShape::Box | ColliderShape::Flat)
+    {
+        return None;
+    }
+    let contact = collider_pair_contact(cylinder, box_collider).or_else(|| {
+        collider_pair_contact(
+            friction_contact_collider(cylinder),
+            friction_contact_collider(box_collider),
+        )
+    })?;
+    let radius_arm = contact.normal * -cylinder.half_extents.z;
+    let surface_velocity = (axle.normalized() * angular_velocity).cross(radius_arm);
+    let relative_velocity = body_velocity + surface_velocity;
+    let tangent = relative_velocity - contact.normal * relative_velocity.dot(contact.normal);
+    Some(contact_friction_force(
+        tangent,
+        contact.friction,
+        normal_force,
+        effective_mass,
+        dt,
+    ))
 }
 
 fn resolve_contact_normal_velocity(inward_velocity: f32, restitution: f32) -> f32 {
@@ -15610,11 +16271,12 @@ fn project(
     scale: f32,
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     projection_mode: ProjectionMode,
     perspective_unit: f32,
 ) -> Option<Pos2> {
-    let (x, y, depth) = view_coordinates(point, yaw, pitch, camera_target);
+    let (x, y, depth) = view_coordinates(point, yaw, pitch, roll, camera_target);
     let projection_scale = match projection_mode {
         ProjectionMode::Perspective => {
             let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * perspective_unit;
@@ -15633,34 +16295,32 @@ fn view_coordinates(
     point: [f32; 3],
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
 ) -> (f32, f32, f32) {
-    let point = [
+    let offset = CoreVec3::new(
         point[0] - camera_target.x,
         point[1] - camera_target.y,
         point[2] - camera_target.z,
-    ];
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    let x = point[0] * cy - point[1] * sy;
-    let forward = point[0] * sy + point[1] * cy;
-    let y = point[2] * cp - forward * sp;
-    let depth = point[2] * sp + forward * cp;
-    (x, y, depth)
+    );
+    let (right, up, forward) = camera_basis(yaw, pitch, roll);
+    (offset.dot(right), offset.dot(up), offset.dot(forward))
 }
 
-fn view_depth(point: [f32; 3], yaw: f32, pitch: f32, camera_target: CoreVec3) -> f32 {
-    view_coordinates(point, yaw, pitch, camera_target).2
+fn view_depth(point: [f32; 3], yaw: f32, pitch: f32, roll: f32, camera_target: CoreVec3) -> f32 {
+    view_coordinates(point, yaw, pitch, roll, camera_target).2
 }
 
 fn near_distance(
     point: [f32; 3],
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     perspective_unit: f32,
 ) -> f32 {
-    PERSPECTIVE_CAMERA_DISTANCE * perspective_unit + view_depth(point, yaw, pitch, camera_target)
+    PERSPECTIVE_CAMERA_DISTANCE * perspective_unit
+        + view_depth(point, yaw, pitch, roll, camera_target)
 }
 
 fn interpolate_point(a: [f32; 3], b: [f32; 3], amount: f32) -> [f32; 3] {
@@ -15675,6 +16335,7 @@ fn clip_segment_to_near(
     mut segment: [[f32; 3]; 2],
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     projection_mode: ProjectionMode,
     perspective_unit: f32,
@@ -15682,8 +16343,8 @@ fn clip_segment_to_near(
     if projection_mode == ProjectionMode::Orthographic {
         return Some(segment);
     }
-    let distances =
-        segment.map(|point| near_distance(point, yaw, pitch, camera_target, perspective_unit));
+    let distances = segment
+        .map(|point| near_distance(point, yaw, pitch, roll, camera_target, perspective_unit));
     let near = PERSPECTIVE_NEAR * perspective_unit;
     let inside = distances.map(|distance| distance >= near);
     match inside {
@@ -15709,6 +16370,7 @@ fn project_segment(
     scale: f32,
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     projection_mode: ProjectionMode,
     perspective_unit: f32,
@@ -15717,6 +16379,7 @@ fn project_segment(
         segment,
         yaw,
         pitch,
+        roll,
         camera_target,
         projection_mode,
         perspective_unit,
@@ -15728,6 +16391,7 @@ fn project_segment(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             perspective_unit,
@@ -15738,6 +16402,7 @@ fn project_segment(
             scale,
             yaw,
             pitch,
+            roll,
             camera_target,
             projection_mode,
             perspective_unit,
@@ -15749,6 +16414,7 @@ fn clip_polygon_to_near(
     polygon: &[[f32; 3]],
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     projection_mode: ProjectionMode,
     perspective_unit: f32,
@@ -15758,6 +16424,7 @@ fn clip_polygon_to_near(
         polygon,
         yaw,
         pitch,
+        roll,
         camera_target,
         projection_mode,
         perspective_unit,
@@ -15771,6 +16438,7 @@ fn clip_polygon_to_near_into(
     polygon: &[[f32; 3]],
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     projection_mode: ProjectionMode,
     perspective_unit: f32,
@@ -15784,9 +16452,10 @@ fn clip_polygon_to_near_into(
     for index in 0..polygon.len() {
         let current = polygon[index];
         let previous = polygon[(index + polygon.len() - 1) % polygon.len()];
-        let current_distance = near_distance(current, yaw, pitch, camera_target, perspective_unit);
+        let current_distance =
+            near_distance(current, yaw, pitch, roll, camera_target, perspective_unit);
         let previous_distance =
-            near_distance(previous, yaw, pitch, camera_target, perspective_unit);
+            near_distance(previous, yaw, pitch, roll, camera_target, perspective_unit);
         let near = PERSPECTIVE_NEAR * perspective_unit;
         let current_inside = current_distance >= near;
         let previous_inside = previous_distance >= near;
@@ -15825,6 +16494,7 @@ fn clip_preview_polygon_to_near_into(
     triangle: &PreviewTriangle,
     yaw: f32,
     pitch: f32,
+    roll: f32,
     camera_target: CoreVec3,
     projection_mode: ProjectionMode,
     perspective_unit: f32,
@@ -15843,6 +16513,7 @@ fn clip_preview_polygon_to_near_into(
             current.position,
             yaw,
             pitch,
+            roll,
             camera_target,
             perspective_unit,
         );
@@ -15850,6 +16521,7 @@ fn clip_preview_polygon_to_near_into(
             previous.position,
             yaw,
             pitch,
+            roll,
             camera_target,
             perspective_unit,
         );
@@ -15877,6 +16549,50 @@ mod tests {
         let b = scene.add("B", ObjectKind::Empty, None);
         assert_ne!(a, b);
         assert_eq!(scene.tree.node(a).unwrap().name, "A");
+    }
+
+    #[test]
+    fn reparented_import_and_camera_hierarchy_survives_project_serialization() {
+        let mut tree = GeometryTree::new();
+        let imported = tree.create("Imported GLB", None).unwrap();
+        tree.add_component(
+            imported,
+            Component::Model {
+                asset: "assets/car.glb".into(),
+                primitive: Some(0),
+            },
+        )
+        .unwrap();
+        let camera = tree.create("Camera", None).unwrap();
+        tree.set_global_transform(
+            camera,
+            Transform {
+                translation: CoreVec3::new(3.0, 4.0, 5.0),
+                ..Transform::IDENTITY
+            },
+        )
+        .unwrap();
+        let camera_world = tree.node(camera).unwrap().global_transform();
+        tree.reparent(camera, Some(imported), ReparentMode::KeepGlobal)
+            .unwrap();
+
+        let encoded = ProjectFile::new("project", "scene", tree)
+            .to_json()
+            .unwrap();
+        let decoded = ProjectFile::from_json(&encoded).unwrap();
+        assert_eq!(
+            decoded.scene.geometry.node(camera).unwrap().parent(),
+            Some(imported)
+        );
+        assert_eq!(
+            decoded
+                .scene
+                .geometry
+                .node(camera)
+                .unwrap()
+                .global_transform(),
+            camera_world
+        );
     }
 
     #[test]
@@ -15944,6 +16660,7 @@ mod tests {
             100.0,
             0.3,
             0.2,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Perspective,
             1.0,
@@ -15960,6 +16677,7 @@ mod tests {
             100.0,
             0.0,
             0.0,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Orthographic,
             1.0,
@@ -15968,6 +16686,7 @@ mod tests {
             [2.0, 100.0, 3.0],
             Pos2::ZERO,
             100.0,
+            0.0,
             0.0,
             0.0,
             CoreVec3::ZERO,
@@ -15987,6 +16706,7 @@ mod tests {
                 100.0,
                 0.0,
                 0.0,
+                0.0,
                 CoreVec3::ZERO,
                 ProjectionMode::Perspective,
                 1.0,
@@ -15997,13 +16717,15 @@ mod tests {
             [behind, [0.0, 1.0, 0.0]],
             0.0,
             0.0,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Perspective,
             1.0,
         )
         .expect("crossing segment survives");
         assert!(
-            (near_distance(crossing[0], 0.0, 0.0, CoreVec3::ZERO, 1.0) - PERSPECTIVE_NEAR).abs()
+            (near_distance(crossing[0], 0.0, 0.0, 0.0, CoreVec3::ZERO, 1.0) - PERSPECTIVE_NEAR)
+                .abs()
                 < 1.0e-4
         );
     }
@@ -16018,13 +16740,14 @@ mod tests {
             ],
             0.0,
             0.0,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Perspective,
             1.0,
         );
         assert_eq!(polygon.len(), 4);
         assert!(polygon.iter().all(|point| {
-            near_distance(*point, 0.0, 0.0, CoreVec3::ZERO, 1.0) >= PERSPECTIVE_NEAR - 1.0e-4
+            near_distance(*point, 0.0, 0.0, 0.0, CoreVec3::ZERO, 1.0) >= PERSPECTIVE_NEAR - 1.0e-4
         }));
     }
 
@@ -16043,6 +16766,7 @@ mod tests {
                 100.0,
                 0.0,
                 0.0,
+                0.0,
                 CoreVec3::ZERO,
                 mode,
                 1.0,
@@ -16054,6 +16778,7 @@ mod tests {
                 100.0,
                 0.0,
                 0.0,
+                0.0,
                 CoreVec3::ZERO,
                 mode,
                 1.0,
@@ -16063,6 +16788,7 @@ mod tests {
                 [0.0, 0.0, 1.0],
                 Pos2::ZERO,
                 100.0,
+                0.0,
                 0.0,
                 0.0,
                 CoreVec3::ZERO,
@@ -16196,7 +16922,9 @@ mod tests {
             half_extents,
             restitution: 0.0,
             friction: 0.8,
+            friction_margin_percent: 5.0,
             shape,
+            joint: CylinderJoint::None,
         };
         let car = collider(
             CoreVec3::new(0.0, 0.0, 1.0),
@@ -16225,14 +16953,18 @@ mod tests {
             half_extents: CoreVec3::new(0.5, 0.5, 0.5),
             restitution: 0.0,
             friction: 0.8,
+            friction_margin_percent: 5.0,
             shape: ColliderShape::Sphere,
+            joint: CylinderJoint::None,
         };
         let floor = WorldCollider {
             center: CoreVec3::ZERO,
             half_extents: CoreVec3::new(10.0, 10.0, 0.05),
             restitution: 0.0,
             friction: 0.8,
+            friction_margin_percent: 5.0,
             shape: ColliderShape::Flat,
+            joint: CylinderJoint::None,
         };
         let mut position = CoreVec3::ZERO;
         let mut velocity = CoreVec3::new(2.0, 0.0, -3.0);
@@ -16253,18 +16985,248 @@ mod tests {
     }
 
     #[test]
+    fn friction_margin_bridges_small_gaps_without_collision_correction() {
+        let body = WorldCollider {
+            center: CoreVec3::new(0.0, 0.0, 0.56),
+            half_extents: CoreVec3::new(0.5, 0.5, 0.5),
+            restitution: 0.0,
+            friction: 1.0,
+            friction_margin_percent: 5.0,
+            shape: ColliderShape::Sphere,
+            joint: CylinderJoint::None,
+        };
+        let floor = WorldCollider {
+            center: CoreVec3::ZERO,
+            half_extents: CoreVec3::new(10.0, 10.0, 0.05),
+            restitution: 0.0,
+            friction: 1.0,
+            friction_margin_percent: 5.0,
+            shape: ColliderShape::Flat,
+            joint: CylinderJoint::None,
+        };
+        assert!(collider_pair_contact(body, floor).is_none());
+        let mut position = CoreVec3::ZERO;
+        let mut velocity = CoreVec3::new(2.0, 0.0, 0.0);
+        assert_eq!(
+            resolve_general_collider_contacts(
+                &mut position,
+                &mut velocity,
+                CoreVec3::ZERO,
+                &[body],
+                &[floor],
+                1.0 / 60.0,
+            ),
+            1
+        );
+        assert_eq!(position, CoreVec3::ZERO);
+        assert!(velocity.x < 2.0);
+    }
+
+    #[test]
+    fn wheel_contact_margin_scales_with_vertical_extent() {
+        let tolerance = friction_contact_tolerance(0.43, 5.0);
+        assert!((tolerance - 0.0215).abs() < 1.0e-6);
+        assert!(0.02 <= tolerance);
+        assert!(0.03 > tolerance);
+    }
+
+    #[test]
+    fn two_driven_cylinders_move_four_wheel_vehicle_over_box() {
+        let floor = WorldCollider {
+            center: CoreVec3::ZERO,
+            half_extents: CoreVec3::new(10.0, 10.0, 0.05),
+            restitution: 0.0,
+            friction: 1.0,
+            friction_margin_percent: 5.0,
+            shape: ColliderShape::Box,
+            joint: CylinderJoint::None,
+        };
+        let wheel = |x: f32, y: f32| WorldCollider {
+            // A 0.01-unit gap deliberately exercises the friction margin.
+            center: CoreVec3::new(x, y, 0.56),
+            half_extents: CoreVec3::new(0.2, 0.5, 0.5),
+            restitution: 0.0,
+            friction: 1.0,
+            friction_margin_percent: 5.0,
+            shape: ColliderShape::Cylinder,
+            joint: CylinderJoint::Engine,
+        };
+        let wheels = [
+            wheel(-0.8, 1.0),
+            wheel(0.8, 1.0),
+            wheel(-0.8, -1.0),
+            wheel(0.8, -1.0),
+        ];
+        let axles = [CoreVec3::X, CoreVec3::new(-1.0, 0.0, 0.0)];
+        // Mirrored axles require mirrored signed angular velocity to produce
+        // the same forward tread velocity on both driven wheels.
+        let driven_angular_velocities = [20.0, -20.0];
+        let mut total_body_force = CoreVec3::ZERO;
+        for index in 0..2 {
+            total_body_force = total_body_force
+                + cylinder_box_traction_force(
+                    wheels[index],
+                    floor,
+                    axles[index],
+                    driven_angular_velocities[index],
+                    CoreVec3::ZERO,
+                    100.0,
+                    25.0,
+                    1.0 / 60.0,
+                )
+                .expect("driven wheel should retain tolerated box contact");
+        }
+        for wheel in &wheels[2..] {
+            let passive_force = cylinder_box_traction_force(
+                *wheel,
+                floor,
+                CoreVec3::X,
+                0.0,
+                CoreVec3::ZERO,
+                100.0,
+                25.0,
+                1.0 / 60.0,
+            )
+            .expect("passive wheel should retain tolerated box contact");
+            assert_eq!(passive_force, CoreVec3::ZERO);
+        }
+        assert!(total_body_force.y < 0.0);
+        assert!(total_body_force.x.abs() < 1.0e-6);
+
+        let mut position = CoreVec3::ZERO;
+        let mut velocity_after_traction = total_body_force * (1.0 / 60.0 / 100.0);
+        let expected_velocity = velocity_after_traction;
+        resolve_general_collider_contacts(
+            &mut position,
+            &mut velocity_after_traction,
+            CoreVec3::ZERO,
+            &wheels[..2],
+            &[floor],
+            1.0 / 60.0,
+        );
+        assert!(
+            velocity_after_traction.approx_eq(expected_velocity, 1.0e-6),
+            "generic friction must not cancel joint-aware wheel traction"
+        );
+    }
+
+    #[test]
+    fn fast_driver_zfp_driven_wheels_generate_box_traction() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../appdata/models/Fast-Driver/game_v0.zfp");
+        assert!(
+            fixture.is_file(),
+            "missing test fixture: {}",
+            fixture.display()
+        );
+        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-zfp-cache/fast-driver-traction");
+        let bundle = load_zfp(&fixture, &cache).expect("load Fast-Driver project");
+        let tree = &bundle.project.scene.geometry;
+        let find = |name: &str| {
+            tree.iter()
+                .find(|(_, node)| node.name == name)
+                .map(|(id, node)| (id, node))
+                .unwrap_or_else(|| panic!("missing `{name}` in Fast-Driver fixture"))
+        };
+        let (_, circuit_node) = find("Circuit");
+        let circuit = circuit_node
+            .components
+            .iter()
+            .find_map(|component| world_collider(circuit_node.global_transform(), component))
+            .expect("Circuit box collider");
+        assert_eq!(circuit.shape, ColliderShape::Box);
+
+        let properties = &bundle.project.project.properties;
+        let engine_objects = properties
+            .iter()
+            .filter_map(|(key, value)| {
+                (key.ends_with(".kind") && value == "29").then(|| {
+                    key.trim_start_matches("compositor.node.")
+                        .trim_end_matches(".kind")
+                        .to_owned()
+                })
+            })
+            .filter_map(|node_id| {
+                properties
+                    .get(&format!("compositor.node.{node_id}.settings_object_name"))
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(engine_objects.len(), 2);
+
+        let mut total_traction = CoreVec3::ZERO;
+        let mut saved_contact_gaps = Vec::new();
+        for wheel_name in &engine_objects {
+            let (_, wheel_node) = find(wheel_name);
+            let transform = wheel_node.global_transform();
+            let mut wheel = wheel_node
+                .components
+                .iter()
+                .find_map(|component| world_collider(transform, component))
+                .expect("engine wheel cylinder collider");
+            assert_eq!(wheel.shape, ColliderShape::Cylinder);
+            let tolerance =
+                friction_contact_tolerance(wheel.half_extents.z, wheel.friction_margin_percent);
+            let axle = transform.rotation.rotate(CoreVec3::Z).normalized();
+            let circuit_top = circuit.center.z + circuit.half_extents.z;
+            let saved_gap = wheel.center.z - wheel.half_extents.z - circuit_top;
+            saved_contact_gaps.push((saved_gap, tolerance));
+            assert!(
+                cylinder_box_traction_force(
+                    wheel,
+                    circuit,
+                    axle,
+                    20.0,
+                    CoreVec3::ZERO,
+                    100.0,
+                    25.0,
+                    1.0 / 60.0,
+                )
+                .is_none(),
+                "saved wheel unexpectedly contacts the saved Circuit"
+            );
+            wheel.center.z =
+                circuit.center.z + circuit.half_extents.z + wheel.half_extents.z + tolerance * 0.5;
+            total_traction = total_traction
+                + cylinder_box_traction_force(
+                    wheel,
+                    circuit,
+                    axle,
+                    20.0,
+                    CoreVec3::ZERO,
+                    100.0,
+                    25.0,
+                    1.0 / 60.0,
+                )
+                .expect("engine wheel should contact Circuit through tolerance");
+        }
+        assert!(
+            total_traction.length() > 1.0,
+            "the two fixture engines must not cancel each other's traction"
+        );
+        assert!(
+            saved_contact_gaps
+                .iter()
+                .all(|(gap, tolerance)| gap > tolerance)
+        );
+    }
+
+    #[test]
     fn box_collider_exposes_bounded_surface_for_wheel_friction() {
         let circuit = WorldCollider {
             center: CoreVec3::new(0.0, 0.0, -0.2),
             half_extents: CoreVec3::new(45.0, 32.5, 0.2),
             restitution: 0.0,
             friction: 0.8,
+            friction_margin_percent: 5.0,
             shape: ColliderShape::Box,
+            joint: CylinderJoint::None,
         };
-        assert_eq!(
-            collider_support_surface(CoreVec3::new(34.0, 0.0, 2.0), &[circuit]),
-            Some((0.0, 0.8))
-        );
+        let (height, friction, tolerance) =
+            collider_support_surface(CoreVec3::new(34.0, 0.0, 2.0), &[circuit]).unwrap();
+        assert_eq!((height, friction), (0.0, 0.8));
+        assert!((tolerance - 0.01).abs() < 1.0e-6);
         assert!(collider_support_surface(CoreVec3::new(50.0, 0.0, 2.0), &[circuit]).is_none());
     }
 
@@ -16453,6 +17415,7 @@ mod tests {
             100.0,
             -0.4,
             0.5,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Orthographic,
             1.0,
@@ -16465,6 +17428,7 @@ mod tests {
                 100.0,
                 -0.4,
                 0.5,
+                0.0,
                 CoreVec3::ZERO,
                 ProjectionMode::Orthographic,
                 1.0,
@@ -16547,6 +17511,7 @@ mod tests {
                 100.0,
                 0.0,
                 0.5,
+                0.0,
                 CoreVec3::ZERO,
                 ProjectionMode::Perspective,
                 1.0,
@@ -16567,6 +17532,7 @@ mod tests {
                 100.0,
                 0.0,
                 0.0,
+                0.0,
                 CoreVec3::ZERO,
                 ProjectionMode::Perspective,
                 1.0,
@@ -16576,6 +17542,7 @@ mod tests {
                 [1.0, depth, 0.0],
                 Pos2::ZERO,
                 100.0,
+                0.0,
                 0.0,
                 0.0,
                 CoreVec3::ZERO,
@@ -16596,6 +17563,7 @@ mod tests {
             perspective_view_scale(100.0, ProjectionMode::Perspective, 1.0),
             -0.4,
             0.5,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Perspective,
             1.0,
@@ -16607,6 +17575,7 @@ mod tests {
             perspective_view_scale(100.0, ProjectionMode::Perspective, 100.0),
             -0.4,
             0.5,
+            0.0,
             CoreVec3::ZERO,
             ProjectionMode::Perspective,
             100.0,
@@ -16700,6 +17669,7 @@ mod tests {
             deformed_batches[0].vertices[0].position
         );
         let camera = (
+            0.0,
             0.0,
             0.0,
             1.0,
@@ -17552,5 +18522,116 @@ mod tests {
         assert!((distance - 5.0).abs() < 1.0e-6);
         assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
         assert!(weights.iter().all(|weight| *weight >= 0.0));
+    }
+
+    #[test]
+    fn scene_camera_preview_uses_camera_position_and_forward_axis() {
+        let camera = SceneCameraPreview {
+            transform: Transform::IDENTITY,
+            perspective: true,
+            field_of_view_degrees: 90.0,
+            aspect_ratio: 2.0,
+            orthographic_size: 10.0,
+        };
+        let view = scene_camera_render_view(&camera, Vec2::new(800.0, 400.0), 1.0);
+        assert!(view.0.abs() < 1.0e-6);
+        assert!(view.1.abs() < 1.0e-6);
+        assert_eq!(view.6, ProjectionMode::Perspective);
+        assert!((view.4.y - PERSPECTIVE_CAMERA_DISTANCE).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn scene_camera_preview_respects_perspective_aspect_and_orthographic_size() {
+        let mut camera = SceneCameraPreview {
+            transform: Transform::IDENTITY,
+            perspective: true,
+            field_of_view_degrees: 90.0,
+            aspect_ratio: 2.0,
+            orthographic_size: 10.0,
+        };
+        let fitted = fit_aspect_rect(
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0)),
+            camera.aspect_ratio,
+        );
+        assert!((fitted.width() / fitted.height() - 2.0).abs() < 1.0e-6);
+        let perspective = scene_camera_render_view(&camera, fitted.size(), 1.0);
+        assert_eq!(perspective.6, ProjectionMode::Perspective);
+
+        camera.perspective = false;
+        let orthographic = scene_camera_render_view(&camera, fitted.size(), 1.0);
+        assert_eq!(orthographic.6, ProjectionMode::Orthographic);
+        assert!(orthographic.3 > perspective.3);
+    }
+
+    #[test]
+    fn scene_camera_preview_preserves_world_quaternion_roll() {
+        // Camera rotation from appdata/models/Fast-Driver/game_v0.zfp.
+        let rotation = Quat {
+            x: -0.6830127,
+            y: 0.6830127,
+            z: 0.18301277,
+            w: -0.18301277,
+        }
+        .normalized();
+        let camera = SceneCameraPreview {
+            transform: Transform {
+                rotation,
+                ..Transform::IDENTITY
+            },
+            perspective: true,
+            field_of_view_degrees: 130.0,
+            aspect_ratio: 16.0 / 9.0,
+            orthographic_size: 10.0,
+        };
+        let view = scene_camera_render_view(&camera, Vec2::new(1280.0, 720.0), 10.0);
+        let (right, up, forward) = camera_basis(view.0, view.1, view.2);
+        assert!(right.approx_eq(rotation.rotate(CoreVec3::X), 1.0e-5));
+        assert!(up.approx_eq(rotation.rotate(CoreVec3::Z), 1.0e-5));
+        assert!(forward.approx_eq(rotation.rotate(CoreVec3::Y), 1.0e-5));
+        assert!(
+            view.2.abs() > 3.0,
+            "fixture includes an approximately 180° roll"
+        );
+    }
+
+    #[test]
+    fn auto_braking_smoothly_opposes_rotation_at_low_throttle() {
+        let positive = smooth_rpm_governor_torque(0.0, 100.0, 250.0, 6_000.0, 1.0);
+        let negative = smooth_rpm_governor_torque(0.0, -100.0, 250.0, 6_000.0, 1.0);
+        assert!(positive < 0.0);
+        assert!(negative > 0.0);
+        assert!((positive.abs() - negative.abs()).abs() < 1.0e-5);
+        assert_eq!(
+            smooth_rpm_governor_torque(0.0, 0.0, 250.0, 6_000.0, 1.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn auto_braking_drives_toward_and_holds_throttle_rpm_target() {
+        let below_target = 2_000.0 * std::f32::consts::TAU / 60.0;
+        assert!(smooth_rpm_governor_torque(0.5, below_target, 250.0, 6_000.0, 1.0) > 0.0);
+        let above_target = 4_000.0 * std::f32::consts::TAU / 60.0;
+        assert!(smooth_rpm_governor_torque(0.5, above_target, 250.0, 6_000.0, 1.0) < 0.0);
+        assert!(smooth_rpm_governor_torque(0.5, 0.0, 250.0, 6_000.0, -1.0) < 0.0);
+    }
+
+    #[test]
+    fn cameras_are_weightless_and_non_collidable() {
+        let mut scene = EditorScene::default();
+        let camera = scene.add("Camera", ObjectKind::Camera, None);
+        assert!(!scene.participates_in_physics(camera));
+        assert!(
+            scene
+                .tree
+                .node(camera)
+                .unwrap()
+                .components
+                .iter()
+                .all(|component| { !matches!(component, Component::Collider { .. }) })
+        );
+
+        let model = scene.add("Model", ObjectKind::Model, None);
+        assert!(scene.participates_in_physics(model));
     }
 }
