@@ -32,6 +32,7 @@ pub struct GpuBatch {
     pub texture_cache_key: u64,
     pub texture: Option<Arc<TextureAsset>>,
     pub gpu_texture: Option<Arc<GpuImage>>,
+    pub transparent: bool,
     pub vertices: Vec<GpuVertex>,
 }
 
@@ -79,6 +80,7 @@ pub struct VulkanViewport {
     camera_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
+    transparent_pipeline: wgpu::RenderPipeline,
     shadow_layout: wgpu::BindGroupLayout,
     directional_shadow_pipeline: wgpu::RenderPipeline,
     point_shadow_pipeline: wgpu::RenderPipeline,
@@ -91,6 +93,8 @@ pub struct VulkanViewport {
     point_shadow_cache: Option<(usize, u32, u32, wgpu::Texture, Arc<wgpu::TextureView>)>,
     gpu_shadow_key: Option<u64>,
     gpu_point_shadow_key: Option<u64>,
+    gpu_directional_metadata: Option<DirectionalShadowMap>,
+    gpu_point_metadata: Option<PointShadowAtlas>,
     camera_group_cache: Option<(usize, usize, Arc<wgpu::BindGroup>)>,
     vertex_cache: HashMap<u64, (usize, u64, Arc<wgpu::Buffer>)>,
     bind_group_cache: HashMap<usize, Arc<wgpu::BindGroup>>,
@@ -183,44 +187,48 @@ impl VulkanViewport {
             0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
             4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4
         ];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ZeroFPS Vulkan viewport"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GpuVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attributes,
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        let viewport_pipeline = |label, depth_write_enabled| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = viewport_pipeline("ZeroFPS Vulkan opaque viewport", true);
+        let transparent_pipeline = viewport_pipeline("ZeroFPS Vulkan transparent viewport", false);
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("GPU shadow uniform layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -317,6 +325,7 @@ impl VulkanViewport {
             camera_layout,
             texture_layout,
             pipeline,
+            transparent_pipeline,
             shadow_layout,
             directional_shadow_pipeline,
             point_shadow_pipeline,
@@ -329,6 +338,8 @@ impl VulkanViewport {
             point_shadow_cache: None,
             gpu_shadow_key: None,
             gpu_point_shadow_key: None,
+            gpu_directional_metadata: None,
+            gpu_point_metadata: None,
             camera_group_cache: None,
             vertex_cache: HashMap::new(),
             bind_group_cache: HashMap::new(),
@@ -554,43 +565,52 @@ impl VulkanViewport {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, camera_group.as_ref(), &[]);
-            for batch in batches {
-                if batch.vertices.is_empty() {
-                    continue;
+            for transparent in [false, true] {
+                pass.set_pipeline(if transparent {
+                    &self.transparent_pipeline
+                } else {
+                    &self.pipeline
+                });
+                for batch in batches
+                    .iter()
+                    .filter(|batch| batch.transparent == transparent)
+                {
+                    if batch.vertices.is_empty() {
+                        continue;
+                    }
+                    let view = batch
+                        .gpu_texture
+                        .as_ref()
+                        .map(|image| Arc::clone(&image.view))
+                        .unwrap_or_else(|| {
+                            self.texture_view(batch.texture_cache_key, batch.texture.as_ref())
+                        });
+                    let view_key = Arc::as_ptr(&view) as usize;
+                    live_bind_groups.insert(view_key);
+                    let texture_group =
+                        Arc::clone(self.bind_group_cache.entry(view_key).or_insert_with(|| {
+                            Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("viewport texture group"),
+                                layout: &self.texture_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(&view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                    },
+                                ],
+                            }))
+                        }));
+                    let vertices = self.vertex_buffer(batch, batch_revision);
+                    live_vertex_buffers.insert(batch.cache_key);
+                    pass.set_bind_group(1, texture_group.as_ref(), &[]);
+                    pass.set_vertex_buffer(0, vertices.as_ref().slice(..));
+                    pass.draw(0..batch.vertices.len() as u32, 0..1);
                 }
-                let view = batch
-                    .gpu_texture
-                    .as_ref()
-                    .map(|image| Arc::clone(&image.view))
-                    .unwrap_or_else(|| {
-                        self.texture_view(batch.texture_cache_key, batch.texture.as_ref())
-                    });
-                let view_key = Arc::as_ptr(&view) as usize;
-                live_bind_groups.insert(view_key);
-                let texture_group =
-                    Arc::clone(self.bind_group_cache.entry(view_key).or_insert_with(|| {
-                        Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("viewport texture group"),
-                            layout: &self.texture_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(&view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                },
-                            ],
-                        }))
-                    }));
-                let vertices = self.vertex_buffer(batch, batch_revision);
-                live_vertex_buffers.insert(batch.cache_key);
-                pass.set_bind_group(1, texture_group.as_ref(), &[]);
-                pass.set_vertex_buffer(0, vertices.as_ref().slice(..));
-                pass.draw(0..batch.vertices.len() as u32, 0..1);
             }
         }
         // Bind groups retain their texture views, and therefore the complete
@@ -648,13 +668,16 @@ impl VulkanViewport {
             let key = revision
                 ^ (global_resolution as u64).rotate_left(11)
                 ^ (filter_radius as u64).rotate_left(23);
-            let metadata = directional_metadata(batches, global_resolution, filter_radius);
             if self.gpu_shadow_key != Some(key) {
+                let metadata = directional_metadata(batches, global_resolution, filter_radius);
                 self.render_gpu_directional_shadow(batches, &metadata, key, batch_revision)?;
+                self.gpu_directional_metadata = Some(metadata);
                 self.gpu_shadow_key = Some(key);
             }
-            Some(metadata)
+            self.gpu_directional_metadata.clone()
         } else {
+            self.gpu_directional_metadata = None;
+            self.gpu_shadow_key = None;
             None
         };
         let point_key = lights.iter().fold(revision.rotate_left(7), |key, light| {
@@ -664,14 +687,18 @@ impl VulkanViewport {
                 ^ (light.position.y.to_bits() as u64).rotate_left(29)
                 ^ (light.position.z.to_bits() as u64).rotate_left(41)
         });
-        let points = point_metadata(lights, filter_radius);
-        if points.regions.iter().any(|region| region.resolution > 0) {
+        let points_required = lights.iter().any(|light| light.shadow_resolution > 0);
+        if points_required {
             if self.gpu_point_shadow_key != Some(point_key) {
+                let points = point_metadata(lights, filter_radius);
                 self.render_gpu_point_shadows(batches, lights, &points, point_key, batch_revision)?;
+                self.gpu_point_metadata = Some(points);
                 self.gpu_point_shadow_key = Some(point_key);
             }
-            Ok((directional, Some(points)))
+            Ok((directional, self.gpu_point_metadata.clone()))
         } else {
+            self.gpu_point_metadata = None;
+            self.gpu_point_shadow_key = None;
             Ok((directional, None))
         }
     }
@@ -1418,6 +1445,7 @@ mod tests {
             texture_cache_key: 1,
             texture: Some(texture),
             gpu_texture: None,
+            transparent: false,
             vertices: vec![
                 vertex(-1.0, -1.0, [1.0; 4]),
                 vertex(1.0, -1.0, [1.0; 4]),

@@ -5,8 +5,9 @@
 //! geometry tree can compose parent and child transforms.
 
 use crate::{
-    AssetNode, AssetTransform, AxisConvention, Handedness, ImportError, Material, MeshAsset,
-    Primitive, SourceInfo, TextureAsset, Vertex, VertexScalarField,
+    AssetAnimationChannel, AssetAnimationClip, AssetNode, AssetTransform, AxisConvention,
+    Handedness, ImportError, Material, MeshAsset, Primitive, SourceInfo, TextureAsset, Vertex,
+    VertexScalarField,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -40,6 +41,27 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
         ..MeshAsset::default()
     };
 
+    for extension in document.extensions_used() {
+        match extension {
+            "KHR_materials_volume" => asset.warnings.push(
+                "KHR_materials_volume was parsed, but thickness and attenuation are not yet represented by ZeroFPS materials".into(),
+            ),
+            "KHR_materials_unlit" => asset.warnings.push(
+                "KHR_materials_unlit was parsed, but the canonical material does not yet preserve an unlit shader flag".into(),
+            ),
+            "KHR_materials_variants" => asset.warnings.push(
+                "KHR_materials_variants was parsed; the default primitive material was imported and variant mappings were skipped".into(),
+            ),
+            "KHR_texture_transform" => asset.warnings.push(
+                "KHR_texture_transform was parsed, but UV offset/rotation/scale are not yet applied".into(),
+            ),
+            "KHR_lights_punctual" => asset.warnings.push(
+                "KHR_lights_punctual was parsed, but glTF lights are not yet instantiated as ZeroFPS scene lights".into(),
+            ),
+            _ => {}
+        }
+    }
+
     for (index, image) in images.iter().enumerate() {
         let name = format!("image-{index}");
         asset
@@ -54,19 +76,41 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("material-{index}"));
         let pbr = material.pbr_metallic_roughness();
-        let base_color = pbr.base_color_factor();
-        let emissive = material.emissive_factor();
-        let base_color_texture = pbr
-            .base_color_texture()
+        let specular_glossiness = material.pbr_specular_glossiness();
+        let base_color = specular_glossiness
+            .as_ref()
+            .map(|value| value.diffuse_factor())
+            .unwrap_or_else(|| pbr.base_color_factor());
+        let emissive_strength = material.emissive_strength().unwrap_or(1.0);
+        let emissive = material
+            .emissive_factor()
+            .map(|channel| channel * emissive_strength);
+        let base_color_texture = specular_glossiness
+            .as_ref()
+            .and_then(|value| value.diffuse_texture())
+            .or_else(|| pbr.base_color_texture())
             .map(|info| format!("image-{}", info.texture().source().index()));
+        let (specular, shininess) = if let Some(value) = specular_glossiness.as_ref() {
+            (value.specular_factor(), value.glossiness_factor())
+        } else if let Some(value) = material.specular() {
+            let factor = value.specular_factor();
+            (
+                value
+                    .specular_color_factor()
+                    .map(|channel| channel * factor),
+                1.0 - pbr.roughness_factor(),
+            )
+        } else {
+            ([pbr.metallic_factor(); 3], 1.0 - pbr.roughness_factor())
+        };
         asset.materials.insert(
             name.clone(),
             Material {
                 name,
                 base_color,
                 emissive,
-                specular: [pbr.metallic_factor(); 3],
-                shininess: 1.0 - pbr.roughness_factor(),
+                specular,
+                shininess,
                 opacity: base_color[3],
                 base_color_texture,
                 transmission: material
@@ -77,6 +121,7 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
         );
     }
 
+    asset.animations = import_animations(&document, &buffers, &mut asset.warnings);
     let scenes: Vec<_> = if let Some(scene) = document.default_scene() {
         vec![scene]
     } else {
@@ -96,6 +141,40 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
         ));
     }
     Ok(asset)
+}
+
+fn import_animations(
+    document: &::gltf::Document,
+    buffers: &[::gltf::buffer::Data],
+    warnings: &mut Vec<String>,
+) -> Vec<AssetAnimationClip> {
+    use ::gltf::animation::util::ReadOutputs;
+    document.animations().enumerate().map(|(animation_index, animation)| {
+        let mut channels = Vec::new();
+        for channel in animation.channels() {
+            let reader = channel.reader(|buffer| Some(&buffers[buffer.index()].0));
+            let Some(times) = reader.read_inputs().map(Iterator::collect::<Vec<_>>) else { continue; };
+            let node = channel.target().node().index();
+            let cubic = channel.sampler().interpolation()
+                == ::gltf::animation::Interpolation::CubicSpline;
+            let output = match reader.read_outputs() {
+                Some(ReadOutputs::Translations(values)) => { let values = values.map(z_up).collect::<Vec<_>>(); AssetAnimationChannel::Translation { node, times, values: animation_key_values(values, cubic) } },
+                Some(ReadOutputs::Rotations(values)) => { let values = values.into_f32().map(|q| [q[3], q[0], -q[2], q[1]]).collect::<Vec<_>>(); AssetAnimationChannel::Rotation { node, times, values: animation_key_values(values, cubic) } },
+                Some(ReadOutputs::Scales(values)) => { let values = values.map(|s| [s[0], s[2], s[1]]).collect::<Vec<_>>(); AssetAnimationChannel::Scale { node, times, values: animation_key_values(values, cubic) } },
+                Some(ReadOutputs::MorphTargetWeights(_)) | None => { warnings.push("glTF morph-weight animation import is not available in the quick animation build".into()); continue; }
+            };
+            channels.push(output);
+        }
+        AssetAnimationClip { name: animation.name().map(str::to_owned).unwrap_or_else(|| format!("Animation {animation_index}")), channels }
+    }).collect()
+}
+
+fn animation_key_values<T>(values: Vec<T>, cubic: bool) -> Vec<T> {
+    if cubic {
+        values.into_iter().skip(1).step_by(3).collect()
+    } else {
+        values
+    }
 }
 
 fn visit_node(
@@ -383,5 +462,37 @@ mod tests {
             "mesh primitives must remain owned by their glTF nodes"
         );
         asset.validate().expect("hierarchy must be canonical");
+    }
+
+    #[test]
+    fn imports_required_specular_glossiness_bridge_fixture() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../appdata/models/gltf_glb/bridge_over_a_river.glb");
+        let asset = crate::import_file(&fixture)
+            .expect("required KHR_materials_pbrSpecularGlossiness should import");
+        assert!(!asset.vertices.is_empty());
+        assert!(!asset.primitives.is_empty());
+        assert!(!asset.materials.is_empty());
+        let clip = asset.animations.first().expect("bridge animation clip");
+        assert!(clip.channels.iter().any(|channel| matches!(
+            channel,
+            AssetAnimationChannel::Rotation { node: 4, times, values }
+                if !times.is_empty() && !values.is_empty()
+        )));
+        let root = asset
+            .nodes
+            .iter()
+            .find(|node| node.name == "Sketchfab_model")
+            .expect("bridge root node");
+        assert_eq!(root.parent, None);
+        assert!((root.local.rotation[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1.0e-6);
+        assert!((root.local.rotation[1] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1.0e-6);
+        assert!(root.local.rotation[2].abs() < 1.0e-6);
+        assert!(root.local.rotation[3].abs() < 1.0e-6);
+        assert!(asset.materials.values().all(|material| {
+            material.base_color.iter().all(|value| value.is_finite())
+                && material.specular.iter().all(|value| value.is_finite())
+                && material.shininess.is_finite()
+        }));
     }
 }

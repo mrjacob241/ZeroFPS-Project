@@ -334,6 +334,7 @@ enum BottomTab {
 enum InspectorTab {
     Inspector,
     Inputs,
+    World,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -875,6 +876,7 @@ struct SceneCameraPreview {
 }
 
 const MAX_VIEWPORT_LIGHTS: usize = 8;
+const MAX_DISPLAYED_OBJECT_NAME_CHARS: usize = 24;
 
 #[derive(Clone, Copy, Debug)]
 struct ViewportLight {
@@ -1506,7 +1508,7 @@ impl DisplayWorker {
 }
 
 fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::GpuBatch> {
-    let mut groups: HashMap<(usize, bool), vulkan_viewport::GpuBatch> = HashMap::new();
+    let mut groups: HashMap<(usize, bool, bool), vulkan_viewport::GpuBatch> = HashMap::new();
     for triangle in triangles {
         let key = triangle
             .gpu_texture
@@ -1519,8 +1521,9 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
                     .map(|texture| Arc::as_ptr(texture) as usize)
             })
             .unwrap_or(0);
+        let transparent = triangle.base_color[3] < 0.999;
         let batch = groups
-            .entry((key, triangle.casts_shadows))
+            .entry((key, triangle.casts_shadows, transparent))
             .or_insert_with(|| vulkan_viewport::GpuBatch {
                 cache_key: triangle
                     .source_texture
@@ -1532,6 +1535,7 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
                 texture_cache_key: triangle.texture_cache_key,
                 texture: triangle.texture.clone(),
                 gpu_texture: triangle.gpu_texture.clone(),
+                transparent,
                 vertices: Vec::new(),
             });
         batch.cache_key = batch.cache_key.rotate_left(7)
@@ -1709,6 +1713,9 @@ struct EditorApp {
     texture_paint_heatmap: bool,
     advanced: bool,
     global_light_enabled: bool,
+    sky_color: [f32; 3],
+    skybox_path: String,
+    skybox_texture: Option<TextureHandle>,
     camera_preview_visible: bool,
     global_shadow_resolution: u32,
     shadow_quality: usize,
@@ -1760,6 +1767,7 @@ struct EditorApp {
     save_dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
     load_dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
     compositor_image_dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
+    skybox_dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
 }
 
 impl EditorApp {
@@ -1852,6 +1860,9 @@ impl EditorApp {
             texture_paint_heatmap: true,
             advanced: false,
             global_light_enabled: true,
+            sky_color: [0.082, 0.094, 0.122],
+            skybox_path: String::new(),
+            skybox_texture: None,
             camera_preview_visible: false,
             global_shadow_resolution: 512,
             shadow_quality: 3,
@@ -1914,6 +1925,7 @@ impl EditorApp {
             save_dialog_result: None,
             load_dialog_result: None,
             compositor_image_dialog_result: None,
+            skybox_dialog_result: None,
         }
     }
 
@@ -2049,6 +2061,7 @@ impl EditorApp {
         let asset_path = asset.path.clone();
         let asset_name = asset.mesh.name.clone();
         let asset_nodes = asset.mesh.nodes.clone();
+        let asset_animations = asset.mesh.animations.clone();
         let primitive_names = asset
             .mesh
             .primitives
@@ -2077,13 +2090,13 @@ impl EditorApp {
             );
             self.scene.selected = Some(id);
         } else {
-            let roots = asset_nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, node)| node.parent.is_none().then_some(index))
-                .collect::<Vec<_>>();
-            let wrapper =
-                (roots.len() > 1).then(|| self.scene.add(&object_name, ObjectKind::Empty, None));
+            // Always keep the user-facing imported object separate from source
+            // hierarchy roots. glTF exporters commonly insert root nodes solely
+            // for coordinate-system correction (for example Sketchfab's X-axis
+            // correction). Exposing that node as the project object makes its
+            // rotation appear wrong and causes user transforms to modify the
+            // exporter correction itself.
+            let wrapper = Some(self.scene.add(&object_name, ObjectKind::Empty, None));
             let mut scene_nodes = Vec::with_capacity(asset_nodes.len());
             for (node_index, node) in asset_nodes.iter().enumerate() {
                 let parent = node
@@ -2140,7 +2153,86 @@ impl EditorApp {
                 }
                 scene_nodes.push(id);
             }
-            self.scene.selected = wrapper.or_else(|| roots.first().map(|root| scene_nodes[*root]));
+            // Quick glTF animation build: expose the first clip's initial
+            // transform keys as normal compositing nodes connected to each
+            // animated object's transform output. The imported clip remains in
+            // the asset for the upcoming timeline/interpolation runtime.
+            self.sync_compositor_outputs();
+            if let Some(clip) = asset_animations.first() {
+                for channel in &clip.channels {
+                    let (source_node, settings) = match channel {
+                        zerofps_assets::AssetAnimationChannel::Translation {
+                            node, values, ..
+                        } => {
+                            let Some(value) = values.first() else {
+                                continue;
+                            };
+                            (*node, NodeSettings::Position { values: *value })
+                        }
+                        zerofps_assets::AssetAnimationChannel::Rotation {
+                            node, values, ..
+                        } => {
+                            let Some(value) = values.first() else {
+                                continue;
+                            };
+                            let euler = Quat {
+                                w: value[0],
+                                x: value[1],
+                                y: value[2],
+                                z: value[3],
+                            }
+                            .normalized()
+                            .to_euler_xyz();
+                            (
+                                *node,
+                                NodeSettings::Rotation {
+                                    degrees: [
+                                        euler.x.to_degrees(),
+                                        euler.y.to_degrees(),
+                                        euler.z.to_degrees(),
+                                    ],
+                                },
+                            )
+                        }
+                        zerofps_assets::AssetAnimationChannel::Scale { .. } => continue,
+                    };
+                    let Some(&target_id) = scene_nodes.get(source_node) else {
+                        continue;
+                    };
+                    let Some(object_index) =
+                        self.scene.tree.iter().position(|(id, _)| id == target_id)
+                    else {
+                        continue;
+                    };
+                    let Some(output_id) = self.compositor_nodes.iter().find_map(|node| matches!(node.settings, NodeSettings::ObjectTransform { object_index: target } if target == object_index).then_some(node.id)) else { continue };
+                    let input = usize::from(matches!(settings, NodeSettings::Rotation { .. }));
+                    let node_id = self.compositor_next_id;
+                    self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+                    self.compositor_nodes.push(CompositorNode {
+                        id: node_id,
+                        object_index,
+                        object_name: self
+                            .scene
+                            .tree
+                            .node(target_id)
+                            .map(|node| node.name.clone())
+                            .unwrap_or_default(),
+                        settings_object_name: None,
+                        settings,
+                        position: Vec2::new(-240.0, 80.0 + input as f32 * 150.0),
+                    });
+                    self.compositor_links
+                        .retain(|(_, _, to, socket)| *to != output_id || *socket != input);
+                    self.compositor_links.push((node_id, 0, output_id, input));
+                }
+                self.apply_object_transform_graphs();
+                self.logs.push(LogEntry {
+                    level: "ANIMATION",
+                    color: Color32::from_rgb(174, 123, 255),
+                    message: format!("Imported `{}` transform channels into compositing (quick build: initial keyframe)", clip.name),
+                });
+            }
+            self.scene.selected = wrapper;
         }
         self.record_undo(previous);
         self.logs.push(LogEntry {
@@ -2845,6 +2937,78 @@ impl EditorApp {
         }
     }
 
+    fn start_skybox_import(&mut self, ctx: &egui::Context) {
+        if self.skybox_dialog_result.is_some() {
+            return;
+        }
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let repaint = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.skybox_dialog_result = Some(receiver);
+        std::thread::Builder::new()
+            .name("zerofps-skybox-dialog".into())
+            .spawn(move || {
+                let path = rfd::FileDialog::new()
+                    .set_title("Select Skybox Image")
+                    .set_directory(directory)
+                    .add_filter("Images", &["png", "jpg", "jpeg"])
+                    .pick_file();
+                let _ = sender.send(path);
+                repaint.request_repaint();
+            })
+            .expect("skybox dialog worker should start");
+    }
+
+    fn poll_skybox_import(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.skybox_dialog_result else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(path) => {
+                self.skybox_dialog_result = None;
+                if let Some(path) = path {
+                    match image::open(&path) {
+                        Ok(image) => {
+                            let rgba = image.into_rgba8();
+                            let size = [rgba.width() as usize, rgba.height() as usize];
+                            self.skybox_texture = Some(ctx.load_texture(
+                                "world-skybox",
+                                ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                                TextureOptions::LINEAR,
+                            ));
+                            self.skybox_path = path.to_string_lossy().into_owned();
+                            self.project_dirty = true;
+                        }
+                        Err(error) => {
+                            self.project_error_dialog = Some((
+                                "Skybox Import Failed".into(),
+                                format!("Could not decode `{}`.\n\n{error}", path.display()),
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.skybox_dialog_result = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn ensure_skybox_texture(&mut self, ctx: &egui::Context) {
+        if self.skybox_texture.is_some() || self.skybox_path.is_empty() {
+            return;
+        }
+        let Ok(image) = image::open(&self.skybox_path) else {
+            return;
+        };
+        let rgba = image.into_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        self.skybox_texture = Some(ctx.load_texture(
+            "world-skybox",
+            ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+            TextureOptions::LINEAR,
+        ));
+    }
+
     fn load_project_from(&mut self, path: PathBuf) {
         let cache_name = path
             .file_stem()
@@ -2938,6 +3102,9 @@ impl EditorApp {
                 "editor.global_light_enabled",
                 self.global_light_enabled.to_string(),
             ),
+            ("editor.sky_color_r", self.sky_color[0].to_string()),
+            ("editor.sky_color_g", self.sky_color[1].to_string()),
+            ("editor.sky_color_b", self.sky_color[2].to_string()),
             (
                 "editor.global_shadow_resolution",
                 self.global_shadow_resolution.to_string(),
@@ -3083,6 +3250,30 @@ impl EditorApp {
             .collect();
         let mut mapping = BTreeMap::new();
         let mut files = Vec::new();
+        if !self.skybox_path.is_empty() {
+            let source = PathBuf::from(&self.skybox_path);
+            if source.is_file() {
+                let filename = source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(safe_bundle_filename)
+                    .unwrap_or_else(|| "skybox.png".into());
+                let archive_path = format!("assets/world/{filename}");
+                project
+                    .project
+                    .properties
+                    .insert("editor.skybox_archive".into(), archive_path.clone());
+                files.push(BundleAsset {
+                    source,
+                    archive_path,
+                });
+            } else {
+                project
+                    .project
+                    .properties
+                    .insert("editor.skybox_path".into(), self.skybox_path.clone());
+            }
+        }
         for (index, source) in referenced.into_iter().enumerate() {
             let source_path = PathBuf::from(&source);
             if !source_path.is_file() {
@@ -3594,6 +3785,18 @@ impl EditorApp {
         {
             self.global_light_enabled = value;
         }
+        self.sky_color = [
+            number("editor.sky_color_r").unwrap_or(self.sky_color[0]),
+            number("editor.sky_color_g").unwrap_or(self.sky_color[1]),
+            number("editor.sky_color_b").unwrap_or(self.sky_color[2]),
+        ]
+        .map(|channel| channel.clamp(0.0, 1.0));
+        self.skybox_path = properties
+            .get("editor.skybox_archive")
+            .or_else(|| properties.get("editor.skybox_path"))
+            .cloned()
+            .unwrap_or_default();
+        self.skybox_texture = None;
         if let Some(value) = properties
             .get("editor.global_shadow_resolution")
             .and_then(|value| value.parse::<u32>().ok())
@@ -5919,6 +6122,7 @@ impl EditorApp {
             return None;
         };
         let name = object.name.clone();
+        let (display_name, name_truncated) = truncated_object_name(&name);
         let children = object.children().to_vec();
         let kind = self.scene.kind(id);
         let (_, dropped) = ui.dnd_drop_zone::<NodeId, _>(egui::Frame::new(), |ui| {
@@ -5931,7 +6135,15 @@ impl EditorApp {
                         ui.add_space(11.0);
                     }
                     let selected = self.scene.selected == Some(id);
-                    ui.selectable_label(selected, format!("{}  {}", kind.icon(), name))
+                    let response =
+                        ui.selectable_label(selected, format!("{}  {}", kind.icon(), display_name));
+                    if name_truncated {
+                        response.on_hover_ui(|ui| {
+                            ui.strong(&name);
+                        })
+                    } else {
+                        response
+                    }
                 })
                 .inner;
             let drag_response = ui.interact(
@@ -6033,6 +6245,11 @@ impl EditorApp {
                         InspectorTab::Inputs,
                         "Inputs",
                     );
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::World,
+                        "World",
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.weak("⋮");
                     });
@@ -6040,6 +6257,10 @@ impl EditorApp {
                 ui.separator();
                 if self.inspector_tab == InspectorTab::Inputs {
                     self.object_handles_panel(ui);
+                    return;
+                }
+                if self.inspector_tab == InspectorTab::World {
+                    self.world_panel(ui);
                     return;
                 }
                 let inspector_height = ui.available_height();
@@ -7340,6 +7561,219 @@ impl EditorApp {
             });
     }
 
+    fn world_panel(&mut self, ui: &mut egui::Ui) {
+        let previous_wind = self.dynamics_wind.clone();
+        let previous_physics = self.dynamics_settings.clone();
+        let previous_light = self.global_light_enabled;
+        let previous_shadow = (
+            self.global_shadow_resolution,
+            self.shadow_quality,
+            self.shadow_blur_radius,
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("world_settings_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading("World");
+                ui.small("Scene-wide simulation, lighting, and shadow settings.");
+                ui.add_space(8.0);
+
+                egui::CollapsingHeader::new(RichText::new("Physics").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if self.dynamics_running {
+                                    "Ⅱ Pause"
+                                } else {
+                                    "▶ Run"
+                                })
+                                .clicked()
+                            {
+                                self.dynamics_running = !self.dynamics_running;
+                                self.dynamics_last_tick = Instant::now();
+                            }
+                            if ui.button("Step").clicked() {
+                                self.dynamics_single_step = true;
+                            }
+                            if ui.button("Reset").clicked() {
+                                self.reset_dynamics();
+                            }
+                        });
+                        ui.small(format!(
+                            "Simulation time: {:.3} s · {} active object(s)",
+                            self.dynamics_time,
+                            self.dynamics_enabled.len()
+                        ));
+                        ui.add(
+                            egui::DragValue::new(&mut self.dynamics_settings.particle_mass)
+                                .speed(0.01)
+                                .range(1.0e-6..=f32::MAX)
+                                .prefix("Particle mass "),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.dynamics_settings.iterations, 1..=16)
+                                .text("Solver iterations"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.dynamics_settings.stretch_compliance)
+                                .speed(0.000_001)
+                                .range(0.0..=f32::MAX)
+                                .prefix("Stretch compliance "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.dynamics_settings.bend_compliance)
+                                .speed(0.000_01)
+                                .range(0.0..=f32::MAX)
+                                .prefix("Bend compliance "),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.dynamics_settings.damping, 0.0..=0.2)
+                                .text("Damping"),
+                        );
+                        ui.separator();
+                        ui.checkbox(&mut self.dynamics_wind.enabled, "World wind enabled");
+                        let mut wind = [
+                            self.dynamics_wind.velocity.x,
+                            self.dynamics_wind.velocity.y,
+                            self.dynamics_wind.velocity.z,
+                        ];
+                        vector_editor(ui, "Wind XYZ", &mut wind, 0.1);
+                        self.dynamics_wind.velocity = CoreVec3::new(wind[0], wind[1], wind[2]);
+                        ui.add(
+                            egui::Slider::new(&mut self.dynamics_wind.gust_strength, 0.0..=2.0)
+                                .text("Gust"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.dynamics_wind.turbulence, 0.0..=2.0)
+                                .text("Turbulence"),
+                        );
+                    });
+
+                egui::CollapsingHeader::new(RichText::new("Global Light").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut self.global_light_enabled, "Enable global light")
+                            .on_hover_text("The editor's world-space directional light.");
+                        ui.small("Direction: world-space (-0.35, 0.80, 0.45)");
+                    });
+
+                egui::CollapsingHeader::new(RichText::new("Sky").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Color");
+                            if ui.color_edit_button_rgb(&mut self.sky_color).changed() {
+                                self.project_dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.skybox_dialog_result.is_none(),
+                                    egui::Button::new("Load skybox…"),
+                                )
+                                .clicked()
+                            {
+                                self.start_skybox_import(ui.ctx());
+                            }
+                            if !self.skybox_path.is_empty() && ui.button("Clear").clicked() {
+                                self.skybox_path.clear();
+                                self.skybox_texture = None;
+                                self.project_dirty = true;
+                            }
+                        });
+                        if self.skybox_path.is_empty() {
+                            ui.small("Solid-color sky");
+                        } else {
+                            let filename = std::path::Path::new(&self.skybox_path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(&self.skybox_path);
+                            ui.small(filename).on_hover_text(&self.skybox_path);
+                            ui.small("Equirectangular image background (first build)");
+                        }
+                    });
+
+                egui::CollapsingHeader::new(RichText::new("Shadows").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ComboBox::from_id_salt("world_shadow_resolution")
+                            .selected_text(if self.global_shadow_resolution == 0 {
+                                "Global shadows: Off".into()
+                            } else {
+                                format!("Global shadows: {} px", self.global_shadow_resolution)
+                            })
+                            .show_ui(ui, |ui| {
+                                for resolution in [0, 128, 256, 512, 1024, 2048] {
+                                    ui.selectable_value(
+                                        &mut self.global_shadow_resolution,
+                                        resolution,
+                                        if resolution == 0 {
+                                            "Off".into()
+                                        } else {
+                                            format!("{resolution} px")
+                                        },
+                                    );
+                                }
+                            });
+                        egui::ComboBox::from_id_salt("world_shadow_quality")
+                            .selected_text(format!(
+                                "Quality: {}",
+                                shadow_quality_label(self.shadow_quality)
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (quality, label) in [
+                                    (0, "Potato"),
+                                    (1, "Low"),
+                                    (2, "Medium"),
+                                    (3, "High"),
+                                    (4, "Ultra"),
+                                ] {
+                                    ui.selectable_value(&mut self.shadow_quality, quality, label);
+                                }
+                            });
+                        egui::ComboBox::from_id_salt("world_shadow_blur")
+                            .selected_text(if self.shadow_blur_radius == 0 {
+                                "Fast blur: Off".into()
+                            } else {
+                                format!("Fast blur: {} px", self.shadow_blur_radius)
+                            })
+                            .show_ui(ui, |ui| {
+                                for radius in 0..=4 {
+                                    ui.selectable_value(
+                                        &mut self.shadow_blur_radius,
+                                        radius,
+                                        if radius == 0 {
+                                            "Off".into()
+                                        } else {
+                                            format!("{radius} px")
+                                        },
+                                    );
+                                }
+                            });
+                        ui.small("Prefer stable shadows over temporal flicker.");
+                    });
+            });
+
+        let physics_changed =
+            self.dynamics_wind != previous_wind || self.dynamics_settings != previous_physics;
+        let lighting_changed = self.global_light_enabled != previous_light
+            || previous_shadow
+                != (
+                    self.global_shadow_resolution,
+                    self.shadow_quality,
+                    self.shadow_blur_radius,
+                );
+        if physics_changed || lighting_changed {
+            self.project_dirty = true;
+        }
+        if lighting_changed {
+            self.viewport_requested_key = None;
+            self.scene_revision = self.scene_revision.wrapping_add(1);
+        }
+    }
+
     fn bottom_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("bottom")
             .resizable(true)
@@ -7841,8 +8275,15 @@ impl EditorApp {
             if node.object_name.is_empty() {
                 node.object_name = names.get(node.object_index).cloned().unwrap_or_default();
             }
-            node.object_index =
-                object_index_by_name(&names, &node.object_name).unwrap_or(usize::MAX);
+            // Preserve a still-valid index before falling back to names. glTF
+            // legally permits duplicate node names; resolving every duplicate
+            // to the first match made sync delete and recreate compositor nodes
+            // every frame (river.zfp reached hundreds of thousands of IDs).
+            node.object_index = if names.get(node.object_index) == Some(&node.object_name) {
+                node.object_index
+            } else {
+                object_index_by_name(&names, &node.object_name).unwrap_or(usize::MAX)
+            };
 
             if let Some(index) = node.settings.object_index() {
                 let name = node
@@ -8200,7 +8641,15 @@ impl EditorApp {
                 transform.rotation = base_rotation
                     * Quat::from_euler_xyz(CoreVec3::new(0.0, 0.0, joint.angle_radians));
             }
-            if transform != original && self.scene.tree.set_local_transform(id, transform).is_ok() {
+            // Graph values commonly round-trip quaternion -> Euler -> quaternion.
+            // Treat sub-float-noise differences as stable; otherwise an unchanged
+            // animation pose increments the scene revision every frame and forces
+            // all shadow maps to rebuild.
+            let materially_changed = (transform.translation - original.translation).length()
+                > 1.0e-5
+                || (transform.scale - original.scale).length() > 1.0e-5
+                || !transform.rotation.approx_eq(original.rotation, 1.0e-6);
+            if materially_changed && self.scene.tree.set_local_transform(id, transform).is_ok() {
                 changed = true;
             }
         }
@@ -11669,6 +12118,13 @@ impl EditorApp {
                         &presented.triangles,
                         presented.mode,
                         viewport_texture,
+                        Color32::from_rgb(
+                            (self.sky_color[0] * 255.0).round() as u8,
+                            (self.sky_color[1] * 255.0).round() as u8,
+                            (self.sky_color[2] * 255.0).round() as u8,
+                        ),
+                        self.skybox_texture.as_ref().map(TextureHandle::id),
+                        scene_camera.is_none(),
                         &collider_wireframe,
                         &camera_wireframes,
                         if scene_camera.is_some() {
@@ -11925,6 +12381,8 @@ impl eframe::App for EditorApp {
         self.poll_save_as();
         self.poll_load_project();
         self.poll_compositor_image_import();
+        self.poll_skybox_import(ctx);
+        self.ensure_skybox_texture(ctx);
         self.sync_compositor_outputs();
         self.poll_vulkan_compositor(ctx);
         self.tick_compositor_time(ctx);
@@ -12991,7 +13449,9 @@ fn rewrite_compositor_image_paths<T: AsRef<std::path::Path>>(
     mapping: &BTreeMap<String, T>,
 ) {
     for (key, path) in &mut project.project.properties {
-        if (key.starts_with("compositor.image.") || key.ends_with(".image_archive"))
+        if (key.starts_with("compositor.image.")
+            || key.ends_with(".image_archive")
+            || key == "editor.skybox_archive")
             && let Some(replacement) = mapping.get(path)
         {
             *path = replacement.as_ref().to_string_lossy().into_owned();
@@ -14150,12 +14610,23 @@ fn draw_viewport(
     triangles: &[PreviewTriangle],
     mode: ViewportMode,
     viewport_texture: Option<TextureId>,
+    sky_color: Color32,
+    skybox_texture: Option<TextureId>,
+    editor_overlays: bool,
     collider_wireframe: &[[[f32; 3]; 2]],
     camera_wireframes: &[[[f32; 3]; 2]],
     point_lights: &[ViewportLight],
 ) {
     let (yaw, pitch, roll, zoom, camera_target, grid_spacing, projection_mode) = camera;
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(21, 24, 31));
+    painter.rect_filled(rect, 0.0, sky_color);
+    if let Some(texture) = skybox_texture {
+        painter.image(
+            texture,
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
     let center = rect.center() + Vec2::new(0.0, 25.0);
     let scale = perspective_view_scale(
         rect.width().min(rect.height()) * 0.18 * zoom,
@@ -14163,7 +14634,7 @@ fn draw_viewport(
         grid_spacing,
     );
 
-    if grid {
+    if grid && editor_overlays {
         let grid_center_x = (camera_target.x / grid_spacing).round() * grid_spacing;
         let grid_center_y = (camera_target.y / grid_spacing).round() * grid_spacing;
         let origin = [grid_center_x, grid_center_y, 0.0];
@@ -14324,43 +14795,45 @@ fn draw_viewport(
             }
         }
 
-        let pivot = project(
-            [0.0, 0.0, 0.7],
-            center,
-            scale,
-            yaw,
-            pitch,
-            roll,
-            camera_target,
-            projection_mode,
-            grid_spacing,
-        )
-        .unwrap_or(center);
-        if tool == Tool::Rotate {
-            painter.circle_stroke(
-                pivot,
-                38.0,
-                Stroke::new(3.0, Color32::from_rgb(96, 205, 125)),
-            );
-            painter.circle_stroke(
-                pivot,
-                29.0,
-                Stroke::new(2.0, Color32::from_rgb(91, 145, 235)),
-            );
-        } else {
-            for (offset, color, label) in [
-                (Vec2::new(62.0, 0.0), Color32::from_rgb(235, 91, 91), "X"),
-                (Vec2::new(-38.0, 35.0), Color32::from_rgb(96, 205, 125), "Y"),
-                (Vec2::new(0.0, -62.0), Color32::from_rgb(91, 145, 235), "Z"),
-            ] {
-                painter.arrow(pivot, offset, Stroke::new(3.0, color));
-                painter.text(
-                    pivot + offset,
-                    Align2::CENTER_CENTER,
-                    label,
-                    FontId::proportional(12.0),
-                    color,
+        if editor_overlays {
+            let pivot = project(
+                [0.0, 0.0, 0.7],
+                center,
+                scale,
+                yaw,
+                pitch,
+                roll,
+                camera_target,
+                projection_mode,
+                grid_spacing,
+            )
+            .unwrap_or(center);
+            if tool == Tool::Rotate {
+                painter.circle_stroke(
+                    pivot,
+                    38.0,
+                    Stroke::new(3.0, Color32::from_rgb(96, 205, 125)),
                 );
+                painter.circle_stroke(
+                    pivot,
+                    29.0,
+                    Stroke::new(2.0, Color32::from_rgb(91, 145, 235)),
+                );
+            } else {
+                for (offset, color, label) in [
+                    (Vec2::new(62.0, 0.0), Color32::from_rgb(235, 91, 91), "X"),
+                    (Vec2::new(-38.0, 35.0), Color32::from_rgb(96, 205, 125), "Y"),
+                    (Vec2::new(0.0, -62.0), Color32::from_rgb(91, 145, 235), "Z"),
+                ] {
+                    painter.arrow(pivot, offset, Stroke::new(3.0, color));
+                    painter.text(
+                        pivot + offset,
+                        Align2::CENTER_CENTER,
+                        label,
+                        FontId::proportional(12.0),
+                        color,
+                    );
+                }
             }
         }
     }
@@ -14413,13 +14886,15 @@ fn draw_viewport(
             painter.circle_stroke(position, 8.0, Stroke::new(2.0, yellow));
         }
     }
-    painter.text(
-        rect.left_top() + Vec2::new(12.0, 14.0),
-        Align2::LEFT_TOP,
-        "Scene 01",
-        FontId::proportional(13.0),
-        Color32::from_gray(175),
-    );
+    if editor_overlays {
+        painter.text(
+            rect.left_top() + Vec2::new(12.0, 14.0),
+            Align2::LEFT_TOP,
+            "Scene 01",
+            FontId::proportional(13.0),
+            Color32::from_gray(175),
+        );
+    }
 }
 
 fn format_grid_spacing(spacing: f32) -> String {
@@ -16538,9 +17013,32 @@ fn clip_preview_polygon_to_near_into(
     }
 }
 
+fn truncated_object_name(name: &str) -> (String, bool) {
+    if name.chars().count() <= MAX_DISPLAYED_OBJECT_NAME_CHARS {
+        return (name.to_owned(), false);
+    }
+    let mut display = name
+        .chars()
+        .take(MAX_DISPLAYED_OBJECT_NAME_CHARS.saturating_sub(1))
+        .collect::<String>();
+    display.push('…');
+    (display, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hierarchy_object_names_truncate_by_unicode_character() {
+        let exact = "a".repeat(MAX_DISPLAYED_OBJECT_NAME_CHARS);
+        assert_eq!(truncated_object_name(&exact), (exact, false));
+        let long = format!("{}界tail", "a".repeat(MAX_DISPLAYED_OBJECT_NAME_CHARS));
+        let (display, truncated) = truncated_object_name(&long);
+        assert!(truncated);
+        assert_eq!(display.chars().count(), MAX_DISPLAYED_OBJECT_NAME_CHARS);
+        assert!(display.ends_with('…'));
+    }
 
     #[test]
     fn scene_ids_are_stable_and_unique() {

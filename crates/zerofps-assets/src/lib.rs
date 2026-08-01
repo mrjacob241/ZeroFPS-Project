@@ -443,6 +443,31 @@ pub struct AssetTransform {
     pub scale: [f32; 3],
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AssetAnimationClip {
+    pub name: String,
+    pub channels: Vec<AssetAnimationChannel>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AssetAnimationChannel {
+    Translation {
+        node: usize,
+        times: Vec<f32>,
+        values: Vec<[f32; 3]>,
+    },
+    Rotation {
+        node: usize,
+        times: Vec<f32>,
+        values: Vec<[f32; 4]>,
+    },
+    Scale {
+        node: usize,
+        times: Vec<f32>,
+        values: Vec<[f32; 3]>,
+    },
+}
+
 impl Default for AssetTransform {
     fn default() -> Self {
         Self {
@@ -462,6 +487,7 @@ pub struct MeshAsset {
     pub textures: BTreeMap<String, TextureAsset>,
     pub vertex_scalar_fields: BTreeMap<String, VertexScalarField>,
     pub nodes: Vec<AssetNode>,
+    pub animations: Vec<AssetAnimationClip>,
     pub source: SourceInfo,
     pub warnings: Vec<String>,
 }

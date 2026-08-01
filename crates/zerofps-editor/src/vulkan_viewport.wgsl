@@ -259,19 +259,30 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     if camera.projection == 0u {
         let near = 0.001 * camera.grid_spacing;
         let far = camera_distance * 1000.0;
-        let safe_depth = max(depth, near);
-        let normalized_depth = clamp((safe_depth - near) / (far - near), 0.0, 1.0);
+        // Keep the true homogeneous W/depth. Vertices behind the camera or
+        // before the near plane must be clipped by the GPU; clamping them onto
+        // the near plane stretches nearby triangles across the entire image.
+        let normalized_depth = (depth - near) / (far - near);
         out.clip_position = vec4<f32>(
-            center_offset.x * safe_depth + 2.0 * view_x * scale * camera_distance / camera.viewport.x,
-            center_offset.y * safe_depth + 2.0 * view_y * scale * camera_distance / camera.viewport.y,
-            normalized_depth * safe_depth,
-            safe_depth
+            center_offset.x * depth + 2.0 * view_x * scale * camera_distance / camera.viewport.x,
+            center_offset.y * depth + 2.0 * view_y * scale * camera_distance / camera.viewport.y,
+            normalized_depth * depth,
+            depth
         );
     } else {
+        // Orthographic projection has no perspective camera plane. Preserve
+        // signed view depth around the target instead of clamping everything
+        // behind the virtual camera to zero, which made large mesh partitions
+        // coplanar in the depth buffer and caused whole chunks to disappear.
+        let orthographic_depth = clamp(
+            0.5 + view_depth / (camera_distance * 2000.0),
+            0.0,
+            1.0
+        );
         out.clip_position = vec4<f32>(
             center_offset.x + 2.0 * view_x * scale / camera.viewport.x,
             center_offset.y + 2.0 * view_y * scale / camera.viewport.y,
-            clamp(depth / (camera_distance * 1000.0), 0.0, 1.0),
+            orthographic_depth,
             1.0
         );
     }

@@ -5,7 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-gltf = { version = "1.4", features = ["import", "extras", "KHR_materials_transmission", "KHR_materials_ior"] }
+gltf = { version = "1.4", features = [
+    "import",
+    "extras",
+    "extensions",
+    "KHR_lights_punctual",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_ior",
+    "KHR_materials_pbrSpecularGlossiness",
+    "KHR_materials_specular",
+    "KHR_materials_transmission",
+    "KHR_materials_unlit",
+    "KHR_materials_variants",
+    "KHR_materials_volume",
+    "KHR_texture_transform",
+] }
 serde_json.workspace = true
 thiserror.workspace = true
 zerofps-core = { path = "../zerofps-core" }
