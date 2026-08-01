@@ -1,7 +1,11 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -68,6 +72,8 @@ pub struct GraphResult {
 /// executed dependency-first without reading editor state or pixels back.
 pub struct VulkanGraphWorker {
     pending: Arc<(Mutex<Option<GraphRequest>>, Condvar)>,
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
     results: mpsc::Receiver<GraphResult>,
     pub device_name: String,
 }
@@ -78,8 +84,10 @@ impl VulkanGraphWorker {
         let device_name = compositor.device_name.clone();
         let pending = Arc::new((Mutex::new(None::<GraphRequest>), Condvar::new()));
         let worker_pending = Arc::clone(&pending);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let (sender, results) = mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("zerofps-vulkan-graph".into())
             .spawn(move || {
                 loop {
@@ -87,8 +95,13 @@ impl VulkanGraphWorker {
                         let (lock, ready) = &*worker_pending;
                         let guard = lock.lock().unwrap_or_else(|error| error.into_inner());
                         let mut guard = ready
-                            .wait_while(guard, |request| request.is_none())
+                            .wait_while(guard, |request| {
+                                request.is_none() && !worker_stopping.load(Ordering::Acquire)
+                            })
                             .unwrap_or_else(|error| error.into_inner());
+                        if worker_stopping.load(Ordering::Acquire) {
+                            break;
+                        }
                         guard.take().expect("graph request became available")
                     };
                     let generation = request.graph.generation;
@@ -105,23 +118,49 @@ impl VulkanGraphWorker {
                         break;
                     }
                 }
+                let _ = compositor.device.poll(wgpu::Maintain::Wait);
             })
             .map_err(|error| error.to_string())?;
         Ok(Self {
             pending,
+            stopping,
+            thread: Some(thread),
             results,
             device_name,
         })
     }
 
     pub fn submit_latest(&self, graph: Arc<CompiledGraph>) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
         let (lock, ready) = &*self.pending;
         *lock.lock().unwrap_or_else(|error| error.into_inner()) = Some(GraphRequest { graph });
         ready.notify_one();
     }
 
+    pub fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        *self
+            .pending
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.pending.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        while self.results.try_recv().is_ok() {}
+    }
+
     pub fn try_result(&self) -> Option<GraphResult> {
         self.results.try_recv().ok()
+    }
+}
+
+impl Drop for VulkanGraphWorker {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -680,6 +719,7 @@ fn graph_parameters(operation: &GraphOperation, connected: u32) -> GraphParamete
                     AlgebraInstruction::Cos => [11.0, 0.0, 0.0, 0.0],
                     AlgebraInstruction::Abs => [12.0, 0.0, 0.0, 0.0],
                     AlgebraInstruction::Sqrt => [13.0, 0.0, 0.0, 0.0],
+                    AlgebraInstruction::Sign => [14.0, 0.0, 0.0, 0.0],
                 };
             }
         }

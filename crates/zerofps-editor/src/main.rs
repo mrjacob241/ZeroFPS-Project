@@ -15,7 +15,11 @@ mod vulkan_viewport;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -37,8 +41,30 @@ use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
 use crate::dynamics::{ClothSettings, ClothState, MeshScalarField, PaintMode, WindField, heatmap};
 
 fn main() -> eframe::Result<()> {
+    let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.device_descriptor = Arc::new(|adapter| {
+            let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
+                wgpu::Limits::downlevel_webgl2_defaults()
+            } else {
+                wgpu::Limits::default()
+            };
+            let timestamp_features = adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+            wgpu::DeviceDescriptor {
+                label: Some("ZeroFPS egui/Vulkan device"),
+                required_features: timestamp_features,
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: 8192,
+                    ..base_limits
+                },
+                memory_hints: wgpu::MemoryHints::Performance,
+            }
+        });
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_title("ZeroFPS Project — Scene Editor")
             .with_inner_size([1440.0, 900.0])
@@ -955,6 +981,8 @@ struct RenderJob {
     key: DepthCacheKey,
     viewport_size: Vec2,
     triangles: Arc<Vec<PreviewTriangle>>,
+    transform_updates: Arc<HashMap<NodeId, Transform>>,
+    max_vram_bytes: u64,
     camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     lighting: ViewportLighting,
     show_grid: bool,
@@ -976,6 +1004,12 @@ struct RenderResult {
     render_time: Duration,
     prepare_time: Duration,
     shadow_prepare_time: Duration,
+    directional_shadow_time: Duration,
+    point_shadow_time: Duration,
+    point_shadow_cpu: vulkan_viewport::PointShadowCpuTimings,
+    gpu_directional_shadow_time: Duration,
+    gpu_point_shadow_time: Duration,
+    gpu_viewport_time: Duration,
     resource_upload_time: Duration,
     vertex_upload_time: Duration,
     texture_upload_time: Duration,
@@ -1022,6 +1056,16 @@ struct EditorPerformanceTelemetry {
     graph_compile: TimingMetric,
     graph_evaluation: TimingMetric,
     shadow_prepare: TimingMetric,
+    directional_shadow: TimingMetric,
+    point_shadow: TimingMetric,
+    point_shadow_setup: TimingMetric,
+    point_shadow_uniform_write: TimingMetric,
+    point_shadow_geometry_lookup: TimingMetric,
+    point_shadow_encoder_create: TimingMetric,
+    point_shadow_pass_finish: TimingMetric,
+    gpu_directional_shadow: TimingMetric,
+    gpu_point_shadow: TimingMetric,
+    gpu_viewport_pass: TimingMetric,
     viewport_resource_upload: TimingMetric,
     viewport_vertex_upload: TimingMetric,
     viewport_texture_upload: TimingMetric,
@@ -1032,6 +1076,8 @@ struct EditorPerformanceTelemetry {
 
 struct DisplayWorker {
     pending: Arc<(Mutex<Option<RenderJob>>, Condvar)>,
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
     results: mpsc::Receiver<RenderResult>,
 }
 
@@ -1254,8 +1300,10 @@ impl DisplayWorker {
     fn new(ctx: egui::Context) -> Self {
         let pending = Arc::new((Mutex::new(None::<RenderJob>), Condvar::new()));
         let worker_pending = Arc::clone(&pending);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let (result_sender, results) = mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("zerofps-display".into())
             .spawn(move || {
                 let mut workspace = RasterWorkspace::default();
@@ -1266,15 +1314,23 @@ impl DisplayWorker {
                     Arc<DirectionalShadowMap>,
                 )> = None;
                 let mut point_shadow_cache: Option<(u64, Arc<PointShadowAtlas>)> = None;
-                let mut vulkan_batch_cache: Option<(u64, Arc<Vec<vulkan_viewport::GpuBatch>>)> =
-                    None;
+                let mut vulkan_batch_cache: Option<(
+                    u64,
+                    u64,
+                    Arc<Vec<vulkan_viewport::GpuBatch>>,
+                )> = None;
                 loop {
                     let job = {
                         let (lock, ready) = &*worker_pending;
                         let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         let mut guard = ready
-                            .wait_while(guard, |job| job.is_none())
+                            .wait_while(guard, |job| {
+                                job.is_none() && !worker_stopping.load(Ordering::Acquire)
+                            })
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if worker_stopping.load(Ordering::Acquire) {
+                            break;
+                        }
                         guard.take().expect("display job became available")
                     };
                     let queue_wait = job.queued_at.elapsed();
@@ -1353,6 +1409,12 @@ impl DisplayWorker {
                         job.lighting.point_shadows = None;
                     }
                     let mut shadow_prepare_time = shadow_prepare_started.elapsed();
+                    let mut directional_shadow_time = Duration::ZERO;
+                    let mut point_shadow_time = Duration::ZERO;
+                    let mut point_shadow_cpu = vulkan_viewport::PointShadowCpuTimings::default();
+                    let mut gpu_directional_shadow_time = Duration::ZERO;
+                    let mut gpu_point_shadow_time = Duration::ZERO;
+                    let mut gpu_viewport_time = Duration::ZERO;
                     let mut resource_upload_time = Duration::ZERO;
                     let mut vertex_upload_time = Duration::ZERO;
                     let mut texture_upload_time = Duration::ZERO;
@@ -1391,16 +1453,32 @@ impl DisplayWorker {
                             // keep stable per-batch GPU buffer identities.
                             let batch_revision =
                                 job.key.scene_revision ^ job.key.texture_revision.rotate_left(29);
-                            let batches = match vulkan_batch_cache.as_ref() {
-                                Some((cached_revision, batches))
+                            let batches = match vulkan_batch_cache.as_mut() {
+                                Some((cached_revision, cached_transform_revision, batches))
                                     if *cached_revision == batch_revision =>
                                 {
+                                    if *cached_transform_revision != job.key.transform_revision {
+                                        let mutable_batches = Arc::make_mut(batches);
+                                        update_vulkan_batch_transforms(
+                                            mutable_batches.as_mut_slice(),
+                                            &job.transform_updates,
+                                        );
+                                        *cached_transform_revision = job.key.transform_revision;
+                                    }
                                     Arc::clone(batches)
                                 }
                                 _ => {
-                                    let batches = Arc::new(build_vulkan_batches(&job.triangles));
-                                    vulkan_batch_cache =
-                                        Some((batch_revision, Arc::clone(&batches)));
+                                    let mut rebuilt = build_vulkan_batches(&job.triangles);
+                                    update_vulkan_batch_transforms(
+                                        &mut rebuilt,
+                                        &job.transform_updates,
+                                    );
+                                    let batches = Arc::new(rebuilt);
+                                    vulkan_batch_cache = Some((
+                                        batch_revision,
+                                        job.key.transform_revision,
+                                        Arc::clone(&batches),
+                                    ));
                                     batches
                                 }
                             };
@@ -1426,13 +1504,23 @@ impl DisplayWorker {
                                     &job.lighting.points,
                                     job.lighting.directional_shadow.as_deref(),
                                     job.lighting.point_shadows.as_deref(),
-                                    Some(job.key.scene_revision),
+                                    Some(
+                                        job.key.scene_revision
+                                            ^ job.key.transform_revision.rotate_left(31),
+                                    ),
                                     batch_revision,
                                     job.lighting.global_shadow_resolution,
                                     job.lighting.shadow_filter_radius,
+                                    job.max_vram_bytes,
                                 )
                                 .ok();
                             shadow_prepare_time += renderer.last_shadow_encode_time();
+                            directional_shadow_time += renderer.last_directional_shadow_time();
+                            point_shadow_time += renderer.last_point_shadow_time();
+                            point_shadow_cpu = renderer.point_shadow_cpu_timings();
+                            gpu_directional_shadow_time = renderer.gpu_directional_shadow_time();
+                            gpu_point_shadow_time = renderer.gpu_point_shadow_time();
+                            gpu_viewport_time = renderer.gpu_viewport_time();
                             resource_upload_time += renderer.last_resource_upload_time();
                             vertex_upload_time += renderer.last_vertex_upload_time();
                             texture_upload_time += renderer.last_texture_upload_time();
@@ -1480,6 +1568,12 @@ impl DisplayWorker {
                             render_time: render_started.elapsed(),
                             prepare_time,
                             shadow_prepare_time,
+                            directional_shadow_time,
+                            point_shadow_time,
+                            point_shadow_cpu,
+                            gpu_directional_shadow_time,
+                            gpu_point_shadow_time,
+                            gpu_viewport_time,
                             resource_upload_time,
                             vertex_upload_time,
                             texture_upload_time,
@@ -1495,20 +1589,52 @@ impl DisplayWorker {
                     }
                     ctx.request_repaint();
                 }
+                if let Some(renderer) = vulkan.as_ref() {
+                    renderer.wait_idle();
+                }
             })
             .expect("display worker thread should start");
-        Self { pending, results }
+        Self {
+            pending,
+            stopping,
+            thread: Some(thread),
+            results,
+        }
     }
 
     fn submit_latest(&self, job: RenderJob) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
         let (lock, ready) = &*self.pending;
         *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(job);
         ready.notify_one();
     }
+
+    fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        *self
+            .pending
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.pending.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        while self.results.try_recv().is_ok() {}
+    }
+}
+
+impl Drop for DisplayWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::GpuBatch> {
-    let mut groups: HashMap<(usize, bool, bool), vulkan_viewport::GpuBatch> = HashMap::new();
+    let mut groups: HashMap<(NodeId, usize, bool, bool), vulkan_viewport::GpuBatch> =
+        HashMap::new();
     for triangle in triangles {
         let key = triangle
             .gpu_texture
@@ -1523,14 +1649,25 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
             .unwrap_or(0);
         let transparent = triangle.base_color[3] < 0.999;
         let batch = groups
-            .entry((key, triangle.casts_shadows, transparent))
+            .entry((triangle.object_id, key, triangle.casts_shadows, transparent))
             .or_insert_with(|| vulkan_viewport::GpuBatch {
                 cache_key: triangle
                     .source_texture
                     .as_ref()
                     .map(|texture| Arc::as_ptr(texture) as u64)
                     .unwrap_or(0)
-                    ^ 0x9e37_79b9_7f4a_7c15,
+                    ^ 0x9e37_79b9_7f4a_7c15
+                    ^ triangle.object_id.slot as u64
+                    ^ ((triangle.object_id.generation as u64) << 32),
+                content_revision: transform_content_revision(triangle.object_transform),
+                object_id: triangle.object_id,
+                object_transform: triangle.object_transform,
+                local_bounds_min: CoreVec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+                local_bounds_max: CoreVec3::new(
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ),
                 casts_shadows: triangle.casts_shadows,
                 texture_cache_key: triangle.texture_cache_key,
                 texture: triangle.texture.clone(),
@@ -1554,6 +1691,12 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
             .cross(local_positions[2] - local_positions[0])
             .normalized();
         for vertex in triangle.vertices {
+            batch.local_bounds_min.x = batch.local_bounds_min.x.min(vertex.local_position[0]);
+            batch.local_bounds_min.y = batch.local_bounds_min.y.min(vertex.local_position[1]);
+            batch.local_bounds_min.z = batch.local_bounds_min.z.min(vertex.local_position[2]);
+            batch.local_bounds_max.x = batch.local_bounds_max.x.max(vertex.local_position[0]);
+            batch.local_bounds_max.y = batch.local_bounds_max.y.max(vertex.local_position[1]);
+            batch.local_bounds_max.z = batch.local_bounds_max.z.max(vertex.local_position[2]);
             let normal = if triangle.smooth_normals {
                 vertex.local_normal
             } else {
@@ -1607,7 +1750,76 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
             });
         }
     }
-    groups.into_values().collect()
+    let mut batches = groups
+        .into_values()
+        .map(|mut batch| {
+            batch.content_revision ^= batch.cache_key.rotate_left(19);
+            batch
+        })
+        .collect::<Vec<_>>();
+    // HashMap iteration is intentionally randomized. A stable order is vital
+    // here because the resident shadow buffer compares the packed batch layout;
+    // otherwise a texture/compositor refresh can masquerade as a geometry
+    // change and force the entire shadow mesh back across PCIe.
+    batches.sort_by_key(|batch| {
+        (
+            batch.object_id.slot,
+            batch.object_id.generation,
+            batch.cache_key,
+            batch.texture_cache_key,
+            batch.casts_shadows,
+            batch.transparent,
+        )
+    });
+    batches
+}
+
+fn transform_content_revision(transform: Transform) -> u64 {
+    let values = [
+        transform.translation.x,
+        transform.translation.y,
+        transform.translation.z,
+        transform.rotation.x,
+        transform.rotation.y,
+        transform.rotation.z,
+        transform.rotation.w,
+        transform.scale.x,
+        transform.scale.y,
+        transform.scale.z,
+    ];
+    values
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, value| {
+            (hash ^ value.to_bits() as u64).wrapping_mul(0x100_0000_01b3)
+        })
+}
+
+fn update_vulkan_batch_transforms(
+    batches: &mut [vulkan_viewport::GpuBatch],
+    updates: &HashMap<NodeId, Transform>,
+) {
+    for batch in batches {
+        let Some(transform) = updates.get(&batch.object_id).copied() else {
+            continue;
+        };
+        batch.content_revision =
+            transform_content_revision(transform) ^ batch.cache_key.rotate_left(19);
+        batch.object_transform = transform;
+        for vertex in &mut batch.vertices {
+            vertex.object_translation[0] = transform.translation.x;
+            vertex.object_translation[1] = transform.translation.y;
+            vertex.object_translation[2] = transform.translation.z;
+            vertex.object_rotation = [
+                transform.rotation.x,
+                transform.rotation.y,
+                transform.rotation.z,
+                transform.rotation.w,
+            ];
+            vertex.object_scale[0] = transform.scale.x;
+            vertex.object_scale[1] = transform.scale.y;
+            vertex.object_scale[2] = transform.scale.z;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1630,6 +1842,7 @@ struct DepthCacheKey {
     grid_spacing: f32,
     projection: ProjectionMode,
     scene_revision: u64,
+    transform_revision: u64,
     texture_revision: u64,
     global_light_enabled: bool,
     global_shadow_resolution: u32,
@@ -1682,6 +1895,7 @@ struct EditorApp {
     compositor_graph_queue: VecDeque<PendingCompositorGraph>,
     compositor_clock_started: Instant,
     compositor_next_time_tick: Instant,
+    last_camera_input_at: Option<Instant>,
     dynamics_fields: HashMap<NodeId, MeshScalarField>,
     dynamics_cloth: HashMap<NodeId, ClothState>,
     object_simulation_states: HashMap<usize, ObjectSimulationState>,
@@ -1721,6 +1935,7 @@ struct EditorApp {
     shadow_quality: usize,
     shadow_blur_radius: usize,
     target_fps: u32,
+    max_vram_gb: f32,
     next_viewport_frame: Instant,
     save_cache_in_file: bool,
     show_grid: bool,
@@ -1753,6 +1968,8 @@ struct EditorApp {
     viewport_depth: Vec<f32>,
     viewport_depth_key: Option<DepthCacheKey>,
     scene_revision: u64,
+    transform_revision: u64,
+    pending_transform_updates: HashMap<NodeId, Transform>,
     texture_revision: u64,
     cached_preview_revision: u64,
     cached_preview_texture_revision: u64,
@@ -1822,6 +2039,7 @@ impl EditorApp {
             compositor_graph_queue: VecDeque::new(),
             compositor_clock_started: Instant::now(),
             compositor_next_time_tick: Instant::now(),
+            last_camera_input_at: None,
             dynamics_fields: HashMap::new(),
             dynamics_cloth: HashMap::new(),
             object_simulation_states: HashMap::new(),
@@ -1868,6 +2086,7 @@ impl EditorApp {
             shadow_quality: 3,
             shadow_blur_radius: 1,
             target_fps: 60,
+            max_vram_gb: 8.0,
             next_viewport_frame: Instant::now(),
             save_cache_in_file: false,
             show_grid: true,
@@ -1911,6 +2130,8 @@ impl EditorApp {
             viewport_depth: Vec::new(),
             viewport_depth_key: None,
             scene_revision: 0,
+            transform_revision: 0,
+            pending_transform_updates: HashMap::new(),
             texture_revision: 0,
             cached_preview_revision: u64::MAX,
             cached_preview_texture_revision: u64::MAX,
@@ -3115,6 +3336,7 @@ impl EditorApp {
                 self.shadow_blur_radius.to_string(),
             ),
             ("editor.target_fps", self.target_fps.to_string()),
+            ("editor.max_vram_gb", self.max_vram_gb.to_string()),
             (
                 "editor.save_cache_in_file",
                 self.save_cache_in_file.to_string(),
@@ -3818,6 +4040,11 @@ impl EditorApp {
             .and_then(|value| value.parse::<u32>().ok())
             .map(sanitize_target_fps)
             .unwrap_or(self.target_fps);
+        self.max_vram_gb = properties
+            .get("editor.max_vram_gb")
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(sanitize_max_vram_gb)
+            .unwrap_or(self.max_vram_gb);
         self.next_viewport_frame = Instant::now();
         self.save_cache_in_file = properties
             .get("editor.save_cache_in_file")
@@ -4632,6 +4859,7 @@ impl EditorApp {
                 ui.label("Expression");
                 changed |= ui.text_edit_singleline(expression).changed();
                 ui.small("Variables: x, y, z");
+                ui.small("Functions: sin, cos, abs, sign, sqrt");
                 match compositor_graph::compile_algebra_expression(expression) {
                     Ok(program) => {
                         ui.small(
@@ -5745,6 +5973,24 @@ impl EditorApp {
                             }
                             RenderDevice::Cpu => "Portable reference renderer + compositor",
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Max VRAM");
+                            let previous = self.max_vram_gb;
+                            ui.add(
+                                egui::DragValue::new(&mut self.max_vram_gb)
+                                    .range(1.0..=128.0)
+                                    .speed(0.5)
+                                    .suffix(" GB"),
+                            );
+                            if self.max_vram_gb != previous {
+                                self.max_vram_gb = sanitize_max_vram_gb(self.max_vram_gb);
+                                self.project_dirty = true;
+                            }
+                        });
+                        ui.small(format!(
+                            "Renderer safety ceiling: {:.2} GB (75%)",
+                            self.max_vram_gb * 0.75
+                        ));
                         if ui
                             .checkbox(&mut self.save_cache_in_file, "Save cache in file")
                             .on_hover_text(
@@ -7795,7 +8041,9 @@ impl EditorApp {
                     BottomTab::Assets => self.assets_panel(ui),
                     BottomTab::Scripts => scripts_panel(ui),
                     BottomTab::Console => console_panel(ui, &self.logs),
-                    BottomTab::Telemetry => telemetry_panel(ui, self.play_state, &self.performance),
+                    BottomTab::Telemetry => {
+                        telemetry_panel(ui, self.play_state, &mut self.performance)
+                    }
                 }
             });
     }
@@ -8577,7 +8825,7 @@ impl EditorApp {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut changed = false;
+        let mut changed_ids = Vec::new();
         for (output_node, object_index) in outputs {
             let Some(id) = self.object_node_id(object_index) else {
                 continue;
@@ -8650,11 +8898,29 @@ impl EditorApp {
                 || (transform.scale - original.scale).length() > 1.0e-5
                 || !transform.rotation.approx_eq(original.rotation, 1.0e-6);
             if materially_changed && self.scene.tree.set_local_transform(id, transform).is_ok() {
-                changed = true;
+                changed_ids.push(id);
             }
         }
-        if changed {
-            self.scene_revision = self.scene_revision.wrapping_add(1);
+        if !changed_ids.is_empty() {
+            if self.render_device == RenderDevice::Vulkan {
+                let mut stack = changed_ids;
+                let mut visited = BTreeSet::new();
+                while let Some(id) = stack.pop() {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    if let Ok(node) = self.scene.tree.node(id) {
+                        self.pending_transform_updates
+                            .insert(id, node.global_transform());
+                        stack.extend(node.children().iter().copied());
+                    }
+                }
+                self.transform_revision = self.transform_revision.wrapping_add(1);
+            } else {
+                // The CPU rasterizer still consumes transformed preview
+                // triangles. Keep its complete rebuild path as a fallback.
+                self.scene_revision = self.scene_revision.wrapping_add(1);
+            }
         }
     }
 
@@ -9136,6 +9402,17 @@ impl EditorApp {
     }
 
     fn tick_compositor_time(&mut self, ctx: &egui::Context) {
+        if let Some(last_input) = self.last_camera_input_at {
+            let quiet_period = Duration::from_millis(150);
+            if last_input.elapsed() < quiet_period {
+                // Preserve the last resident compositor output while the user
+                // controls the camera. New time-node work resumes shortly
+                // after input stops, keeping interaction latency ahead of
+                // nonessential visual animation.
+                ctx.request_repaint_after(quiet_period.saturating_sub(last_input.elapsed()));
+                return;
+            }
+        }
         let time_nodes: Vec<usize> = self
             .compositor_nodes
             .iter()
@@ -11797,20 +12074,6 @@ impl EditorApp {
                 let render_rect = scene_camera.as_ref().map_or(response.rect, |camera| {
                     fit_aspect_rect(response.rect, camera.aspect_ratio)
                 });
-                let render_camera = scene_camera.as_ref().map_or(
-                    (
-                        self.camera_yaw,
-                        self.camera_pitch,
-                        0.0,
-                        self.camera_zoom,
-                        self.camera_target,
-                        self.grid_spacing,
-                        self.projection_mode,
-                    ),
-                    |camera| {
-                        scene_camera_render_view(camera, render_rect.size(), self.grid_spacing)
-                    },
-                );
                 self.viewport_focused = response.hovered();
                 let pointer_delta = ui.input(|input| input.pointer.delta());
                 if matches!(self.active_tool, Tool::FieldPaint | Tool::TexturePaint) {
@@ -11895,12 +12158,24 @@ impl EditorApp {
                         }
                     }
                 }
-                let orbit = if response.dragged_by(egui::PointerButton::Secondary) {
+                // `Response::dragged_by` waits for egui's drag-distance threshold.
+                // Camera controls should react on the press frame, while the
+                // viewport owns the pointer, to avoid an initial dead zone.
+                let pointer_owned = response.hovered()
+                    || response.is_pointer_button_down_on()
+                    || response.dragged();
+                let (secondary_down, middle_down) = ui.input(|input| {
+                    (
+                        input.pointer.button_down(egui::PointerButton::Secondary),
+                        input.pointer.button_down(egui::PointerButton::Middle),
+                    )
+                });
+                let orbit = if pointer_owned && secondary_down {
                     pointer_delta
                 } else {
                     Vec2::ZERO
                 };
-                let pan = if response.dragged_by(egui::PointerButton::Middle) {
+                let pan = if pointer_owned && middle_down {
                     pointer_delta
                 } else {
                     Vec2::ZERO
@@ -11919,7 +12194,25 @@ impl EditorApp {
                     };
                     self.apply_editor_camera_input(sample);
                     self.input_worker.submit(sample);
+                    self.last_camera_input_at = Some(Instant::now());
                 }
+                // Capture the camera only after applying this frame's input.
+                // Previously the submitted render job always trailed the mouse
+                // by one frame at the beginning of an interaction.
+                let render_camera = scene_camera.as_ref().map_or(
+                    (
+                        self.camera_yaw,
+                        self.camera_pitch,
+                        0.0,
+                        self.camera_zoom,
+                        self.camera_target,
+                        self.grid_spacing,
+                        self.projection_mode,
+                    ),
+                    |camera| {
+                        scene_camera_render_view(camera, render_rect.size(), self.grid_spacing)
+                    },
+                );
                 self.schedule_compositor_lod_update(ctx);
                 self.refresh_preview_cache();
                 let preview = Arc::clone(&self.cached_preview);
@@ -11951,6 +12244,7 @@ impl EditorApp {
                         grid_spacing: self.grid_spacing,
                         projection: render_camera.6,
                         scene_revision: self.scene_revision,
+                        transform_revision: self.transform_revision,
                         texture_revision: self.texture_revision,
                         global_light_enabled: self.global_light_enabled,
                         global_shadow_resolution: self.global_shadow_resolution,
@@ -11982,6 +12276,36 @@ impl EditorApp {
                         self.performance
                             .shadow_prepare
                             .record(result.shadow_prepare_time);
+                        self.performance
+                            .directional_shadow
+                            .record(result.directional_shadow_time);
+                        self.performance
+                            .point_shadow
+                            .record(result.point_shadow_time);
+                        self.performance
+                            .point_shadow_setup
+                            .record(result.point_shadow_cpu.setup);
+                        self.performance
+                            .point_shadow_uniform_write
+                            .record(result.point_shadow_cpu.uniform_write);
+                        self.performance
+                            .point_shadow_geometry_lookup
+                            .record(result.point_shadow_cpu.geometry_lookup);
+                        self.performance
+                            .point_shadow_encoder_create
+                            .record(result.point_shadow_cpu.encoder_create);
+                        self.performance
+                            .point_shadow_pass_finish
+                            .record(result.point_shadow_cpu.pass_and_finish);
+                        self.performance
+                            .gpu_directional_shadow
+                            .record(result.gpu_directional_shadow_time);
+                        self.performance
+                            .gpu_point_shadow
+                            .record(result.gpu_point_shadow_time);
+                        self.performance
+                            .gpu_viewport_pass
+                            .record(result.gpu_viewport_time);
                         self.performance
                             .viewport_resource_upload
                             .record(result.resource_upload_time);
@@ -12084,6 +12408,10 @@ impl EditorApp {
                             key,
                             viewport_size: render_rect.size(),
                             triangles: Arc::clone(&preview),
+                            transform_updates: Arc::new(std::mem::take(
+                                &mut self.pending_transform_updates,
+                            )),
+                            max_vram_bytes: safe_vram_budget_bytes(self.max_vram_gb),
                             camera: render_camera,
                             lighting: lighting.clone(),
                             show_grid: self.show_grid && scene_camera.is_none(),
@@ -12371,6 +12699,37 @@ impl EditorApp {
     }
 }
 
+impl Drop for EditorApp {
+    fn drop(&mut self) {
+        // Stop producers first so shutdown cannot race a freshly queued animation frame.
+        self.dynamics_running = false;
+        self.dynamics_single_step = false;
+        self.compositor_apply_due = None;
+        self.compositor_graph_queue.clear();
+        self.compositor_pending_target = None;
+        self.vulkan_waiting_generation = None;
+
+        // GPU-owning workers must finish and release their command resources while the
+        // eframe device/window is still alive. Display is stopped last because it may
+        // consume compositor-produced images.
+        self.cpu_compositor.shutdown();
+        if let Some(mut worker) = self.vulkan_compositor.take() {
+            worker.shutdown();
+        }
+        self.display_worker.shutdown();
+
+        // Release editor-held GPU image/view references before eframe tears down its
+        // renderer and native surface.
+        self.compositor_gpu_cache.clear();
+        self.compositor_texture_overrides
+            .retain(|(_, texture)| matches!(texture, TextureOverride::Cpu(_)));
+        self.viewport_native_texture = None;
+        self.viewport_native_view = None;
+        self.viewport_color = None;
+        self.skybox_texture = None;
+    }
+}
+
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
@@ -12385,6 +12744,20 @@ impl eframe::App for EditorApp {
         self.ensure_skybox_texture(ctx);
         self.sync_compositor_outputs();
         self.poll_vulkan_compositor(ctx);
+        // Detect camera intent before ticking live compositor graphs. The
+        // scene viewport itself is laid out later in this update, which used
+        // to let one new graph job slip through on the first drag frame.
+        let camera_input_pending = self.viewport_focused
+            && ctx.input(|input| {
+                let pointer = &input.pointer;
+                let camera_button = pointer.button_down(egui::PointerButton::Secondary)
+                    || pointer.button_down(egui::PointerButton::Middle);
+                (camera_button && pointer.delta() != Vec2::ZERO)
+                    || input.smooth_scroll_delta.y != 0.0
+            });
+        if camera_input_pending {
+            self.last_camera_input_at = Some(Instant::now());
+        }
         self.tick_compositor_time(ctx);
         self.apply_object_transform_graphs();
         self.poll_compositor_apply(ctx);
@@ -13571,7 +13944,11 @@ fn console_panel(ui: &mut egui::Ui, logs: &[LogEntry]) {
         });
 }
 
-fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerformanceTelemetry) {
+fn telemetry_panel(
+    ui: &mut egui::Ui,
+    state: PlayState,
+    performance: &mut EditorPerformanceTelemetry,
+) {
     let live = matches!(state, PlayState::Running | PlayState::Paused);
     ui.horizontal(|ui| {
         ui.label(
@@ -13596,6 +13973,13 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
         ui.separator();
         if ui.button("Copy telemetry").clicked() {
             ui.ctx().copy_text(format_telemetry_report(performance));
+        }
+        if ui
+            .button("Reset telemetry")
+            .on_hover_text("Clear startup maxima before measuring an interaction spike")
+            .clicked()
+        {
+            *performance = EditorPerformanceTelemetry::default();
         }
     });
     ui.add_space(8.0);
@@ -13626,7 +14010,7 @@ fn telemetry_panel(ui: &mut egui::Ui, state: PlayState, performance: &EditorPerf
 
 fn telemetry_metrics(
     performance: &EditorPerformanceTelemetry,
-) -> [(&'static str, TimingMetric); 18] {
+) -> [(&'static str, TimingMetric); 28] {
     [
         ("Vulkan viewport worker", performance.viewport_vulkan),
         ("GPU batch preparation", performance.viewport_prepare),
@@ -13639,6 +14023,34 @@ fn telemetry_metrics(
             "Shadow preparation / GPU encoding",
             performance.shadow_prepare,
         ),
+        (
+            "Directional shadow preparation",
+            performance.directional_shadow,
+        ),
+        ("Point shadow preparation", performance.point_shadow),
+        ("  Point setup / bounds", performance.point_shadow_setup),
+        (
+            "  Point uniform writes",
+            performance.point_shadow_uniform_write,
+        ),
+        (
+            "  Point geometry lookup",
+            performance.point_shadow_geometry_lookup,
+        ),
+        (
+            "  Point encoder creation",
+            performance.point_shadow_encoder_create,
+        ),
+        (
+            "  Point pass + finish",
+            performance.point_shadow_pass_finish,
+        ),
+        (
+            "GPU directional shadow timestamp",
+            performance.gpu_directional_shadow,
+        ),
+        ("GPU point shadow timestamp", performance.gpu_point_shadow),
+        ("GPU viewport timestamp", performance.gpu_viewport_pass),
         (
             "GPU resource loading / upload",
             performance.viewport_resource_upload,
@@ -14973,6 +15385,18 @@ fn sanitize_shadow_resolution(value: u32) -> u32 {
 
 fn sanitize_target_fps(value: u32) -> u32 {
     value.clamp(15, 360)
+}
+
+fn sanitize_max_vram_gb(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(1.0, 128.0)
+    } else {
+        8.0
+    }
+}
+
+fn safe_vram_budget_bytes(max_vram_gb: f32) -> u64 {
+    (sanitize_max_vram_gb(max_vram_gb) as f64 * 0.75 * 1024.0_f64.powi(3)) as u64
 }
 
 fn target_frame_period(target_fps: u32) -> Duration {
@@ -17030,6 +17454,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vram_setting_defaults_and_safety_budget_are_bounded() {
+        assert_eq!(sanitize_max_vram_gb(f32::NAN), 8.0);
+        assert_eq!(sanitize_max_vram_gb(0.25), 1.0);
+        assert_eq!(sanitize_max_vram_gb(256.0), 128.0);
+        assert_eq!(safe_vram_budget_bytes(8.0), 6 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn transform_updates_touch_only_the_matching_gpu_batch() {
+        let vertex = vulkan_viewport::GpuVertex {
+            position: [0.0, 0.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 1.0, 0.0],
+            uv_color_rg: [0.0; 4],
+            color_ba_base_rg: [0.0; 4],
+            base_ba_material: [0.0; 4],
+            object_translation: [0.0; 4],
+            object_rotation: [0.0, 0.0, 0.0, 1.0],
+            object_scale: [1.0, 1.0, 1.0, 0.0],
+        };
+        let first = NodeId {
+            slot: 1,
+            generation: 0,
+        };
+        let second = NodeId {
+            slot: 2,
+            generation: 0,
+        };
+        let batch = |object_id, cache_key| vulkan_viewport::GpuBatch {
+            cache_key,
+            content_revision: 5,
+            object_id,
+            object_transform: Transform::IDENTITY,
+            local_bounds_min: CoreVec3::ZERO,
+            local_bounds_max: CoreVec3::ZERO,
+            casts_shadows: true,
+            texture_cache_key: 0,
+            texture: None,
+            gpu_texture: None,
+            transparent: false,
+            vertices: vec![vertex],
+        };
+        let mut batches = vec![batch(first, 11), batch(second, 12)];
+        let untouched_revision = batches[1].content_revision;
+        let moved = Transform {
+            translation: CoreVec3::new(4.0, 5.0, 6.0),
+            ..Transform::IDENTITY
+        };
+        update_vulkan_batch_transforms(&mut batches, &HashMap::from([(first, moved)]));
+
+        assert_eq!(
+            batches[0].vertices[0].object_translation[..3],
+            [4.0, 5.0, 6.0]
+        );
+        assert_ne!(batches[0].content_revision, 5);
+        assert_eq!(batches[1].vertices[0].object_translation, [0.0; 4]);
+        assert_eq!(batches[1].content_revision, untouched_revision);
+    }
+
+    #[test]
     fn hierarchy_object_names_truncate_by_unicode_character() {
         let exact = "a".repeat(MAX_DISPLAYED_OBJECT_NAME_CHARS);
         assert_eq!(truncated_object_name(&exact), (exact, false));
@@ -17707,6 +18190,191 @@ mod tests {
             saved_contact_gaps
                 .iter()
                 .all(|(gap, tolerance)| gap > tolerance)
+        );
+    }
+
+    #[test]
+    #[ignore = "headless Vulkan integration benchmark using light_test.zfp"]
+    fn reproduces_light_test_zfp_first_camera_motion_point_uniform_spike() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../appdata/models/saved/light_test.zfp");
+        assert!(fixture.is_file(), "missing fixture: {}", fixture.display());
+        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-zfp-cache/light-test-headless");
+        let bundle = load_zfp(&fixture, &cache).expect("load light_test.zfp");
+        let mut batches = Vec::new();
+        let mut light = None;
+        for (id, node) in bundle.project.scene.geometry.iter() {
+            for component in &node.components {
+                match component {
+                    Component::Light {
+                        intensity,
+                        color,
+                        radius,
+                        shadow_resolution,
+                    } => {
+                        light = Some(ViewportLight {
+                            position: node.global_transform().translation,
+                            color: *color,
+                            intensity: *intensity,
+                            radius: *radius,
+                            shadow_resolution: *shadow_resolution,
+                        });
+                    }
+                    Component::Model { asset, .. } => {
+                        let Some(extracted) = bundle.extracted_files.get(asset) else {
+                            // Built-in primitives have no archive payload. The
+                            // imported Bunny and Avocado are the expensive
+                            // caster workload relevant to this regression.
+                            assert!(
+                                asset.starts_with("builtin:"),
+                                "missing extracted asset `{asset}`"
+                            );
+                            continue;
+                        };
+                        let mesh = import_file(extracted).expect("import fixture model");
+                        let transform = node.global_transform();
+                        let mut minimum =
+                            CoreVec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+                        let mut maximum =
+                            CoreVec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+                        let mut vertices = Vec::new();
+                        for index in mesh
+                            .primitives
+                            .iter()
+                            .flat_map(|primitive| &primitive.indices)
+                        {
+                            let source = &mesh.vertices[*index as usize];
+                            minimum.x = minimum.x.min(source.position[0]);
+                            minimum.y = minimum.y.min(source.position[1]);
+                            minimum.z = minimum.z.min(source.position[2]);
+                            maximum.x = maximum.x.max(source.position[0]);
+                            maximum.y = maximum.y.max(source.position[1]);
+                            maximum.z = maximum.z.max(source.position[2]);
+                            vertices.push(vulkan_viewport::GpuVertex {
+                                position: [
+                                    source.position[0],
+                                    source.position[1],
+                                    source.position[2],
+                                    1.0,
+                                ],
+                                normal: [source.normal[0], source.normal[1], source.normal[2], 0.0],
+                                uv_color_rg: [source.uv[0], source.uv[1], 1.0, 1.0],
+                                color_ba_base_rg: [1.0; 4],
+                                base_ba_material: [1.0, 1.0, 0.0, 0.0],
+                                object_translation: [
+                                    transform.translation.x,
+                                    transform.translation.y,
+                                    transform.translation.z,
+                                    id.slot as f32 + 1.0,
+                                ],
+                                object_rotation: [
+                                    transform.rotation.x,
+                                    transform.rotation.y,
+                                    transform.rotation.z,
+                                    transform.rotation.w,
+                                ],
+                                object_scale: [
+                                    transform.scale.x,
+                                    transform.scale.y,
+                                    transform.scale.z,
+                                    0.0,
+                                ],
+                            });
+                        }
+                        let cache_key = u64::from(id.slot) | (u64::from(id.generation) << 32);
+                        batches.push(vulkan_viewport::GpuBatch {
+                            cache_key,
+                            content_revision: transform_content_revision(transform)
+                                ^ cache_key.rotate_left(19),
+                            object_id: id,
+                            object_transform: transform,
+                            local_bounds_min: minimum,
+                            local_bounds_max: maximum,
+                            casts_shadows: true,
+                            texture_cache_key: 0,
+                            texture: None,
+                            gpu_texture: None,
+                            transparent: false,
+                            vertices,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(!batches.is_empty(), "fixture did not produce model batches");
+        let mut light = light.expect("fixture Light component");
+        let mut renderer =
+            vulkan_viewport::VulkanViewport::new().expect("headless Vulkan viewport");
+        let runtime = vulkan_runtime::shared_runtime().expect("shared headless Vulkan runtime");
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let worker_device = Arc::clone(&runtime.device);
+        let worker_queue = Arc::clone(&runtime.queue);
+        let compositor = std::thread::spawn(move || {
+            while worker_running.load(std::sync::atomic::Ordering::Relaxed) {
+                let encoder =
+                    worker_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("headless light_test live compositor"),
+                    });
+                worker_queue.submit([encoder.finish()]);
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        });
+        let mut maximum_uniform = Duration::ZERO;
+        let mut maximum_frame = 0_u64;
+        let mut yaw = 0.0_f32;
+        let mut light_seconds = 0.0_f32;
+        for frame in 0..240_u64 {
+            // Two complete cycles of: rest (live graph advances), mouse
+            // rotate (live graph held), rest, then mouse rotate again.
+            let phase = frame % 120;
+            let rotating = (45..60).contains(&phase) || (105..120).contains(&phase);
+            if rotating {
+                yaw += 0.002;
+            } else {
+                light_seconds += 1.0 / 60.0;
+            }
+            let seconds = light_seconds;
+            light.position.x = 10.0 * (5.0 * seconds).sin();
+            light.position.y = 10.0 * (5.0 * seconds).cos();
+            renderer
+                .render_resident(
+                    Vec2::new(320.0, 240.0),
+                    (yaw, -0.4, 0.0, 0.08, CoreVec3::ZERO, 10.0, 1),
+                    &batches,
+                    false,
+                    &[light],
+                    None,
+                    None,
+                    Some(frame),
+                    1,
+                    0,
+                    2,
+                    6 * 1024 * 1024 * 1024,
+                )
+                .expect("headless light_test frame");
+            if frame > 8 {
+                let uniform = renderer.point_shadow_cpu_timings().uniform_write;
+                if uniform > maximum_uniform {
+                    maximum_uniform = uniform;
+                    maximum_frame = frame;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+        compositor.join().expect("headless compositor worker");
+        eprintln!(
+            "light_test.zfp rotate/rest maximum: {:.3} ms at frame {}",
+            maximum_uniform.as_secs_f64() * 1_000.0,
+            maximum_frame,
+        );
+        assert!(
+            maximum_uniform >= Duration::from_millis(50),
+            "did not reproduce the light_test.zfp spike; maximum was only {:.3} ms",
+            maximum_uniform.as_secs_f64() * 1_000.0
         );
     }
 
@@ -18853,8 +19521,15 @@ mod tests {
         assert!(report.contains("GPU texture + mip upload"));
         assert!(report.contains("Viewport target allocation"));
         assert!(report.contains("Shadow target allocation"));
+        assert!(report.contains("Directional shadow preparation"));
+        assert!(report.contains("Point shadow preparation"));
+        assert!(report.contains("Point encoder creation"));
+        assert!(report.contains("Point pass + finish"));
+        assert!(report.contains("GPU directional shadow timestamp"));
+        assert!(report.contains("GPU point shadow timestamp"));
+        assert!(report.contains("GPU viewport timestamp"));
         assert!(report.contains("Vulkan renderer initialization"));
-        assert_eq!(report.lines().count(), 19);
+        assert_eq!(report.lines().count(), 29);
     }
 
     #[test]

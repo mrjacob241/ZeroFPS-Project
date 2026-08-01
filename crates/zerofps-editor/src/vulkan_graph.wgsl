@@ -104,7 +104,8 @@ fn algebra(values:array<f32,3>)->f32 {
             if top==0u{return 0.0;} let a=stack[top-1u];
             if op==9u{stack[top-1u]=-a;}else if op==10u{stack[top-1u]=sin(a);}
             else if op==11u{stack[top-1u]=cos(a);}else if op==12u{stack[top-1u]=abs(a);}
-            else{stack[top-1u]=sqrt(max(a,0.0));}
+            else if op==13u{stack[top-1u]=sqrt(max(a,0.0));}
+            else{stack[top-1u]=sign(a);}
         } else {
             if top<2u{return 0.0;}let b=stack[top-1u];let a=stack[top-2u];top-=1u;
             if op==4u{stack[top-1u]=a+b;}else if op==5u{stack[top-1u]=a-b;}

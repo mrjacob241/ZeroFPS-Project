@@ -42,11 +42,13 @@ async fn create_runtime() -> Result<Arc<VulkanRuntime>, String> {
         .await
         .ok_or_else(|| "no Vulkan adapter found".to_owned())?;
     let info = adapter.get_info();
+    let timestamp_features = adapter.features()
+        & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("ZeroFPS shared Vulkan device"),
-                required_features: wgpu::Features::empty(),
+                required_features: timestamp_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },

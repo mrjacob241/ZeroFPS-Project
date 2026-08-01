@@ -18,6 +18,7 @@ pub enum AlgebraInstruction {
     Sin,
     Cos,
     Abs,
+    Sign,
     Sqrt,
 }
 
@@ -57,6 +58,7 @@ pub fn evaluate_algebra_program(
             | AlgebraInstruction::Sin
             | AlgebraInstruction::Cos
             | AlgebraInstruction::Abs
+            | AlgebraInstruction::Sign
             | AlgebraInstruction::Sqrt => {
                 let value = stack.pop().ok_or("invalid unary expression")?;
                 stack.push(match instruction {
@@ -64,6 +66,15 @@ pub fn evaluate_algebra_program(
                     AlgebraInstruction::Sin => value.sin(),
                     AlgebraInstruction::Cos => value.cos(),
                     AlgebraInstruction::Abs => value.abs(),
+                    AlgebraInstruction::Sign => {
+                        if value > 0.0 {
+                            1.0
+                        } else if value < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    }
                     AlgebraInstruction::Sqrt => value.max(0.0).sqrt(),
                     _ => unreachable!(),
                 });
@@ -201,6 +212,7 @@ impl AlgebraParser<'_> {
                     "sin" => AlgebraInstruction::Sin,
                     "cos" => AlgebraInstruction::Cos,
                     "abs" => AlgebraInstruction::Abs,
+                    "sign" => AlgebraInstruction::Sign,
                     "sqrt" => AlgebraInstruction::Sqrt,
                     _ => return Err(format!("unknown function `{function}`")),
                 });
@@ -1101,6 +1113,17 @@ mod tests {
         assert!((value - 11.0).abs() < 1.0e-6);
         assert!(compile_algebra_expression("x + unknown").is_err());
         assert!(compile_algebra_expression("(x + y").is_err());
+    }
+
+    #[test]
+    fn algebra_sign_returns_negative_zero_and_positive_signs() {
+        let program = compile_algebra_expression("sign(x)").expect("valid sign expression");
+        assert_eq!(
+            evaluate_algebra_program(&program, [-2.5, 0.0, 0.0]),
+            Ok(-1.0)
+        );
+        assert_eq!(evaluate_algebra_program(&program, [0.0, 0.0, 0.0]), Ok(0.0));
+        assert_eq!(evaluate_algebra_program(&program, [8.0, 0.0, 0.0]), Ok(1.0));
     }
 
     #[test]
