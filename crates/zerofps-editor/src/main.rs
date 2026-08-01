@@ -354,6 +354,7 @@ enum BottomTab {
     Scripts,
     Console,
     Telemetry,
+    Inputs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -465,6 +466,7 @@ enum ProjectionMode {
 
 const PERSPECTIVE_CAMERA_DISTANCE: f32 = 20.0;
 const PERSPECTIVE_NEAR: f32 = 0.05;
+const MOUSE_RECALL_DELAY: Duration = Duration::from_millis(100);
 
 impl ProjectionMode {
     fn label(self) -> &'static str {
@@ -513,6 +515,23 @@ enum NodeSettings {
     },
     Algebra {
         expression: String,
+    },
+    KeyInput {
+        negative_key: usize,
+        positive_key: usize,
+        value: f32,
+        speed: f32,
+        keep_position: bool,
+    },
+    MouseInput {
+        horizontal_degrees: f32,
+        vertical_degrees: f32,
+        sensitivity: f32,
+        mode: usize,
+    },
+    Accumulator {
+        value: f32,
+        rate: f32,
     },
     SharpThreshold {
         threshold: f32,
@@ -702,6 +721,9 @@ impl NodeSettings {
             Self::ForceOutput { .. } => 28,
             Self::Engine { .. } => 29,
             Self::Algebra { .. } => 30,
+            Self::KeyInput { .. } => 31,
+            Self::MouseInput { .. } => 32,
+            Self::Accumulator { .. } => 33,
         }
     }
 
@@ -820,6 +842,23 @@ impl NodeSettings {
             },
             30 => Self::Algebra {
                 expression: "x + y * z".into(),
+            },
+            31 => Self::KeyInput {
+                negative_key: 0,
+                positive_key: 3,
+                value: 0.0,
+                speed: 4.0,
+                keep_position: false,
+            },
+            32 => Self::MouseInput {
+                horizontal_degrees: 0.0,
+                vertical_degrees: 0.0,
+                sensitivity: 0.002_f32.to_degrees(),
+                mode: 1,
+            },
+            33 => Self::Accumulator {
+                value: 0.0,
+                rate: 1.0,
             },
             _ => return None,
         })
@@ -1072,6 +1111,7 @@ struct EditorPerformanceTelemetry {
     viewport_target_allocation: TimingMetric,
     shadow_target_allocation: TimingMetric,
     viewport_initialization: TimingMetric,
+    editor_overlay_prepare: TimingMetric,
 }
 
 struct DisplayWorker {
@@ -1873,6 +1913,13 @@ struct EditorApp {
     compositor_dragging_node: Option<(usize, Vec2)>,
     compositor_pending_output: Option<(usize, usize)>,
     compositor_pending_spawn: Option<usize>,
+    compositor_key_capture: Option<(usize, bool)>,
+    compositor_mouse_capture: bool,
+    compositor_mouse_square: Option<Rect>,
+    compositor_mouse_last_tick: Instant,
+    compositor_mouse_offset: Vec2,
+    compositor_mouse_window_position: Option<Pos2>,
+    compositor_mouse_last_user_input: Option<Instant>,
     compositor_texture_overrides: Vec<(NodeId, TextureOverride)>,
     compositor_eval_cache: HashMap<(usize, usize, u32), Arc<TextureAsset>>,
     compositor_gpu_cache: HashMap<(usize, usize, u32), Arc<vulkan_runtime::GpuImage>>,
@@ -1895,7 +1942,14 @@ struct EditorApp {
     compositor_graph_queue: VecDeque<PendingCompositorGraph>,
     compositor_clock_started: Instant,
     compositor_next_time_tick: Instant,
+    compositor_key_last_tick: Instant,
+    compositor_accumulator_last_tick: Instant,
     last_camera_input_at: Option<Instant>,
+    gui_input_sequence: u64,
+    gui_last_input_at: Option<Instant>,
+    gui_last_event: String,
+    game_input_sequence: u64,
+    game_last_input_at: Option<Instant>,
     dynamics_fields: HashMap<NodeId, MeshScalarField>,
     dynamics_cloth: HashMap<NodeId, ClothState>,
     object_simulation_states: HashMap<usize, ObjectSimulationState>,
@@ -1942,6 +1996,8 @@ struct EditorApp {
     grid_spacing: f32,
     snap: bool,
     viewport_focused: bool,
+    viewport_extent: f32,
+    editor_camera_input_consumed: bool,
     camera_yaw: f32,
     camera_pitch: f32,
     camera_zoom: f32,
@@ -2016,6 +2072,13 @@ impl EditorApp {
             compositor_dragging_node: None,
             compositor_pending_output: None,
             compositor_pending_spawn: None,
+            compositor_key_capture: None,
+            compositor_mouse_capture: false,
+            compositor_mouse_square: None,
+            compositor_mouse_last_tick: Instant::now(),
+            compositor_mouse_offset: Vec2::ZERO,
+            compositor_mouse_window_position: None,
+            compositor_mouse_last_user_input: None,
             compositor_texture_overrides: Vec::new(),
             compositor_eval_cache: HashMap::new(),
             compositor_gpu_cache: HashMap::new(),
@@ -2039,7 +2102,14 @@ impl EditorApp {
             compositor_graph_queue: VecDeque::new(),
             compositor_clock_started: Instant::now(),
             compositor_next_time_tick: Instant::now(),
+            compositor_key_last_tick: Instant::now(),
+            compositor_accumulator_last_tick: Instant::now(),
             last_camera_input_at: None,
+            gui_input_sequence: 0,
+            gui_last_input_at: None,
+            gui_last_event: "No GUI input received".into(),
+            game_input_sequence: 0,
+            game_last_input_at: None,
             dynamics_fields: HashMap::new(),
             dynamics_cloth: HashMap::new(),
             object_simulation_states: HashMap::new(),
@@ -2093,6 +2163,8 @@ impl EditorApp {
             grid_spacing: 1.0,
             snap: false,
             viewport_focused: false,
+            viewport_extent: 1.0,
+            editor_camera_input_consumed: false,
             camera_yaw: -0.55,
             camera_pitch: 0.42,
             camera_zoom: 1.0,
@@ -3773,6 +3845,61 @@ impl EditorApp {
                         live_update.to_string(),
                     );
                 }
+                NodeSettings::KeyInput {
+                    negative_key,
+                    positive_key,
+                    speed,
+                    keep_position,
+                    ..
+                } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.negative_key"),
+                        negative_key.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.positive_key"),
+                        positive_key.to_string(),
+                    );
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.key_speed"), speed.to_string());
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.key_keep_position"),
+                        keep_position.to_string(),
+                    );
+                }
+                NodeSettings::MouseInput {
+                    horizontal_degrees,
+                    vertical_degrees,
+                    sensitivity,
+                    mode,
+                } => {
+                    for (name, value) in [
+                        ("mouse_horizontal", horizontal_degrees),
+                        ("mouse_vertical", vertical_degrees),
+                        ("mouse_sensitivity", sensitivity),
+                    ] {
+                        project
+                            .project
+                            .properties
+                            .insert(format!("compositor.node.{id}.{name}"), value.to_string());
+                    }
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.mouse_mode"), mode.to_string());
+                }
+                NodeSettings::Accumulator { value, rate } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.accumulator_value"),
+                        value.to_string(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.accumulator_rate"),
+                        rate.to_string(),
+                    );
+                }
                 NodeSettings::Position { values } => {
                     for (axis, value) in ["x", "y", "z"].into_iter().zip(values) {
                         project.project.properties.insert(
@@ -4530,6 +4657,53 @@ impl EditorApp {
                             .cloned()
                             .unwrap_or_else(|| "x + y * z".into()),
                     },
+                    31 => NodeSettings::KeyInput {
+                        negative_key: properties
+                            .get(&format!("compositor.node.{id}.negative_key"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0),
+                        positive_key: properties
+                            .get(&format!("compositor.node.{id}.positive_key"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(3),
+                        value: 0.0,
+                        speed: properties
+                            .get(&format!("compositor.node.{id}.key_speed"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(4.0),
+                        keep_position: properties
+                            .get(&format!("compositor.node.{id}.key_keep_position"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(false),
+                    },
+                    32 => NodeSettings::MouseInput {
+                        horizontal_degrees: properties
+                            .get(&format!("compositor.node.{id}.mouse_horizontal"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.0),
+                        vertical_degrees: properties
+                            .get(&format!("compositor.node.{id}.mouse_vertical"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.0),
+                        sensitivity: properties
+                            .get(&format!("compositor.node.{id}.mouse_sensitivity"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or_else(|| 0.002_f32.to_degrees()),
+                        mode: properties
+                            .get(&format!("compositor.node.{id}.mouse_mode"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1),
+                    },
+                    33 => NodeSettings::Accumulator {
+                        value: properties
+                            .get(&format!("compositor.node.{id}.accumulator_value"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0.0),
+                        rate: properties
+                            .get(&format!("compositor.node.{id}.accumulator_rate"))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1.0),
+                    },
                     _ => continue,
                 };
                 let legacy_graph_index = properties
@@ -4870,6 +5044,157 @@ impl EditorApp {
                     Err(error) => {
                         ui.small(RichText::new(error).color(Color32::from_rgb(225, 105, 95)));
                     }
+                }
+            }
+            31 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::KeyInput {
+                    ref mut negative_key,
+                    ref mut positive_key,
+                    value,
+                    ref mut speed,
+                    ref mut keep_position,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Common pairs");
+                for (label, negative, positive) in [
+                    ("A / D", Key::A, Key::D),
+                    ("S / W", Key::S, Key::W),
+                    ("Q / E", Key::Q, Key::E),
+                    ("Left / Right", Key::ArrowLeft, Key::ArrowRight),
+                    ("Down / Up", Key::ArrowDown, Key::ArrowUp),
+                ] {
+                    if ui.small_button(label).clicked() {
+                        *negative_key = compositor_key_index(negative).unwrap();
+                        *positive_key = compositor_key_index(positive).unwrap();
+                        changed = true;
+                    }
+                }
+                let mut capture = None;
+                ui.horizontal(|ui| {
+                    ui.label(format!("− {}", compositor_key_name(*negative_key)));
+                    if ui.button("Choose key").clicked() {
+                        capture = Some((node_id, true));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(format!("+ {}", compositor_key_name(*positive_key)));
+                    if ui.button("Choose key").clicked() {
+                        capture = Some((node_id, false));
+                    }
+                });
+                if let Some(capture) = capture {
+                    self.compositor_key_capture = Some(capture);
+                }
+                if let Some((capture_node, negative)) = self.compositor_key_capture
+                    && capture_node == node_id
+                {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        format!(
+                            "Press the {} key…",
+                            if negative { "negative" } else { "positive" }
+                        ),
+                    );
+                }
+                let mut preview_value = value;
+                ui.add_enabled(false, egui::Slider::new(&mut preview_value, -1.0..=1.0));
+                ui.monospace(format!("Value: {value:+.3}"));
+                ui.label("Speed (units / second)");
+                changed |= ui
+                    .add(egui::DragValue::new(speed).range(0.01..=100.0).speed(0.1))
+                    .changed();
+                changed |= ui
+                    .checkbox(keep_position, "Keep position on release")
+                    .changed();
+                ui.small("Keys are sampled while camera preview mode is enabled.");
+            }
+            32 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::MouseInput {
+                    ref mut horizontal_degrees,
+                    ref mut vertical_degrees,
+                    ref mut sensitivity,
+                    ref mut mode,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Mouse mode");
+                egui::ComboBox::from_id_salt(("mouse_input_mode", node_id))
+                    .selected_text(if *mode == 1 {
+                        "Canonical cursor warp"
+                    } else {
+                        "Central square"
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(mode, 1, "Canonical cursor warp")
+                            .changed();
+                        changed |= ui.selectable_value(mode, 0, "Central square").changed();
+                    });
+                ui.label("Horizontal angle");
+                changed |= ui
+                    .add(egui::Slider::new(horizontal_degrees, -180.0..=180.0).suffix("°"))
+                    .changed();
+                ui.label("Vertical angle");
+                changed |= ui
+                    .add(egui::Slider::new(vertical_degrees, -89.0..=89.0).suffix("°"))
+                    .changed();
+                ui.label("Sensitivity (degrees / pixel)");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(sensitivity)
+                            .range(0.001..=10.0)
+                            .speed(0.01),
+                    )
+                    .changed();
+                if ui.small_button("Match editor turning rate").clicked() {
+                    *sensitivity = 0.002_f32.to_degrees();
+                    changed = true;
+                }
+                if self.compositor_mouse_capture {
+                    ui.colored_label(Color32::LIGHT_GREEN, "Mouse captured · Esc releases it");
+                } else if self.camera_preview_visible
+                    && self.active_scene_camera().is_some()
+                    && self.compositor_mouse_square.is_some()
+                {
+                    if ui.button("Enter mouse mode").clicked() {
+                        self.capture_compositor_mouse(ui.ctx());
+                    }
+                } else {
+                    ui.small("Enable a valid camera preview to enter mouse mode.");
+                }
+            }
+            33 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Accumulator {
+                    ref mut value,
+                    ref mut rate,
+                } = self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Rate (units / second)");
+                changed |= ui.add(egui::DragValue::new(rate).speed(0.05)).changed();
+                ui.monospace(format!("Value: {value:.4}"));
+                if ui.small_button("Reset to zero").clicked() {
+                    *value = 0.0;
+                    changed = true;
                 }
             }
             5 => {
@@ -8032,6 +8357,7 @@ impl EditorApp {
                     tab(ui, &mut self.bottom_tab, BottomTab::Scripts, "Scripts");
                     tab(ui, &mut self.bottom_tab, BottomTab::Console, "Console");
                     tab(ui, &mut self.bottom_tab, BottomTab::Telemetry, "Telemetry");
+                    tab(ui, &mut self.bottom_tab, BottomTab::Inputs, "Inputs");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.small(RichText::new("⌕  Search").weak());
                     });
@@ -8044,8 +8370,120 @@ impl EditorApp {
                     BottomTab::Telemetry => {
                         telemetry_panel(ui, self.play_state, &mut self.performance)
                     }
+                    BottomTab::Inputs => self.inputs_telemetry_panel(ui, ctx),
                 }
             });
+    }
+
+    fn inputs_telemetry_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let age = |timestamp: Option<Instant>| {
+            timestamp
+                .map(|time| format!("{:.1} ms ago", time.elapsed().as_secs_f64() * 1_000.0))
+                .unwrap_or_else(|| "never".into())
+        };
+        let (rotate, pan, zoom, select) = ctx.input(|input| {
+            let pointer = &input.pointer;
+            (
+                pointer.button_down(egui::PointerButton::Secondary),
+                pointer.button_down(egui::PointerButton::Middle),
+                input.smooth_scroll_delta.y * 0.001,
+                pointer.button_down(egui::PointerButton::Primary),
+            )
+        });
+        ui.columns(2, |columns| {
+            columns[0].heading("GUI inputs");
+            egui::Grid::new("gui_input_telemetry")
+                .striped(true)
+                .show(&mut columns[0], |ui| {
+                    ui.label("Sequence");
+                    ui.monospace(self.gui_input_sequence.to_string());
+                    ui.end_row();
+                    ui.label("Latest action");
+                    ui.monospace(&self.gui_last_event);
+                    ui.end_row();
+                    ui.label("Updated");
+                    ui.monospace(age(self.gui_last_input_at));
+                    ui.end_row();
+                    ui.label("Rotate");
+                    ui.monospace(if rotate { "active" } else { "idle" });
+                    ui.end_row();
+                    ui.label("Pan");
+                    ui.monospace(if pan { "active" } else { "idle" });
+                    ui.end_row();
+                    ui.label("Zoom");
+                    ui.monospace(format!("{zoom:+.3}"));
+                    ui.end_row();
+                    ui.label("Select");
+                    ui.monospace(if select { "active" } else { "idle" });
+                    ui.end_row();
+                });
+
+            columns[1].heading("Game / compositor inputs");
+            let camera = self.input_worker.snapshot();
+            egui::Grid::new("game_input_telemetry")
+                .striped(true)
+                .show(&mut columns[1], |ui| {
+                    ui.label("Key sequence");
+                    ui.monospace(self.game_input_sequence.to_string());
+                    ui.end_row();
+                    ui.label("Key register age");
+                    ui.monospace(age(self.game_last_input_at));
+                    ui.end_row();
+                    ui.label("Camera sequence");
+                    ui.monospace(camera.sequence.to_string());
+                    ui.end_row();
+                    ui.label("Camera register age");
+                    ui.monospace(age(camera.captured_at));
+                    ui.end_row();
+                    ui.label("Rotate register");
+                    ui.monospace(format!("{:+.2}, {:+.2}", camera.orbit.x, camera.orbit.y));
+                    ui.end_row();
+                    ui.label("Pan register");
+                    ui.monospace(format!("{:+.2}, {:+.2}", camera.pan.x, camera.pan.y));
+                    ui.end_row();
+                    ui.label("Zoom register");
+                    ui.monospace(format!("{:+.4}", camera.zoom_log));
+                    ui.end_row();
+                });
+            columns[1].separator();
+            for node in &self.compositor_nodes {
+                if let NodeSettings::KeyInput {
+                    negative_key,
+                    positive_key,
+                    value,
+                    ..
+                } = node.settings
+                {
+                    columns[1].horizontal(|ui| {
+                        ui.monospace(format!("Node #{}", node.id));
+                        ui.label(format!(
+                            "{} / {}",
+                            compositor_key_name(negative_key),
+                            compositor_key_name(positive_key)
+                        ));
+                        ui.monospace(format!("{value:+.3}"));
+                    });
+                } else if let NodeSettings::MouseInput {
+                    horizontal_degrees,
+                    vertical_degrees,
+                    ..
+                } = node.settings
+                {
+                    columns[1].horizontal(|ui| {
+                        ui.monospace(format!("Mouse #{}", node.id));
+                        ui.label(if self.compositor_mouse_capture {
+                            "captured"
+                        } else {
+                            "released"
+                        });
+                        ui.monospace(format!(
+                            "H {horizontal_degrees:+.2}°  V {vertical_degrees:+.2}°"
+                        ));
+                    });
+                }
+            }
+        });
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     fn object_handles_panel(&mut self, ui: &mut egui::Ui) {
@@ -8672,6 +9110,17 @@ impl EditorApp {
                     modulus,
                 )))
             }
+            NodeSettings::KeyInput { value, .. } => Ok(CompositorProbeValue::Number(value)),
+            NodeSettings::MouseInput {
+                horizontal_degrees,
+                vertical_degrees,
+                ..
+            } => Ok(CompositorProbeValue::Number(if output == 0 {
+                horizontal_degrees
+            } else {
+                vertical_degrees
+            })),
+            NodeSettings::Accumulator { value, .. } => Ok(CompositorProbeValue::Number(value)),
             NodeSettings::Position { .. } | NodeSettings::Rotation { .. } => self
                 .transform_vector_value(node_id)
                 .map(|(values, _)| CompositorProbeValue::Triple(values))
@@ -8773,6 +9222,17 @@ impl EditorApp {
                 scale,
                 modulus,
             )),
+            NodeSettings::KeyInput { value, .. } => Some(value),
+            NodeSettings::MouseInput {
+                horizontal_degrees,
+                vertical_degrees,
+                ..
+            } => Some(if output == 0 {
+                horizontal_degrees
+            } else {
+                vertical_degrees
+            }),
+            NodeSettings::Accumulator { value, .. } => Some(value),
             NodeSettings::Algebra { .. } => {
                 match self.probe_compositor_node(node_id, output, &mut BTreeSet::new()) {
                     Ok(CompositorProbeValue::Number(value)) => Some(value),
@@ -9272,6 +9732,45 @@ impl EditorApp {
                     cached_mips: Vec::new(),
                 }))
             }
+            NodeSettings::KeyInput { value, .. } => {
+                let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Ok(Arc::new(TextureAsset {
+                    name: "compositor-key-input".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![channel, channel, channel, 255],
+                    cached_mips: Vec::new(),
+                }))
+            }
+            NodeSettings::MouseInput {
+                horizontal_degrees,
+                vertical_degrees,
+                ..
+            } => {
+                let value = if output == 0 {
+                    horizontal_degrees
+                } else {
+                    vertical_degrees
+                };
+                let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Ok(Arc::new(TextureAsset {
+                    name: "compositor-mouse-input".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![channel, channel, channel, 255],
+                    cached_mips: Vec::new(),
+                }))
+            }
+            NodeSettings::Accumulator { value, .. } => {
+                let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Ok(Arc::new(TextureAsset {
+                    name: "compositor-accumulator".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![channel, channel, channel, 255],
+                    cached_mips: Vec::new(),
+                }))
+            }
             NodeSettings::Debug => {
                 let (from_id, from_out) = self.compositor_input_source(node_id, 0)?;
                 self.evaluate_compositor_node(from_id, from_out, visiting)
@@ -9399,6 +9898,374 @@ impl EditorApp {
         } else {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
+    }
+
+    fn capture_compositor_key(&mut self, ctx: &egui::Context) {
+        let Some((node_id, negative)) = self.compositor_key_capture else {
+            return;
+        };
+        let pressed = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                } => compositor_key_index(*key),
+                _ => None,
+            })
+        });
+        let Some(key_index) = pressed else {
+            return;
+        };
+        if let Some(node) = self
+            .compositor_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            && let NodeSettings::KeyInput {
+                negative_key,
+                positive_key,
+                ..
+            } = &mut node.settings
+        {
+            if negative {
+                *negative_key = key_index;
+            } else {
+                *positive_key = key_index;
+            }
+            self.project_dirty = true;
+        }
+        self.compositor_key_capture = None;
+    }
+
+    fn track_gui_inputs(&mut self, ctx: &egui::Context) {
+        let mouse_captured = self.compositor_mouse_capture;
+        let semantic_event = ctx.input(|input| {
+            let pointer = &input.pointer;
+            let delta = pointer.delta();
+            if mouse_captured && delta != Vec2::ZERO {
+                Some(format!("FPS look ({:+.1}, {:+.1})", delta.x, delta.y))
+            } else if pointer.button_down(egui::PointerButton::Secondary) && delta != Vec2::ZERO {
+                Some(format!("Rotate ({:+.1}, {:+.1})", delta.x, delta.y))
+            } else if pointer.button_down(egui::PointerButton::Middle) && delta != Vec2::ZERO {
+                Some(format!("Pan ({:+.1}, {:+.1})", delta.x, delta.y))
+            } else if input.smooth_scroll_delta.y != 0.0 {
+                Some(format!("Zoom {:+.2}", input.smooth_scroll_delta.y * 0.001))
+            } else {
+                input.events.iter().rev().find_map(|event| match event {
+                    egui::Event::Key { key, pressed, .. } => Some(format!(
+                        "Key {key:?} {}",
+                        if *pressed { "pressed" } else { "released" }
+                    )),
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        ..
+                    } => Some(format!(
+                        "Select {}",
+                        if *pressed { "pressed" } else { "released" }
+                    )),
+                    _ => None,
+                })
+            }
+        });
+        if let Some(event) = semantic_event {
+            self.gui_input_sequence = self.gui_input_sequence.wrapping_add(1);
+            self.gui_last_input_at = Some(Instant::now());
+            self.gui_last_event = event;
+        }
+    }
+
+    fn release_compositor_mouse(&mut self, ctx: &egui::Context) {
+        self.compositor_mouse_capture = false;
+        self.compositor_mouse_offset = Vec2::ZERO;
+        self.compositor_mouse_window_position = None;
+        self.compositor_mouse_last_user_input = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+    }
+
+    fn capture_compositor_mouse(&mut self, ctx: &egui::Context) {
+        let Some(square) = self.compositor_mouse_square else {
+            return;
+        };
+        let center = square.center();
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(center));
+        let canonical_warp = self.compositor_mouse_mode() == 1;
+        // Confine instead of asking the compositor for a relative-pointer lock:
+        // canonical warp needs real absolute motion events before each recenter.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::CursorGrab::Confined,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!canonical_warp));
+        self.compositor_mouse_capture = true;
+        self.compositor_mouse_last_tick = Instant::now();
+        self.compositor_mouse_offset = Vec2::ZERO;
+        self.compositor_mouse_window_position = Some(center);
+        self.compositor_mouse_last_user_input = Some(Instant::now());
+    }
+
+    fn compositor_mouse_mode(&self) -> usize {
+        self.compositor_nodes
+            .iter()
+            .find_map(|node| match node.settings {
+                NodeSettings::MouseInput { mode, .. } => Some(mode),
+                _ => None,
+            })
+            .unwrap_or(1)
+    }
+
+    fn tick_compositor_mouse(&mut self, ctx: &egui::Context) {
+        let escape = ctx.input(|input| input.key_pressed(Key::Escape));
+        let window_focused = ctx.input(|input| input.focused);
+        let has_mouse_node = self
+            .compositor_nodes
+            .iter()
+            .any(|node| matches!(node.settings, NodeSettings::MouseInput { .. }));
+        if compositor_mouse_should_release(
+            self.compositor_mouse_capture,
+            self.camera_preview_visible,
+            has_mouse_node,
+            escape,
+            window_focused,
+        ) {
+            // Escape has priority over motion from the same frame. This guarantees
+            // that releasing capture cannot also rotate the camera.
+            self.compositor_key_capture = None;
+            self.release_compositor_mouse(ctx);
+            return;
+        }
+        if !self.compositor_mouse_capture {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.compositor_mouse_last_tick)
+            .as_secs_f32()
+            .min(0.05);
+        self.compositor_mouse_last_tick = now;
+        let square = self.compositor_mouse_square.unwrap_or_else(|| {
+            let center = ctx.input(|input| input.screen_rect().center());
+            Rect::from_center_size(center, Vec2::splat(192.0))
+        });
+        let mouse_mode = self.compositor_mouse_mode();
+        if mouse_mode == 1 {
+            let center = square.center();
+            let delta = ctx.input(|input| canonical_cursor_warp_delta(&input.events, center));
+            // Canonical relative mouse input: consume motion from the fixed origin,
+            // then warp straight back so screen edges can never limit rotation.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(center));
+            self.compositor_mouse_window_position = Some(center);
+            self.compositor_mouse_offset = Vec2::ZERO;
+            if delta.length_sq() <= 0.0001 {
+                ctx.request_repaint_after(Duration::from_millis(4));
+                return;
+            }
+            self.apply_compositor_mouse_delta(ctx, delta, mouse_mode);
+            return;
+        }
+        let half = square.width().min(square.height()) * 0.5;
+        let expected_position = square.center() + self.compositor_mouse_offset;
+        let window_input_position =
+            ctx.input(|input| latest_genuine_pointer_position(&input.events, expected_position));
+        let user_displacement = window_input_position
+            .map(|position| position - expected_position)
+            .unwrap_or(Vec2::ZERO);
+        if let Some(position) = window_input_position {
+            self.compositor_mouse_window_position = Some(position);
+        }
+        let user_active = user_displacement.length_sq() > 0.01;
+        if user_active {
+            self.compositor_mouse_last_user_input = Some(now);
+        }
+        let recall_active = self
+            .compositor_mouse_last_user_input
+            .is_none_or(|last_input| {
+                now.saturating_duration_since(last_input) >= MOUSE_RECALL_DELAY
+            });
+        self.compositor_mouse_offset = step_compositor_mouse_recall(
+            self.compositor_mouse_offset,
+            user_displacement,
+            user_active,
+            recall_active,
+            half,
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(
+            square.center() + self.compositor_mouse_offset,
+        ));
+        let normalized = self.compositor_mouse_offset / half.max(1.0);
+        let axis = Vec2::new(
+            joystick_axis(normalized.x, 0.08),
+            joystick_axis(normalized.y, 0.08),
+        );
+        let equivalent_delta = axis * (half * 6.0 * dt);
+        self.apply_compositor_mouse_delta(ctx, equivalent_delta, mouse_mode);
+    }
+
+    fn apply_compositor_mouse_delta(
+        &mut self,
+        ctx: &egui::Context,
+        delta: Vec2,
+        mouse_mode: usize,
+    ) {
+        let changed_nodes = self
+            .compositor_nodes
+            .iter_mut()
+            .filter_map(|node| {
+                let NodeSettings::MouseInput {
+                    horizontal_degrees,
+                    vertical_degrees,
+                    sensitivity,
+                    mode,
+                } = &mut node.settings
+                else {
+                    return None;
+                };
+                if *mode != mouse_mode {
+                    return None;
+                }
+                let previous = (*horizontal_degrees, *vertical_degrees);
+                let next = advance_compositor_mouse_angles(
+                    *horizontal_degrees,
+                    *vertical_degrees,
+                    delta,
+                    *sensitivity,
+                );
+                (*horizontal_degrees, *vertical_degrees) = next;
+                (next != previous).then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        if changed_nodes.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(4));
+            return;
+        }
+        for node_id in changed_nodes {
+            self.invalidate_compositor_from(node_id);
+        }
+        self.compositor_control_started = Some(Instant::now());
+        self.compositor_apply_due = Some(Instant::now());
+        self.game_input_sequence = self.game_input_sequence.wrapping_add(1);
+        self.game_last_input_at = Some(Instant::now());
+        ctx.request_repaint_after(Duration::from_millis(4));
+    }
+
+    fn tick_compositor_keys(&mut self, ctx: &egui::Context) {
+        let camera_mode = self.camera_preview_visible;
+        let now = Instant::now();
+        let delta_seconds = now
+            .saturating_duration_since(self.compositor_key_last_tick)
+            .as_secs_f32()
+            .min(0.05);
+        self.compositor_key_last_tick = now;
+        let states = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| match node.settings {
+                NodeSettings::KeyInput {
+                    negative_key,
+                    positive_key,
+                    value,
+                    speed,
+                    keep_position,
+                } => {
+                    let direction = if camera_mode {
+                        ctx.input(|input| {
+                            let negative = compositor_key_choices()
+                                .get(negative_key)
+                                .is_some_and(|(key, _)| input.key_down(*key));
+                            let positive = compositor_key_choices()
+                                .get(positive_key)
+                                .is_some_and(|(key, _)| input.key_down(*key));
+                            compositor_key_axis_value(negative, positive)
+                        })
+                    } else {
+                        0.0
+                    };
+                    let next = advance_compositor_key_axis(
+                        value,
+                        direction,
+                        speed,
+                        keep_position && camera_mode,
+                        delta_seconds,
+                    );
+                    (next != value).then_some((node.id, next))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if states.is_empty() {
+            return;
+        }
+        for (node_id, next) in &states {
+            if let Some(node) = self
+                .compositor_nodes
+                .iter_mut()
+                .find(|node| node.id == *node_id)
+                && let NodeSettings::KeyInput { value, .. } = &mut node.settings
+            {
+                *value = *next;
+            }
+            self.invalidate_compositor_from(*node_id);
+        }
+        self.compositor_control_started = Some(Instant::now());
+        self.compositor_apply_due = Some(Instant::now());
+        self.game_input_sequence = self.game_input_sequence.wrapping_add(1);
+        self.game_last_input_at = Some(Instant::now());
+        ctx.request_repaint();
+    }
+
+    fn tick_compositor_accumulators(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.compositor_accumulator_last_tick)
+            .as_secs_f32()
+            .min(0.05);
+        self.compositor_accumulator_last_tick = now;
+        if dt <= 0.0 {
+            return;
+        }
+        let accumulator_ids = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| {
+                matches!(node.settings, NodeSettings::Accumulator { .. }).then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        let mut updates = Vec::new();
+        for node_id in accumulator_ids {
+            let input = self
+                .compositor_input_source(node_id, 0)
+                .ok()
+                .and_then(|(source, output)| {
+                    self.scalar_node_value(source, output, &mut BTreeSet::new())
+                })
+                .unwrap_or(0.0);
+            let Some((value, rate)) = self.compositor_nodes.iter().find_map(|node| {
+                (node.id == node_id).then(|| match node.settings {
+                    NodeSettings::Accumulator { value, rate } => Some((value, rate)),
+                    _ => None,
+                })?
+            }) else {
+                continue;
+            };
+            let next = advance_accumulator(value, input, rate, dt);
+            if next.is_finite() && next != value {
+                updates.push((node_id, next));
+            }
+        }
+        for (node_id, next) in updates {
+            if let Some(node) = self
+                .compositor_nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                && let NodeSettings::Accumulator { value, .. } = &mut node.settings
+            {
+                *value = next;
+            }
+            self.invalidate_compositor_from(node_id);
+            self.compositor_apply_due = Some(now);
+        }
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     fn tick_compositor_time(&mut self, ctx: &egui::Context) {
@@ -11178,7 +12045,7 @@ impl EditorApp {
                     ui.separator();
                     ui.menu_button("Add", |ui| {
                         ui.menu_button("Input", |ui| {
-                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time"), (19, "Painted Texture")] {
+                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time"), (31, "Key Input"), (32, "Mouse Input"), (33, "Accumulator"), (19, "Painted Texture")] {
                                 if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
@@ -11321,7 +12188,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 31] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 34] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -11369,12 +12236,15 @@ impl EditorApp {
                         Color32::from_rgb(190, 93, 47),
                     ),
                     ("Algebra", "Converter", Color32::from_rgb(105, 112, 122)),
+                    ("Key Input", "Input", Color32::from_rgb(76, 122, 155)),
+                    ("Mouse Input", "Input", Color32::from_rgb(76, 122, 155)),
+                    ("Accumulator", "Input", Color32::from_rgb(76, 122, 155)),
                 ];
-                let node_heights_by_kind: [f32; 31] = [
+                let node_heights_by_kind: [f32; 34] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
                     175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
                     285.0, 235.0, 245.0, 285.0, 190.0,
-                    205.0, 205.0, 360.0, 210.0, 190.0, 190.0,
+                    205.0, 205.0, 360.0, 210.0, 190.0, 190.0, 430.0, 330.0, 190.0,
                 ];
                 let node_width = 230.0;
 
@@ -11993,6 +12863,36 @@ impl EditorApp {
         }
     }
 
+    fn sample_editor_camera_input_early(&mut self, ctx: &egui::Context) {
+        self.editor_camera_input_consumed = false;
+        if self.workspace_tab != WorkspaceTab::Scene
+            || self.camera_preview_visible
+            || self.compositor_mouse_capture
+            || !self.viewport_focused
+        {
+            return;
+        }
+        let (delta, secondary, middle, scroll) = ctx.input(|input| {
+            (
+                input.pointer.delta(),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Middle),
+                input.smooth_scroll_delta.y,
+            )
+        });
+        let sample = InputSample {
+            orbit: if secondary { delta } else { Vec2::ZERO },
+            pan: if middle { delta } else { Vec2::ZERO },
+            zoom_log: scroll * 0.001,
+            viewport_extent: self.viewport_extent.max(1.0),
+        };
+        if sample.orbit != Vec2::ZERO || sample.pan != Vec2::ZERO || sample.zoom_log != 0.0 {
+            self.apply_editor_camera_input(sample);
+            self.last_camera_input_at = Some(Instant::now());
+            self.editor_camera_input_consumed = true;
+        }
+    }
+
     fn viewport(&mut self, ctx: &egui::Context) {
         if self.active_tool == Tool::TexturePaint
             && let Some(id) = self.scene.selected
@@ -12053,6 +12953,25 @@ impl EditorApp {
                             .clicked()
                         {
                             self.camera_preview_visible = !self.camera_preview_visible;
+                            if !self.camera_preview_visible && self.compositor_mouse_capture {
+                                self.release_compositor_mouse(ui.ctx());
+                            }
+                        }
+                        let has_mouse_input = self
+                            .compositor_nodes
+                            .iter()
+                            .any(|node| matches!(node.settings, NodeSettings::MouseInput { .. }));
+                        if self.camera_preview_visible
+                            && self.active_scene_camera().is_some()
+                            && self.compositor_mouse_square.is_some()
+                            && has_mouse_input
+                            && !self.compositor_mouse_capture
+                            && ui
+                                .button("Enter mouse mode")
+                                .on_hover_text("Lock and hide the cursor; press Esc to release")
+                                .clicked()
+                        {
+                            self.capture_compositor_mouse(ui.ctx());
                         }
                         if ui
                             .selectable_label(self.global_light_enabled, "☀")
@@ -12074,7 +12993,11 @@ impl EditorApp {
                 let render_rect = scene_camera.as_ref().map_or(response.rect, |camera| {
                     fit_aspect_rect(response.rect, camera.aspect_ratio)
                 });
+                self.compositor_mouse_square = (self.camera_preview_visible
+                    && scene_camera.is_some())
+                .then(|| Rect::from_center_size(render_rect.center(), Vec2::splat(192.0)));
                 self.viewport_focused = response.hovered();
+                self.viewport_extent = response.rect.width().min(response.rect.height()).max(1.0);
                 let pointer_delta = ui.input(|input| input.pointer.delta());
                 if matches!(self.active_tool, Tool::FieldPaint | Tool::TexturePaint) {
                     let (pointer, pressed, down, released) = ui.input(|input| {
@@ -12170,17 +13093,17 @@ impl EditorApp {
                         input.pointer.button_down(egui::PointerButton::Middle),
                     )
                 });
-                let orbit = if pointer_owned && secondary_down {
+                let orbit = if !self.editor_camera_input_consumed && pointer_owned && secondary_down {
                     pointer_delta
                 } else {
                     Vec2::ZERO
                 };
-                let pan = if pointer_owned && middle_down {
+                let pan = if !self.editor_camera_input_consumed && pointer_owned && middle_down {
                     pointer_delta
                 } else {
                     Vec2::ZERO
                 };
-                let zoom_log = if response.hovered() {
+                let zoom_log = if !self.editor_camera_input_consumed && response.hovered() {
                     ui.input(|input| input.smooth_scroll_delta.y) * 0.001
                 } else {
                     0.0
@@ -12193,7 +13116,6 @@ impl EditorApp {
                         viewport_extent: response.rect.width().min(response.rect.height()),
                     };
                     self.apply_editor_camera_input(sample);
-                    self.input_worker.submit(sample);
                     self.last_camera_input_at = Some(Instant::now());
                 }
                 // Capture the camera only after applying this frame's input.
@@ -12260,8 +13182,13 @@ impl EditorApp {
                         newest_completed = Some(result);
                     }
                     if let Some(result) = newest_completed {
-                        self.viewport_render_in_flight = false;
-                        self.viewport_requested_key = None;
+                        // A newer camera state may already occupy the worker's
+                        // replaceable pending slot. Do not erase that request when
+                        // an older in-flight frame completes.
+                        if self.viewport_requested_key == Some(result.key) {
+                            self.viewport_render_in_flight = false;
+                            self.viewport_requested_key = None;
+                        }
                         let presented_assets = completed_asset_loads(
                             &self.asset_loading_present_revision,
                             result.key.scene_revision,
@@ -12401,7 +13328,6 @@ impl EditorApp {
                     }
                     if self.viewport_depth_key != Some(key)
                         && self.viewport_requested_key != Some(key)
-                        && !self.viewport_render_in_flight
                         && viewport_frame_due
                     {
                         self.display_worker.submit_latest(RenderJob {
@@ -12427,6 +13353,7 @@ impl EditorApp {
                     self.viewport_native_texture
                         .or_else(|| self.viewport_color.as_ref().map(TextureHandle::id))
                 };
+                let overlay_started = Instant::now();
                 if let Some(presented) = &self.presented_view {
                     painter.rect_filled(response.rect, 0.0, Color32::BLACK);
                     let collider_wireframe = scene_camera
@@ -12473,6 +13400,63 @@ impl EditorApp {
                     }
                 } else {
                     painter.rect_filled(response.rect, 0.0, Color32::from_rgb(21, 24, 31));
+                }
+                self.performance
+                    .editor_overlay_prepare
+                    .record(overlay_started.elapsed());
+                if self.compositor_mouse_capture
+                    && self.compositor_mouse_mode() == 0
+                    && let Some(square) = self.compositor_mouse_square
+                {
+                    painter.rect_stroke(
+                        square,
+                        4.0,
+                        Stroke::new(1.5, Color32::from_rgb(245, 205, 75)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let center = square.center();
+                    painter.line_segment(
+                        [center - Vec2::new(7.0, 0.0), center + Vec2::new(7.0, 0.0)],
+                        Stroke::new(1.0, Color32::from_rgb(245, 205, 75)),
+                    );
+                    painter.line_segment(
+                        [center - Vec2::new(0.0, 7.0), center + Vec2::new(0.0, 7.0)],
+                        Stroke::new(1.0, Color32::from_rgb(245, 205, 75)),
+                    );
+                    let window_position = self
+                        .compositor_mouse_window_position
+                        .unwrap_or(center);
+                    let relative_position = window_position - center;
+                    let recall_status = self.compositor_mouse_last_user_input.map_or_else(
+                        || "Recall: active".to_owned(),
+                        |last_input| {
+                            let remaining = MOUSE_RECALL_DELAY
+                                .saturating_sub(last_input.elapsed())
+                                .as_secs_f32();
+                            if remaining > 0.0 {
+                                format!("Recall in: {remaining:.2} s")
+                            } else {
+                                "Recall: active".to_owned()
+                            }
+                        },
+                    );
+                    let diagnostics = format!(
+                        "Window:  ({:.1}, {:.1})\nRelative: ({:+.1}, {:+.1})\nRecall:   ({:+.1}, {:+.1})\n{}",
+                        window_position.x,
+                        window_position.y,
+                        relative_position.x,
+                        relative_position.y,
+                        self.compositor_mouse_offset.x,
+                        self.compositor_mouse_offset.y,
+                        recall_status,
+                    );
+                    painter.text(
+                        square.left_top() + Vec2::splat(8.0),
+                        Align2::LEFT_TOP,
+                        diagnostics,
+                        FontId::monospace(10.0),
+                        Color32::from_rgb(255, 225, 120),
+                    );
                 }
             });
     }
@@ -12736,6 +13720,12 @@ impl eframe::App for EditorApp {
             "{} — ZeroFPS Project",
             self.project_display_name()
         )));
+        self.track_gui_inputs(ctx);
+        self.sample_editor_camera_input_early(ctx);
+        self.tick_compositor_mouse(ctx);
+        self.capture_compositor_key(ctx);
+        self.tick_compositor_keys(ctx);
+        self.tick_compositor_accumulators(ctx);
         self.poll_asset_imports();
         self.poll_save_as();
         self.poll_load_project();
@@ -13249,9 +14239,173 @@ fn resolve_object_handle_value(nodes: &[CompositorNode], node_id: usize) -> Opti
     resolve(nodes, node_id, &mut BTreeSet::new())
 }
 
+fn compositor_key_choices() -> &'static [(Key, &'static str)] {
+    &[
+        (Key::A, "A"),
+        (Key::B, "B"),
+        (Key::C, "C"),
+        (Key::D, "D"),
+        (Key::E, "E"),
+        (Key::F, "F"),
+        (Key::G, "G"),
+        (Key::H, "H"),
+        (Key::I, "I"),
+        (Key::J, "J"),
+        (Key::K, "K"),
+        (Key::L, "L"),
+        (Key::M, "M"),
+        (Key::N, "N"),
+        (Key::O, "O"),
+        (Key::P, "P"),
+        (Key::Q, "Q"),
+        (Key::R, "R"),
+        (Key::S, "S"),
+        (Key::T, "T"),
+        (Key::U, "U"),
+        (Key::V, "V"),
+        (Key::W, "W"),
+        (Key::X, "X"),
+        (Key::Y, "Y"),
+        (Key::Z, "Z"),
+        (Key::ArrowLeft, "Left Arrow"),
+        (Key::ArrowRight, "Right Arrow"),
+        (Key::ArrowDown, "Down Arrow"),
+        (Key::ArrowUp, "Up Arrow"),
+        (Key::Space, "Space"),
+        (Key::Enter, "Enter"),
+        (Key::Escape, "Escape"),
+        (Key::Tab, "Tab"),
+        (Key::Backspace, "Backspace"),
+        (Key::Insert, "Insert"),
+        (Key::Delete, "Delete"),
+        (Key::Home, "Home"),
+        (Key::End, "End"),
+        (Key::PageUp, "Page Up"),
+        (Key::PageDown, "Page Down"),
+    ]
+}
+
+fn compositor_key_name(index: usize) -> &'static str {
+    compositor_key_choices()
+        .get(index)
+        .map(|(_, name)| *name)
+        .unwrap_or("Unassigned")
+}
+
+fn compositor_key_index(key: Key) -> Option<usize> {
+    compositor_key_choices()
+        .iter()
+        .position(|(candidate, _)| *candidate == key)
+}
+
+fn compositor_key_axis_value(negative_down: bool, positive_down: bool) -> f32 {
+    f32::from(positive_down) - f32::from(negative_down)
+}
+
+fn advance_compositor_key_axis(
+    value: f32,
+    direction: f32,
+    speed: f32,
+    keep_position: bool,
+    delta_seconds: f32,
+) -> f32 {
+    let target = if direction != 0.0 {
+        direction.clamp(-1.0, 1.0)
+    } else if keep_position {
+        value
+    } else {
+        0.0
+    };
+    let maximum_step = speed.abs() * delta_seconds.max(0.0);
+    if (target - value).abs() <= maximum_step {
+        target
+    } else {
+        (value + (target - value).signum() * maximum_step).clamp(-1.0, 1.0)
+    }
+}
+
+fn compositor_mouse_should_release(
+    captured: bool,
+    camera_mode: bool,
+    has_mouse_node: bool,
+    escape_pressed: bool,
+    window_focused: bool,
+) -> bool {
+    captured && (escape_pressed || !camera_mode || !has_mouse_node || !window_focused)
+}
+
+fn advance_compositor_mouse_angles(
+    horizontal_degrees: f32,
+    vertical_degrees: f32,
+    delta: Vec2,
+    sensitivity: f32,
+) -> (f32, f32) {
+    let horizontal = (horizontal_degrees + delta.x * sensitivity + 180.0).rem_euclid(360.0) - 180.0;
+    let vertical = (vertical_degrees - delta.y * sensitivity).clamp(-89.0, 89.0);
+    (horizontal, vertical)
+}
+
+fn joystick_axis(value: f32, dead_zone: f32) -> f32 {
+    let magnitude = value.abs();
+    if magnitude <= dead_zone {
+        0.0
+    } else {
+        value.signum() * ((magnitude - dead_zone) / (1.0 - dead_zone)).clamp(0.0, 1.0)
+    }
+}
+
+fn latest_genuine_pointer_position(events: &[egui::Event], expected: Pos2) -> Option<Pos2> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::PointerMoved(position) if position.distance_sq(expected) > 0.01 => {
+                Some(*position)
+            }
+            _ => None,
+        })
+        .last()
+}
+
+fn canonical_cursor_warp_delta(events: &[egui::Event], origin: Pos2) -> Vec2 {
+    // A warp-generated event lands exactly on the origin and must not undo the
+    // physical movement event that preceded it in the same input batch.
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::PointerMoved(position) if position.distance_sq(origin) > 0.01 => {
+                Some(*position - origin)
+            }
+            _ => None,
+        })
+        .last()
+        .unwrap_or(Vec2::ZERO)
+}
+
+fn step_compositor_mouse_recall(
+    mut offset: Vec2,
+    user_displacement: Vec2,
+    user_active: bool,
+    recall_active: bool,
+    half_extent: f32,
+) -> Vec2 {
+    if user_active {
+        offset += user_displacement;
+    } else if !recall_active {
+        // Preserve the exact position during the post-input grace period.
+    } else {
+        // Recall is a discrete timeout: once it expires, return exactly to the
+        // fixed rectangle origin without intermediate motion.
+        offset = Vec2::ZERO;
+    }
+    let limit = half_extent.max(1.0);
+    offset.x = offset.x.clamp(-limit, limit);
+    offset.y = offset.y.clamp(-limit, limit);
+    offset
+}
+
 fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
     match kind {
-        0 | 1 | 2 | 14 | 15 | 19 => 0,
+        0 | 1 | 2 | 14 | 15 | 19 | 31 | 32 => 0,
         9 => {
             if combine_mode == 1 {
                 3
@@ -13281,6 +14435,7 @@ fn compositor_input_socket_y(kind: usize, input: usize) -> f32 {
 fn compositor_output_socket_y(kind: usize, output: usize) -> f32 {
     match kind {
         11 => 70.0 + output as f32 * 22.0,
+        32 => 70.0 + output as f32 * 28.0,
         27 => 74.0 + output as f32 * 26.0,
         _ => 70.0,
     }
@@ -13309,6 +14464,7 @@ fn compositor_output_count(kind: usize) -> usize {
         8 | 16 | 17 | 18 | 28 | 29 => 0,
         11 => 4,
         27 => 2,
+        32 => 2,
         _ => 1,
     }
 }
@@ -13352,7 +14508,8 @@ fn compositor_output_label(kind: usize, output: usize) -> &'static str {
         26 => "Rotation",
         27 => ["Position", "Rotation"][output],
         0 | 1 | 7 | 8 | 9 | 10 | 12 | 13 | 19 => "Texture",
-        3 | 4 | 5 | 6 | 14 | 15 | 30 => "Value",
+        3 | 4 | 5 | 6 | 14 | 15 | 30 | 31 | 33 => "Value",
+        32 => ["Horizontal", "Vertical"][output],
         2 => "Value / Color",
         16 => "Preview",
         _ => "Output",
@@ -13392,6 +14549,9 @@ fn compositor_node_description(kind: usize) -> &'static str {
         28 => "Collects an object's force and propagates it to simulated ancestors.",
         29 => "Drives an Engine cylinder around its local Z axle.",
         30 => "Evaluates an algebraic expression using up to three inputs.",
+        31 => "Outputs -1, 0, or +1 from two configurable keyboard keys.",
+        32 => "Captures FPS-style mouse motion as horizontal and vertical angles.",
+        33 => "Integrates its input over time using value += input × rate × dt.",
         _ => "Node",
     }
 }
@@ -13434,6 +14594,10 @@ fn scaled_modulated_time(seconds: f32, scale: f32, modulus: f32) -> f32 {
     } else {
         scaled
     }
+}
+
+fn advance_accumulator(value: f32, input: f32, rate: f32, delta_seconds: f32) -> f32 {
+    value + input * rate * delta_seconds.max(0.0)
 }
 
 fn select_compositor_lod_for_backend(
@@ -14010,7 +15174,7 @@ fn telemetry_panel(
 
 fn telemetry_metrics(
     performance: &EditorPerformanceTelemetry,
-) -> [(&'static str, TimingMetric); 28] {
+) -> [(&'static str, TimingMetric); 29] {
     [
         ("Vulkan viewport worker", performance.viewport_vulkan),
         ("GPU batch preparation", performance.viewport_prepare),
@@ -14018,6 +15182,7 @@ fn telemetry_metrics(
             "egui native texture presentation",
             performance.viewport_present,
         ),
+        ("Editor overlays + grid", performance.editor_overlay_prepare),
         ("Viewport queue wait", performance.viewport_queue_wait),
         (
             "Shadow preparation / GPU encoding",
@@ -16057,7 +17222,10 @@ fn canonical_ground_line(segment: [[f32; 3]; 2]) -> [[f32; 3]; 2] {
 }
 
 fn visible_grid_half_cells(rect: Rect, x_step: Vec2, y_step: Vec2) -> i32 {
-    const MAX_HALF_CELLS: i32 = 2_000;
+    // Beyond this density multiple analytical lines land in the same pixel.
+    // Generating thousands of egui shapes only stalls scene navigation without
+    // adding visible information; coarser grid orders remain available normally.
+    const MAX_HALF_CELLS: i32 = 16;
     let half_diagonal = rect.size().length() * 0.5;
     let smallest_step = x_step.length().min(y_step.length()).max(0.01);
     (half_diagonal * 1.5 / smallest_step)
@@ -19496,6 +20664,93 @@ mod tests {
     }
 
     #[test]
+    fn compositor_accumulator_integrates_signed_input_at_rate() {
+        assert_eq!(advance_accumulator(2.0, 3.0, 4.0, 0.5), 8.0);
+        assert_eq!(advance_accumulator(2.0, -1.0, 4.0, 0.25), 1.0);
+        assert_eq!(advance_accumulator(2.0, 3.0, 4.0, -1.0), 2.0);
+    }
+
+    #[test]
+    fn compositor_key_axis_reports_negative_neutral_positive_and_cancellation() {
+        assert_eq!(compositor_key_axis_value(true, false), -1.0);
+        assert_eq!(compositor_key_axis_value(false, false), 0.0);
+        assert_eq!(compositor_key_axis_value(false, true), 1.0);
+        assert_eq!(compositor_key_axis_value(true, true), 0.0);
+        assert_eq!(
+            compositor_key_index(Key::ArrowLeft).map(compositor_key_name),
+            Some("Left Arrow")
+        );
+        assert_eq!(advance_compositor_key_axis(0.0, 1.0, 2.0, false, 0.25), 0.5);
+        assert_eq!(advance_compositor_key_axis(0.5, 0.0, 2.0, false, 0.25), 0.0);
+        assert_eq!(advance_compositor_key_axis(0.5, 0.0, 2.0, true, 0.25), 0.5);
+    }
+
+    #[test]
+    fn compositor_mouse_escape_always_releases_before_motion() {
+        assert!(compositor_mouse_should_release(
+            true, true, true, true, true
+        ));
+        assert!(compositor_mouse_should_release(
+            true, false, true, false, true
+        ));
+        assert!(compositor_mouse_should_release(
+            true, true, false, false, true
+        ));
+        assert!(compositor_mouse_should_release(
+            true, true, true, false, false
+        ));
+        assert!(!compositor_mouse_should_release(
+            true, true, true, false, true
+        ));
+        assert!(!compositor_mouse_should_release(
+            false, true, true, true, true
+        ));
+
+        let (horizontal, vertical) =
+            advance_compositor_mouse_angles(179.0, 88.0, Vec2::new(20.0, -20.0), 0.1);
+        assert_eq!(horizontal, -179.0);
+        assert_eq!(vertical, 89.0);
+
+        assert_eq!(joystick_axis(0.05, 0.08), 0.0);
+        assert_eq!(joystick_axis(1.0, 0.08), 1.0);
+        assert_eq!(joystick_axis(-1.0, 0.08), -1.0);
+        let square = Rect::from_center_size(Pos2::new(320.0, 240.0), Vec2::splat(192.0));
+        assert_eq!(square.center(), Pos2::new(320.0, 240.0));
+        let expected = square.center();
+        let movement_then_warp = [
+            egui::Event::PointerMoved(expected + Vec2::new(12.0, -4.0)),
+            egui::Event::PointerMoved(expected),
+        ];
+        assert_eq!(
+            latest_genuine_pointer_position(&movement_then_warp, expected),
+            Some(expected + Vec2::new(12.0, -4.0))
+        );
+        assert_eq!(
+            canonical_cursor_warp_delta(&movement_then_warp, expected),
+            Vec2::new(12.0, -4.0)
+        );
+        assert_eq!(
+            step_compositor_mouse_recall(Vec2::ZERO, Vec2::ZERO, false, true, 96.0),
+            Vec2::ZERO
+        );
+        let clipped =
+            step_compositor_mouse_recall(Vec2::ZERO, Vec2::new(100.0, 0.0), true, false, 96.0);
+        assert_eq!(clipped.x, 96.0);
+        let returning =
+            step_compositor_mouse_recall(Vec2::new(96.0, 0.0), Vec2::ZERO, false, true, 96.0);
+        assert_eq!(returning, Vec2::ZERO);
+        assert_eq!(
+            step_compositor_mouse_recall(Vec2::new(40.0, -20.0), Vec2::ZERO, false, false, 96.0,),
+            Vec2::new(40.0, -20.0)
+        );
+        assert_eq!(
+            step_compositor_mouse_recall(Vec2::new(2.5, -2.5), Vec2::ZERO, false, true, 96.0,),
+            Vec2::ZERO
+        );
+        assert!((0.002_f32.to_degrees() - 0.11459156).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn timing_metric_tracks_latest_ema_maximum_and_samples() {
         let mut metric = TimingMetric::default();
         metric.record(Duration::from_millis(2));
@@ -19529,7 +20784,8 @@ mod tests {
         assert!(report.contains("GPU point shadow timestamp"));
         assert!(report.contains("GPU viewport timestamp"));
         assert!(report.contains("Vulkan renderer initialization"));
-        assert_eq!(report.lines().count(), 29);
+        assert!(report.contains("Editor overlays + grid"));
+        assert_eq!(report.lines().count(), 30);
     }
 
     #[test]

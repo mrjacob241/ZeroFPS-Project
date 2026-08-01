@@ -268,6 +268,24 @@ impl Compiler<'_> {
                 );
                 self.add_source(GraphSource::Constant([value, value, value, 1.0]))
             }
+            NodeSettings::KeyInput { value, .. } => {
+                self.add_source(GraphSource::Constant([value, value, value, 1.0]))
+            }
+            NodeSettings::MouseInput {
+                horizontal_degrees,
+                vertical_degrees,
+                ..
+            } => {
+                let value = if socket.1 == 0 {
+                    horizontal_degrees
+                } else {
+                    vertical_degrees
+                };
+                self.add_source(GraphSource::Constant([value, value, value, 1.0]))
+            }
+            NodeSettings::Accumulator { value, .. } => {
+                self.add_source(GraphSource::Constant([value, value, value, 1.0]))
+            }
             // Debug is a sink and therefore has no connectable graph output.
             // This branch only satisfies exhaustive loading of legacy or
             // hand-edited project data; socket validation rejects it first.
