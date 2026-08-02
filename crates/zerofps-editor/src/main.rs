@@ -871,8 +871,14 @@ struct ObjectSimulationState {
     initial_rotation_degrees: CoreVec3,
     position: CoreVec3,
     rotation_degrees: CoreVec3,
+    /// Authoritative runtime orientation. Euler angles above are only a UI
+    /// representation and must never be integrated directly.
+    orientation: Quat,
     linear_velocity: CoreVec3,
     angular_velocity: CoreVec3,
+    /// World-space angular momentum (kg m^2 / s).  Angular velocity is
+    /// derived from this value through the body's inertia every step.
+    angular_momentum: CoreVec3,
 }
 
 #[derive(Clone, Copy)]
@@ -9326,10 +9332,12 @@ impl EditorApp {
                     Some(NodeSettings::Rotation { .. }) => self
                         .transform_vector_value(source)
                         .map(|(value, _)| CoreVec3::new(value[0], value[1], value[2])),
-                    Some(NodeSettings::ObjectSimulator { .. }) if source_output == 1 => self
-                        .object_simulation_states
-                        .get(&source)
-                        .map(|state| state.rotation_degrees),
+                    Some(NodeSettings::ObjectSimulator { .. }) if source_output == 1 => {
+                        if let Some(state) = self.object_simulation_states.get(&source) {
+                            transform.rotation = state.orientation;
+                        }
+                        None
+                    }
                     _ => None,
                 };
                 if let Some(degrees) = degrees {
@@ -10857,6 +10865,22 @@ impl EditorApp {
             } else {
                 fallback_mass.max(1.0e-6)
             };
+            let mass_colliders = general_body_colliders
+                .iter()
+                .enumerate()
+                .map(|(index, collider)| {
+                    let mass = body_colliders
+                        .get(index)
+                        .map(|entry| entry.7)
+                        .unwrap_or(0.0);
+                    (*collider, mass)
+                })
+                .collect::<Vec<_>>();
+            let (_, center_of_mass, inertia) =
+                rigid_body_mass_properties(&mass_colliders, body_mass, scene_body_position);
+            let initial_angular_radians =
+                CoreVec3::new(initial_angular[0], initial_angular[1], initial_angular[2])
+                    * (std::f32::consts::PI / 180.0);
             let state =
                 self.object_simulation_states
                     .entry(node_id)
@@ -10865,6 +10889,9 @@ impl EditorApp {
                         initial_rotation_degrees: initial_rotation,
                         position: initial_position,
                         rotation_degrees: initial_rotation,
+                        orientation: Quat::from_euler_xyz(
+                            initial_rotation * (std::f32::consts::PI / 180.0),
+                        ),
                         linear_velocity: CoreVec3::new(
                             initial_linear[0],
                             initial_linear[1],
@@ -10875,24 +10902,23 @@ impl EditorApp {
                             initial_angular[1],
                             initial_angular[2],
                         ),
+                        angular_momentum: inertia.component_mul(initial_angular_radians),
                     });
             state.linear_velocity = state.linear_velocity + external_force * (dt / body_mass);
             if let Some(force) = coupling_forces.get(&node_id) {
                 state.linear_velocity = state.linear_velocity + *force * (dt / body_mass);
             }
             if let Some(torque) = coupling_torques.get(&node_id) {
-                state.angular_velocity = state.angular_velocity
-                    + *torque * (dt * 180.0 / std::f32::consts::PI / body_mass);
+                state.angular_momentum = state.angular_momentum + *torque * dt;
             }
+            state.angular_velocity = inverse_inertia_mul(inertia, state.angular_momentum)
+                * (180.0 / std::f32::consts::PI);
             if gravity {
                 state.linear_velocity.z -= 9.81 * dt;
             }
             if let Some((floor_z, surface_friction, surface_friction_tolerance)) = support_surface {
-                let angular_radians = state.angular_velocity * std::f32::consts::PI / 180.0;
-                let mut contact_force = CoreVec3::ZERO;
-                let mut contact_torque = CoreVec3::ZERO;
+                let mut angular_radians = inverse_inertia_mul(inertia, state.angular_momentum);
                 let mut maximum_penetration = 0.0_f32;
-                let mut contact_restitution = 0.0_f32;
                 const CONTACT_SKIN: f32 = 1.0e-4;
                 let active_contact_count = body_colliders
                     .iter()
@@ -10903,8 +10929,7 @@ impl EditorApp {
                         floor_z - (center.z - extent_z) >= -tolerance
                     })
                     .count();
-                let (active_contacts, has_active_contact) =
-                    contact_count_for_solver(active_contact_count);
+                let (active_contacts, _) = contact_count_for_solver(active_contact_count);
                 let support_load = body_mass * 9.81 / active_contacts;
                 let mut joint_reaction_torques = Vec::<(NodeId, f32, f32)>::new();
                 for (
@@ -10930,10 +10955,9 @@ impl EditorApp {
                         continue;
                     }
                     maximum_penetration = maximum_penetration.max(penetration.max(0.0));
-                    contact_restitution = contact_restitution.max(*restitution);
                     let wheel_arm = CoreVec3::new(0.0, 0.0, -*extent_z);
                     let contact_point = *center + wheel_arm;
-                    let body_arm = contact_point - state.position;
+                    let body_arm = contact_point - center_of_mass;
                     let axle = rotation.rotate(CoreVec3::new(0.0, 0.0, 1.0)).normalized();
                     let joint_surface_velocity =
                         if *shape == ColliderShape::Cylinder && *joint != CylinderJoint::None {
@@ -10944,11 +10968,35 @@ impl EditorApp {
                         } else {
                             CoreVec3::ZERO
                         };
-                    let contact_velocity = state.linear_velocity
+                    let mut contact_velocity = state.linear_velocity
                         + angular_radians.cross(body_arm)
                         + joint_surface_velocity;
+                    let normal = CoreVec3::Z;
+                    let inward_speed = contact_velocity.dot(normal);
+                    if inward_speed < 0.0 {
+                        let impulse = rigid_contact_impulse(
+                            body_mass,
+                            inertia,
+                            body_arm,
+                            normal,
+                            inward_speed,
+                            *restitution,
+                        );
+                        state.linear_velocity = state.linear_velocity + impulse * (1.0 / body_mass);
+                        state.angular_momentum = state.angular_momentum + body_arm.cross(impulse);
+                        angular_radians = inverse_inertia_mul(inertia, state.angular_momentum);
+                        contact_velocity = state.linear_velocity
+                            + angular_radians.cross(body_arm)
+                            + joint_surface_velocity;
+                    }
                     let tangent = CoreVec3::new(contact_velocity.x, contact_velocity.y, 0.0);
-                    let body_contact_mass = body_mass / active_contacts;
+                    let tangent_direction = tangent.normalized();
+                    let body_contact_mass = if tangent_direction.length() > 1.0e-6 {
+                        rigid_effective_mass(body_mass, inertia, body_arm, tangent_direction)
+                            / active_contacts
+                    } else {
+                        body_mass / active_contacts
+                    };
                     let joint_inertia = (*shape == ColliderShape::Cylinder
                         && *joint != CylinderJoint::None)
                         .then(|| (0.5 * collider_mass.max(1.0e-6) * radius.powi(2)).max(1.0e-6));
@@ -10982,8 +11030,16 @@ impl EditorApp {
                         effective_contact_mass,
                         dt,
                     );
-                    contact_force = contact_force + friction_force;
-                    contact_torque = contact_torque + body_arm.cross(friction_force);
+                    // Apply each constraint immediately (sequential impulses).
+                    // Accumulating several independently computed "stop"
+                    // forces lets every wheel cancel the same velocity and can
+                    // overshoot into an ever-growing opposite rotation.
+                    let friction_impulse = friction_force * dt;
+                    state.linear_velocity =
+                        state.linear_velocity + friction_impulse * (1.0 / body_mass);
+                    state.angular_momentum =
+                        state.angular_momentum + body_arm.cross(friction_impulse);
+                    angular_radians = inverse_inertia_mul(inertia, state.angular_momentum);
                     if let Some(inertia) = joint_inertia {
                         joint_reaction_torques.push((
                             *collider_id,
@@ -10992,10 +11048,6 @@ impl EditorApp {
                         ));
                     }
                 }
-                state.linear_velocity = state.linear_velocity + contact_force * (dt / body_mass);
-                let angular_acceleration = contact_torque * (1.0 / body_mass);
-                state.angular_velocity = state.angular_velocity
-                    + angular_acceleration * (dt * 180.0 / std::f32::consts::PI);
                 for (joint_id, torque, inertia) in joint_reaction_torques {
                     if let Some(joint_state) = self.joint_simulation_states.get_mut(&joint_id) {
                         joint_state.angular_velocity += torque * dt / inertia;
@@ -11004,27 +11056,32 @@ impl EditorApp {
                 if maximum_penetration > 0.0 {
                     state.position.z += maximum_penetration;
                 }
-                if has_active_contact && state.linear_velocity.z < 0.0 {
-                    state.linear_velocity.z = resolve_contact_normal_velocity(
-                        state.linear_velocity.z,
-                        contact_restitution,
-                    );
-                }
             }
-            resolve_general_collider_contacts(
+            resolve_rigid_collider_contacts(
                 &mut state.position,
                 &mut state.linear_velocity,
+                &mut state.angular_momentum,
+                center_of_mass,
+                body_mass,
+                inertia,
                 scene_body_position,
                 &general_body_colliders,
                 &general_external_colliders,
                 dt,
             );
             state.position = state.position + state.linear_velocity * dt;
-            state.rotation_degrees = state.rotation_degrees + state.angular_velocity * dt;
+            state.angular_velocity = inverse_inertia_mul(inertia, state.angular_momentum)
+                * (180.0 / std::f32::consts::PI);
+            let angular_speed = inverse_inertia_mul(inertia, state.angular_momentum);
+            state.orientation = integrate_world_orientation(state.orientation, angular_speed, dt);
+            state.rotation_degrees =
+                state.orientation.to_euler_xyz() * (180.0 / std::f32::consts::PI);
             state.linear_velocity =
                 state.linear_velocity * (-linear_damping.clamp(0.0, 1.0) * dt).exp();
-            state.angular_velocity =
-                state.angular_velocity * (-angular_damping.clamp(0.0, 1.0) * dt).exp();
+            state.angular_momentum =
+                state.angular_momentum * (-angular_damping.clamp(0.0, 1.0) * dt).exp();
+            state.angular_velocity = inverse_inertia_mul(inertia, state.angular_momentum)
+                * (180.0 / std::f32::consts::PI);
         }
     }
 
@@ -18033,6 +18090,137 @@ fn collider_support_surface(
         .max_by(|left, right| left.0.total_cmp(&right.0))
 }
 
+/// Builds a stable diagonal world-space inertia approximation from the
+/// collider aggregate.  Each collider contributes its box inertia plus the
+/// parallel-axis term.  This deliberately uses the already conservative
+/// world bounds, so every supported collider shape participates without a
+/// shape-specific hole in the rigid-body solver.
+fn rigid_body_mass_properties(
+    colliders: &[(WorldCollider, f32)],
+    fallback_mass: f32,
+    fallback_center: CoreVec3,
+) -> (f32, CoreVec3, CoreVec3) {
+    let authored_mass = colliders.iter().map(|(_, mass)| mass.max(0.0)).sum::<f32>();
+    let total_mass = if authored_mass > 1.0e-6 {
+        authored_mass
+    } else {
+        fallback_mass.max(1.0e-6)
+    };
+    if colliders.is_empty() {
+        return (
+            total_mass,
+            fallback_center,
+            CoreVec3::new(total_mass, total_mass, total_mass),
+        );
+    }
+    let equal_mass = total_mass / colliders.len() as f32;
+    let mass_of = |mass: f32| {
+        if authored_mass > 1.0e-6 {
+            mass.max(0.0)
+        } else {
+            equal_mass
+        }
+    };
+    let center = colliders
+        .iter()
+        .fold(CoreVec3::ZERO, |sum, (collider, mass)| {
+            sum + collider.center * mass_of(*mass)
+        })
+        * (1.0 / total_mass);
+    let mut inertia = CoreVec3::ZERO;
+    for (collider, mass) in colliders {
+        let mass = mass_of(*mass);
+        let h = collider.half_extents;
+        let local = CoreVec3::new(
+            mass * (h.y * h.y + h.z * h.z) / 3.0,
+            mass * (h.x * h.x + h.z * h.z) / 3.0,
+            mass * (h.x * h.x + h.y * h.y) / 3.0,
+        );
+        let arm = collider.center - center;
+        let parallel_axis = CoreVec3::new(
+            mass * (arm.y * arm.y + arm.z * arm.z),
+            mass * (arm.x * arm.x + arm.z * arm.z),
+            mass * (arm.x * arm.x + arm.y * arm.y),
+        );
+        inertia = inertia + local + parallel_axis;
+    }
+    let minimum = (total_mass * 1.0e-6).max(1.0e-6);
+    inertia.x = inertia.x.max(minimum);
+    inertia.y = inertia.y.max(minimum);
+    inertia.z = inertia.z.max(minimum);
+    (total_mass, center, inertia)
+}
+
+fn inverse_inertia_mul(inertia: CoreVec3, value: CoreVec3) -> CoreVec3 {
+    CoreVec3::new(
+        value.x / inertia.x.max(1.0e-6),
+        value.y / inertia.y.max(1.0e-6),
+        value.z / inertia.z.max(1.0e-6),
+    )
+}
+
+fn integrate_world_orientation(orientation: Quat, angular_velocity: CoreVec3, dt: f32) -> Quat {
+    let angular_step = angular_velocity.length() * dt.max(0.0);
+    if angular_step <= 1.0e-8 {
+        orientation
+    } else {
+        // World-space angular velocity pre-multiplies the current orientation.
+        Quat::from_axis_angle(angular_velocity.normalized(), angular_step) * orientation
+    }
+}
+
+fn rigid_effective_mass(mass: f32, inertia: CoreVec3, arm: CoreVec3, direction: CoreVec3) -> f32 {
+    let direction = direction.normalized();
+    if direction.length() <= 1.0e-6 {
+        return 0.0;
+    }
+    let angular_response = inverse_inertia_mul(inertia, arm.cross(direction));
+    let inverse_mass = 1.0 / mass.max(1.0e-6) + angular_response.cross(arm).dot(direction).max(0.0);
+    1.0 / inverse_mass.max(1.0e-6)
+}
+
+#[cfg(test)]
+fn rigid_kinetic_energy(
+    mass: f32,
+    inertia: CoreVec3,
+    velocity: CoreVec3,
+    angular_momentum: CoreVec3,
+) -> f32 {
+    let angular_velocity = inverse_inertia_mul(inertia, angular_momentum);
+    0.5 * mass.max(0.0) * velocity.dot(velocity) + 0.5 * angular_momentum.dot(angular_velocity)
+}
+
+fn rigid_contact_impulse(
+    mass: f32,
+    inertia: CoreVec3,
+    arm: CoreVec3,
+    normal: CoreVec3,
+    inward_speed: f32,
+    restitution: f32,
+) -> CoreVec3 {
+    if inward_speed >= 0.0 {
+        return CoreVec3::ZERO;
+    }
+    let effective_mass = rigid_effective_mass(mass, inertia, arm, normal);
+    let magnitude = -(1.0 + restitution.clamp(0.0, 1.0)) * inward_speed * effective_mass;
+    normal * magnitude
+}
+
+/// Scalar normal impulse for a centered collision between two movable bodies.
+/// A negative relative speed means that the bodies approach each other.
+fn rigid_pair_normal_impulse(
+    mass_a: f32,
+    mass_b: f32,
+    relative_normal_speed: f32,
+    restitution: f32,
+) -> f32 {
+    if relative_normal_speed >= 0.0 {
+        return 0.0;
+    }
+    let inverse_mass = 1.0 / mass_a.max(1.0e-6) + 1.0 / mass_b.max(1.0e-6);
+    -(1.0 + restitution.clamp(0.0, 1.0)) * relative_normal_speed / inverse_mass.max(1.0e-6)
+}
+
 fn resolve_general_collider_contacts(
     position: &mut CoreVec3,
     velocity: &mut CoreVec3,
@@ -18077,6 +18265,86 @@ fn resolve_general_collider_contacts(
                 if tangent_speed > 1.0e-6 {
                     let removed_speed = (contact.friction * normal_speed).min(tangent_speed);
                     *velocity = *velocity - tangent * (removed_speed / tangent_speed);
+                }
+            }
+            resolved += 1;
+        }
+    }
+    resolved
+}
+
+fn resolve_rigid_collider_contacts(
+    position: &mut CoreVec3,
+    velocity: &mut CoreVec3,
+    angular_momentum: &mut CoreVec3,
+    center_of_mass: CoreVec3,
+    mass: f32,
+    inertia: CoreVec3,
+    scene_body_position: CoreVec3,
+    body_colliders: &[WorldCollider],
+    external_colliders: &[WorldCollider],
+    dt: f32,
+) -> usize {
+    let mut resolved = 0;
+    let translation = *position - scene_body_position;
+    let shifted_center_of_mass = center_of_mass + translation;
+    for body in body_colliders {
+        for external in external_colliders {
+            let shifted_body = WorldCollider {
+                center: body.center + translation,
+                ..*body
+            };
+            let collision_contact = collider_pair_contact(shifted_body, *external);
+            let friction_contact = collision_contact.or_else(|| {
+                collider_pair_contact(
+                    friction_contact_collider(shifted_body),
+                    friction_contact_collider(*external),
+                )
+            });
+            let Some(contact) = friction_contact else {
+                continue;
+            };
+            let surface_point = shifted_body.center
+                - CoreVec3::new(
+                    contact.normal.x * shifted_body.half_extents.x,
+                    contact.normal.y * shifted_body.half_extents.y,
+                    contact.normal.z * shifted_body.half_extents.z,
+                );
+            let arm = surface_point - shifted_center_of_mass;
+            let angular_velocity = inverse_inertia_mul(inertia, *angular_momentum);
+            let contact_velocity = *velocity + angular_velocity.cross(arm);
+            let inward_speed = contact_velocity.dot(contact.normal);
+            if let Some(collision) = collision_contact {
+                *position = *position + collision.normal * collision.penetration;
+                let impulse = rigid_contact_impulse(
+                    mass,
+                    inertia,
+                    arm,
+                    collision.normal,
+                    inward_speed,
+                    collision.restitution,
+                );
+                *velocity = *velocity + impulse * (1.0 / mass.max(1.0e-6));
+                *angular_momentum = *angular_momentum + arm.cross(impulse);
+            }
+            // Jointed wheels resolve their driven surface in the specialized
+            // wheel path. Other bodies receive a Coulomb tangential impulse at
+            // the actual contact arm, hence friction can also spin a body.
+            if body.shape != ColliderShape::Cylinder || body.joint == CylinderJoint::None {
+                let angular_velocity = inverse_inertia_mul(inertia, *angular_momentum);
+                let contact_velocity = *velocity + angular_velocity.cross(arm);
+                let tangent =
+                    contact_velocity - contact.normal * contact_velocity.dot(contact.normal);
+                let tangent_speed = tangent.length();
+                if tangent_speed > 1.0e-6 {
+                    let normal_speed = inward_speed.abs().max(9.81 * dt);
+                    let tangent_direction = tangent.normalized();
+                    let desired =
+                        rigid_effective_mass(mass, inertia, arm, tangent_direction) * tangent_speed;
+                    let maximum = contact.friction.max(0.0) * mass.max(1.0e-6) * normal_speed;
+                    let impulse = tangent_direction * -desired.min(maximum);
+                    *velocity = *velocity + impulse * (1.0 / mass.max(1.0e-6));
+                    *angular_momentum = *angular_momentum + arm.cross(impulse);
                 }
             }
             resolved += 1;
@@ -19698,6 +19966,80 @@ mod tests {
     }
 
     #[test]
+    fn collider_aggregate_uses_mass_weighted_center_and_parallel_axis_inertia() {
+        let collider = |x: f32| WorldCollider {
+            center: CoreVec3::new(x, 0.0, 0.0),
+            half_extents: CoreVec3::new(0.5, 0.5, 0.5),
+            restitution: 0.0,
+            friction: 1.0,
+            friction_margin_percent: 0.0,
+            shape: ColliderShape::Box,
+            joint: CylinderJoint::None,
+        };
+        let (mass, center, inertia) = rigid_body_mass_properties(
+            &[(collider(-2.0), 1.0), (collider(2.0), 3.0)],
+            1.0,
+            CoreVec3::ZERO,
+        );
+        assert!((mass - 4.0).abs() < 1.0e-6);
+        assert!(center.approx_eq(CoreVec3::new(1.0, 0.0, 0.0), 1.0e-6));
+        assert!(inertia.y > inertia.x);
+        assert!(inertia.z > inertia.x);
+    }
+
+    #[test]
+    fn off_center_support_impulse_produces_angular_momentum() {
+        let inertia = CoreVec3::new(2.0, 3.0, 4.0);
+        let arm = CoreVec3::new(-1.5, 0.0, -0.5);
+        let impulse = rigid_contact_impulse(10.0, inertia, arm, CoreVec3::Z, -4.0, 0.0);
+        let angular_momentum = arm.cross(impulse);
+        assert!(impulse.z > 0.0);
+        assert!(angular_momentum.y > 0.0);
+        assert!(angular_momentum.x.abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn centered_support_impulse_does_not_create_rotation() {
+        let arm = CoreVec3::new(0.0, 0.0, -0.5);
+        let impulse = rigid_contact_impulse(
+            10.0,
+            CoreVec3::new(2.0, 3.0, 4.0),
+            arm,
+            CoreVec3::Z,
+            -4.0,
+            0.0,
+        );
+        assert!(arm.cross(impulse).approx_eq(CoreVec3::ZERO, 1.0e-6));
+    }
+
+    #[test]
+    fn repeated_inelastic_contact_constraints_never_add_kinetic_energy() {
+        let mass = 10.0;
+        let inertia = CoreVec3::new(8.0, 12.0, 16.0);
+        let arms = [
+            CoreVec3::new(-1.0, -0.8, -0.5),
+            CoreVec3::new(-1.0, 0.8, -0.5),
+            CoreVec3::new(1.0, -0.8, -0.5),
+            CoreVec3::new(1.0, 0.8, -0.5),
+        ];
+        let mut velocity = CoreVec3::new(2.0, 0.5, -4.0);
+        let mut momentum = CoreVec3::new(0.0, 3.0, 1.0);
+        let mut previous = rigid_kinetic_energy(mass, inertia, velocity, momentum);
+        for _ in 0..32 {
+            for arm in arms {
+                let omega = inverse_inertia_mul(inertia, momentum);
+                let inward = (velocity + omega.cross(arm)).dot(CoreVec3::Z);
+                let impulse = rigid_contact_impulse(mass, inertia, arm, CoreVec3::Z, inward, 0.0);
+                velocity = velocity + impulse * (1.0 / mass);
+                momentum = momentum + arm.cross(impulse);
+                let energy = rigid_kinetic_energy(mass, inertia, velocity, momentum);
+                assert!(energy <= previous + 1.0e-4, "{energy} > {previous}");
+                previous = energy;
+            }
+        }
+    }
+
+    #[test]
     fn wheel_contact_uses_coupled_body_and_rotational_mass() {
         let wheel_mass = 196.0;
         let radius = 0.43;
@@ -21062,5 +21404,269 @@ mod tests {
 
         let model = scene.add("Model", ObjectKind::Model, None);
         assert!(scene.participates_in_physics(model));
+    }
+
+    /// Headless rigid-body acceptance scenarios. These tests intentionally use
+    /// SI-like values and state physical invariants rather than matching
+    /// implementation-specific intermediate numbers.
+    mod rigid_body_scenarios {
+        use super::*;
+
+        const EPS: f32 = 1.0e-4;
+
+        fn apply_floor_constraint(
+            mass: f32,
+            inertia: CoreVec3,
+            arm: CoreVec3,
+            velocity: &mut CoreVec3,
+            angular_momentum: &mut CoreVec3,
+            restitution: f32,
+        ) {
+            let omega = inverse_inertia_mul(inertia, *angular_momentum);
+            let inward = (*velocity + omega.cross(arm)).dot(CoreVec3::Z);
+            let impulse =
+                rigid_contact_impulse(mass, inertia, arm, CoreVec3::Z, inward, restitution);
+            *velocity = *velocity + impulse / mass;
+            *angular_momentum = *angular_momentum + arm.cross(impulse);
+        }
+
+        fn contact_normal_speed(
+            inertia: CoreVec3,
+            arm: CoreVec3,
+            velocity: CoreVec3,
+            angular_momentum: CoreVec3,
+        ) -> f32 {
+            (velocity + inverse_inertia_mul(inertia, angular_momentum).cross(arm)).z
+        }
+
+        #[test]
+        fn cube_falling_flat_stops_without_spinning() {
+            let mass = 2.0;
+            let inertia = CoreVec3::new(4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0);
+            let arm = CoreVec3::new(0.0, 0.0, -1.0);
+            let mut velocity = CoreVec3::new(0.0, 0.0, -5.0);
+            let mut angular_momentum = CoreVec3::ZERO;
+            apply_floor_constraint(
+                mass,
+                inertia,
+                arm,
+                &mut velocity,
+                &mut angular_momentum,
+                0.0,
+            );
+            assert!(velocity.z.abs() < EPS);
+            assert!(angular_momentum.length() < EPS);
+        }
+
+        #[test]
+        fn cube_falling_on_one_vertex_converts_fall_to_finite_rotation() {
+            let mass = 2.0;
+            let inertia = CoreVec3::new(4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0);
+            let arm = CoreVec3::new(1.0, 1.0, -1.0);
+            let mut velocity = CoreVec3::new(0.0, 0.0, -5.0);
+            let mut angular_momentum = CoreVec3::ZERO;
+            let before = rigid_kinetic_energy(mass, inertia, velocity, angular_momentum);
+            apply_floor_constraint(
+                mass,
+                inertia,
+                arm,
+                &mut velocity,
+                &mut angular_momentum,
+                0.0,
+            );
+            let after = rigid_kinetic_energy(mass, inertia, velocity, angular_momentum);
+            assert!(contact_normal_speed(inertia, arm, velocity, angular_momentum).abs() < EPS);
+            assert!(angular_momentum.x > 0.0 && angular_momentum.y < 0.0);
+            assert!(after <= before + EPS);
+        }
+
+        #[test]
+        fn cube_falling_on_edge_rotates_only_about_edge_direction() {
+            let mass = 2.0;
+            let inertia = CoreVec3::new(4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0);
+            let arm = CoreVec3::new(1.0, 0.0, -1.0);
+            let mut velocity = CoreVec3::new(0.0, 0.0, -3.0);
+            let mut angular_momentum = CoreVec3::ZERO;
+            apply_floor_constraint(
+                mass,
+                inertia,
+                arm,
+                &mut velocity,
+                &mut angular_momentum,
+                0.0,
+            );
+            assert!(angular_momentum.x.abs() < EPS);
+            assert!(angular_momentum.y < 0.0);
+            assert!(angular_momentum.z.abs() < EPS);
+        }
+
+        #[test]
+        fn resting_cube_contact_does_not_create_energy_over_many_steps() {
+            let mass = 2.0;
+            let inertia = CoreVec3::new(4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0);
+            let arm = CoreVec3::new(0.0, 0.0, -1.0);
+            let mut velocity = CoreVec3::ZERO;
+            let mut angular_momentum = CoreVec3::ZERO;
+            for _ in 0..10_000 {
+                apply_floor_constraint(
+                    mass,
+                    inertia,
+                    arm,
+                    &mut velocity,
+                    &mut angular_momentum,
+                    0.0,
+                );
+            }
+            assert_eq!(velocity, CoreVec3::ZERO);
+            assert_eq!(angular_momentum, CoreVec3::ZERO);
+        }
+
+        #[test]
+        fn equal_cubes_colliding_perfectly_inelastically_share_velocity() {
+            let mass_a = 2.0;
+            let mass_b = 2.0;
+            let mut velocity_a = 4.0;
+            let mut velocity_b = 0.0;
+            let momentum_before = mass_a * velocity_a + mass_b * velocity_b;
+            let impulse = rigid_pair_normal_impulse(mass_a, mass_b, velocity_b - velocity_a, 0.0);
+            velocity_a -= impulse / mass_a;
+            velocity_b += impulse / mass_b;
+            assert!((velocity_a - velocity_b).abs() < EPS);
+            assert!((mass_a * velocity_a + mass_b * velocity_b - momentum_before).abs() < EPS);
+        }
+
+        #[test]
+        fn equal_cubes_colliding_elastically_exchange_velocities_and_energy() {
+            let mass_a = 2.0;
+            let mass_b = 2.0;
+            let mut velocity_a = 4.0;
+            let mut velocity_b = -1.0;
+            let energy_before =
+                0.5 * mass_a * velocity_a * velocity_a + 0.5 * mass_b * velocity_b * velocity_b;
+            let impulse = rigid_pair_normal_impulse(mass_a, mass_b, velocity_b - velocity_a, 1.0);
+            velocity_a -= impulse / mass_a;
+            velocity_b += impulse / mass_b;
+            let energy_after =
+                0.5 * mass_a * velocity_a * velocity_a + 0.5 * mass_b * velocity_b * velocity_b;
+            assert!((velocity_a + 1.0).abs() < EPS);
+            assert!((velocity_b - 4.0).abs() < EPS);
+            assert!((energy_after - energy_before).abs() < EPS);
+        }
+
+        #[test]
+        fn unequal_inelastic_collision_conserves_momentum_and_loses_energy() {
+            let mass_a = 1.0;
+            let mass_b = 3.0;
+            let mut velocity_a: f32 = 6.0;
+            let mut velocity_b: f32 = -1.0;
+            let momentum_before = mass_a * velocity_a + mass_b * velocity_b;
+            let energy_before =
+                0.5 * mass_a * velocity_a.powi(2) + 0.5 * mass_b * velocity_b.powi(2);
+            let impulse = rigid_pair_normal_impulse(mass_a, mass_b, velocity_b - velocity_a, 0.0);
+            velocity_a -= impulse / mass_a;
+            velocity_b += impulse / mass_b;
+            let energy_after =
+                0.5 * mass_a * velocity_a.powi(2) + 0.5 * mass_b * velocity_b.powi(2);
+            assert!((mass_a * velocity_a + mass_b * velocity_b - momentum_before).abs() < EPS);
+            assert!(energy_after < energy_before);
+        }
+
+        #[test]
+        fn separating_cubes_receive_no_collision_impulse() {
+            assert_eq!(rigid_pair_normal_impulse(1.0, 1.0, 2.0, 0.5), 0.0);
+        }
+
+        #[test]
+        fn solid_wheel_rolls_without_slip_down_fixed_inclined_box() {
+            let mass = 2.0;
+            let radius = 0.5;
+            let angle = 20.0_f32.to_radians();
+            let downhill = CoreVec3::new(angle.cos(), 0.0, -angle.sin());
+            let normal = CoreVec3::new(angle.sin(), 0.0, angle.cos());
+            let contact_arm = normal * -radius;
+            // Cylinder axle is world Y. Only I_y participates in rolling.
+            let axial_inertia = 0.5 * mass * radius * radius;
+            let inertia = CoreVec3::new(axial_inertia, axial_inertia, axial_inertia);
+            let gravity = CoreVec3::new(0.0, 0.0, -9.81);
+            let dt = 1.0 / 1_000.0;
+            let duration = 0.75;
+            let steps = (duration / dt) as usize;
+            let mut velocity = CoreVec3::ZERO;
+            let mut angular_momentum = CoreVec3::ZERO;
+            let mut friction_impulse_sum = 0.0;
+
+            for _ in 0..steps {
+                velocity = velocity + gravity * dt;
+
+                // The fixed incline removes inward normal motion.
+                let omega = inverse_inertia_mul(inertia, angular_momentum);
+                let inward = (velocity + omega.cross(contact_arm)).dot(normal);
+                let normal_impulse =
+                    rigid_contact_impulse(mass, inertia, contact_arm, normal, inward, 0.0);
+                velocity = velocity + normal_impulse / mass;
+                angular_momentum = angular_momentum + contact_arm.cross(normal_impulse);
+
+                // Static rolling friction is a tangential no-slip constraint,
+                // not a spring force and not an arbitrary drag coefficient.
+                let omega = inverse_inertia_mul(inertia, angular_momentum);
+                let slip = (velocity + omega.cross(contact_arm)).dot(downhill);
+                let friction_impulse =
+                    -slip * rigid_effective_mass(mass, inertia, contact_arm, downhill);
+                let impulse = downhill * friction_impulse;
+                velocity = velocity + impulse / mass;
+                angular_momentum = angular_momentum + contact_arm.cross(impulse);
+                friction_impulse_sum += friction_impulse;
+            }
+
+            let omega = inverse_inertia_mul(inertia, angular_momentum);
+            let final_slip = (velocity + omega.cross(contact_arm)).dot(downhill);
+            let measured_acceleration = velocity.dot(downhill) / duration;
+            let expected_acceleration = (2.0 / 3.0) * 9.81 * angle.sin();
+            assert!(final_slip.abs() < 1.0e-4, "contact slip = {final_slip}");
+            assert!(
+                (measured_acceleration - expected_acceleration).abs() < 0.02,
+                "measured {measured_acceleration}, expected {expected_acceleration}"
+            );
+            assert!(
+                friction_impulse_sum < 0.0,
+                "static friction must point uphill"
+            );
+        }
+
+        #[test]
+        fn world_angular_velocity_is_heading_invariant_near_import_rotation() {
+            let imported =
+                Quat::from_euler_xyz(CoreVec3::new(-std::f32::consts::FRAC_PI_2, 0.0, 0.0));
+            let omega = CoreVec3::new(0.4, -0.2, 1.3);
+            let dt = 1.0 / 60.0;
+            let expected_delta = Quat::from_axis_angle(omega.normalized(), omega.length() * dt);
+            for yaw in [0.0_f32, 0.7, 1.8, 3.0, -2.4] {
+                let orientation = Quat::from_axis_angle(CoreVec3::Z, yaw) * imported;
+                let next = integrate_world_orientation(orientation, omega, dt);
+                let measured_delta = next * orientation.inverse();
+                assert!(measured_delta.approx_eq(expected_delta, 1.0e-5));
+            }
+        }
+
+        #[test]
+        fn flat_floor_vertex_response_is_independent_of_world_heading() {
+            let mass = 2.0;
+            let inertia = CoreVec3::new(4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0);
+            let base_arm = CoreVec3::new(1.0, 0.5, -1.0);
+            let mut reference_energy: Option<f32> = None;
+            for yaw in [0.0_f32, 0.8, 1.7, 2.9, -2.2] {
+                let arm = Quat::from_axis_angle(CoreVec3::Z, yaw).rotate(base_arm);
+                let mut velocity = CoreVec3::new(0.0, 0.0, -4.0);
+                let mut momentum = CoreVec3::ZERO;
+                apply_floor_constraint(mass, inertia, arm, &mut velocity, &mut momentum, 0.0);
+                assert!(contact_normal_speed(inertia, arm, velocity, momentum).abs() < EPS);
+                let energy = rigid_kinetic_energy(mass, inertia, velocity, momentum);
+                if let Some(reference) = reference_energy {
+                    assert!((energy - reference).abs() < EPS);
+                } else {
+                    reference_energy = Some(energy);
+                }
+            }
+        }
     }
 }
