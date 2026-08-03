@@ -19,6 +19,7 @@ zerofps-telemetry = { path = "../zerofps-telemetry" }
 pollster = "0.4"
 wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 
 [[bin]]
 name = "zerofps-editor"

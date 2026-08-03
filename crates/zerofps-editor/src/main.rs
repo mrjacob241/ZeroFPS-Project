@@ -8,6 +8,7 @@ mod compositor_compile;
 mod compositor_cpu;
 mod compositor_graph;
 mod dynamics;
+mod multiplayer;
 mod vulkan_compositor;
 mod vulkan_runtime;
 mod vulkan_viewport;
@@ -39,6 +40,7 @@ use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
 
 use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
 use crate::dynamics::{ClothSettings, ClothState, MeshScalarField, PaintMode, WindField, heatmap};
+use crate::multiplayer::{MultiplayerClient, MultiplayerEvent};
 
 fn main() -> eframe::Result<()> {
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
@@ -533,6 +535,10 @@ enum NodeSettings {
         value: f32,
         rate: f32,
     },
+    Broadcast {
+        variable: String,
+        values: Vec<f32>,
+    },
     SharpThreshold {
         threshold: f32,
     },
@@ -724,6 +730,7 @@ impl NodeSettings {
             Self::KeyInput { .. } => 31,
             Self::MouseInput { .. } => 32,
             Self::Accumulator { .. } => 33,
+            Self::Broadcast { .. } => 34,
         }
     }
 
@@ -859,6 +866,10 @@ impl NodeSettings {
             33 => Self::Accumulator {
                 value: 0.0,
                 rate: 1.0,
+            },
+            34 => Self::Broadcast {
+                variable: "value".into(),
+                values: vec![0.0],
             },
             _ => return None,
         })
@@ -1030,12 +1041,12 @@ struct RenderJob {
     max_vram_bytes: u64,
     camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     lighting: ViewportLighting,
-    show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
     reusable_depth: Vec<f32>,
     device: RenderDevice,
     queued_at: Instant,
+    camera_input_started_at: Option<Instant>,
 }
 
 struct RenderResult {
@@ -1043,7 +1054,6 @@ struct RenderResult {
     frame: DepthFrame,
     camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     triangles: Arc<Vec<PreviewTriangle>>,
-    show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
     render_time: Duration,
@@ -1063,6 +1073,8 @@ struct RenderResult {
     renderer_initialization_time: Duration,
     device: RenderDevice,
     queue_wait: Duration,
+    camera_input_started_at: Option<Instant>,
+    worker_completed_at: Instant,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1118,6 +1130,13 @@ struct EditorPerformanceTelemetry {
     shadow_target_allocation: TimingMetric,
     viewport_initialization: TimingMetric,
     editor_overlay_prepare: TimingMetric,
+    mouse_event_to_register: TimingMetric,
+    input_register_to_camera: TimingMetric,
+    camera_to_viewport_submit: TimingMetric,
+    mouse_input_to_present: TimingMetric,
+    viewport_worker_to_gui: TimingMetric,
+    viewport_gui_to_paint: TimingMetric,
+    viewport_jobs_replaced: u64,
 }
 
 struct DisplayWorker {
@@ -1130,7 +1149,6 @@ struct DisplayWorker {
 struct PresentedView {
     camera: (f32, f32, f32, f32, CoreVec3, f32, ProjectionMode),
     triangles: Arc<Vec<PreviewTriangle>>,
-    show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
 }
@@ -1141,6 +1159,7 @@ struct InputSample {
     pan: Vec2,
     zoom_log: f32,
     viewport_extent: f32,
+    captured_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1151,11 +1170,12 @@ struct RuntimeInputSnapshot {
     viewport_extent: f32,
     sequence: u64,
     captured_at: Option<Instant>,
+    published_at: Option<Instant>,
 }
 
 struct InputWorker {
-    samples: mpsc::Sender<InputSample>,
     latest: Arc<Mutex<RuntimeInputSnapshot>>,
+    ctx: egui::Context,
 }
 
 struct ImportRequest {
@@ -1290,45 +1310,28 @@ impl AssetImportWorker {
 }
 
 impl InputWorker {
-    fn new(_ctx: egui::Context) -> Self {
-        let (sample_sender, sample_receiver) = mpsc::channel::<InputSample>();
+    fn new(ctx: egui::Context) -> Self {
         let latest = Arc::new(Mutex::new(RuntimeInputSnapshot::default()));
-        let worker_latest = Arc::clone(&latest);
-        std::thread::Builder::new()
-            .name("zerofps-input".into())
-            .spawn(move || {
-                while let Ok(first) = sample_receiver.recv() {
-                    let mut processed = RuntimeInputSnapshot {
-                        orbit: first.orbit,
-                        pan: first.pan,
-                        zoom_log: first.zoom_log,
-                        viewport_extent: first.viewport_extent,
-                        sequence: 0,
-                        captured_at: Some(Instant::now()),
-                    };
-                    for sample in sample_receiver.try_iter() {
-                        processed.orbit += sample.orbit;
-                        processed.pan += sample.pan;
-                        processed.zoom_log += sample.zoom_log;
-                        processed.viewport_extent = sample.viewport_extent;
-                        processed.captured_at = Some(Instant::now());
-                    }
-                    let mut latest = worker_latest
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    processed.sequence = latest.sequence.wrapping_add(1);
-                    *latest = processed;
-                }
-            })
-            .expect("input worker thread should start");
-        Self {
-            samples: sample_sender,
-            latest,
-        }
+        Self { latest, ctx }
     }
 
     fn submit(&self, sample: InputSample) {
-        let _ = self.samples.send(sample);
+        // Input nodes publish directly to a tiny shared register. Do the same
+        // for editor camera input: queuing this through an OS-scheduled worker
+        // adds an avoidable frame before the camera can observe the event.
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        latest.orbit += sample.orbit;
+        latest.pan += sample.pan;
+        latest.zoom_log += sample.zoom_log;
+        latest.viewport_extent = sample.viewport_extent;
+        latest.captured_at = latest.captured_at.or(sample.captured_at);
+        latest.published_at = Some(Instant::now());
+        latest.sequence = latest.sequence.wrapping_add(1);
+        drop(latest);
+        self.ctx.request_repaint();
     }
 
     /// Samples the latest coalesced input without consuming it. The compiled-game
@@ -1339,6 +1342,20 @@ impl InputWorker {
             .latest
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn consume(&self) -> RuntimeInputSnapshot {
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = *latest;
+        latest.orbit = Vec2::ZERO;
+        latest.pan = Vec2::ZERO;
+        latest.zoom_log = 0.0;
+        latest.captured_at = None;
+        latest.published_at = None;
+        snapshot
     }
 }
 
@@ -1608,7 +1625,6 @@ impl DisplayWorker {
                             frame,
                             camera: job.camera,
                             triangles: job.triangles,
-                            show_grid: job.show_grid,
                             mode: job.mode,
                             tool: job.tool,
                             render_time: render_started.elapsed(),
@@ -1628,6 +1644,8 @@ impl DisplayWorker {
                             renderer_initialization_time,
                             device: job.device,
                             queue_wait,
+                            camera_input_started_at: job.camera_input_started_at,
+                            worker_completed_at: Instant::now(),
                         })
                         .is_err()
                     {
@@ -1648,13 +1666,17 @@ impl DisplayWorker {
         }
     }
 
-    fn submit_latest(&self, job: RenderJob) {
+    /// Returns true when an older pending (not yet started) frame was replaced.
+    fn submit_latest(&self, job: RenderJob) -> bool {
         if self.stopping.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         let (lock, ready) = &*self.pending;
-        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(job);
+        let mut pending = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let replaced = pending.replace(job).is_some();
+        drop(pending);
         ready.notify_one();
+        replaced
     }
 
     fn shutdown(&mut self) {
@@ -1894,7 +1916,6 @@ struct DepthCacheKey {
     global_shadow_resolution: u32,
     shadow_quality: usize,
     shadow_blur_radius: usize,
-    show_grid: bool,
     mode: ViewportMode,
     tool: Tool,
     device: RenderDevice,
@@ -1951,11 +1972,22 @@ struct EditorApp {
     compositor_key_last_tick: Instant,
     compositor_accumulator_last_tick: Instant,
     last_camera_input_at: Option<Instant>,
+    camera_input_started_at: Option<Instant>,
+    camera_input_applied_at: Option<Instant>,
     gui_input_sequence: u64,
     gui_last_input_at: Option<Instant>,
     gui_last_event: String,
     game_input_sequence: u64,
     game_last_input_at: Option<Instant>,
+    multiplayer: MultiplayerClient,
+    server_url: String,
+    server_lobby: String,
+    server_player: String,
+    server_status: String,
+    server_connected: bool,
+    multiplayer_values: HashMap<(String, String), Vec<f32>>,
+    multiplayer_latest: HashMap<String, Vec<f32>>,
+    multiplayer_last_sent: HashMap<usize, Vec<f32>>,
     dynamics_fields: HashMap<NodeId, MeshScalarField>,
     dynamics_cloth: HashMap<NodeId, ClothState>,
     object_simulation_states: HashMap<usize, ObjectSimulationState>,
@@ -2004,6 +2036,8 @@ struct EditorApp {
     viewport_focused: bool,
     viewport_extent: f32,
     editor_camera_input_consumed: bool,
+    editor_orbit_drag_active: bool,
+    editor_pan_drag_active: bool,
     camera_yaw: f32,
     camera_pitch: f32,
     camera_zoom: f32,
@@ -2041,6 +2075,8 @@ struct EditorApp {
     asset_import_worker: AssetImportWorker,
     viewport_requested_key: Option<DepthCacheKey>,
     viewport_render_in_flight: bool,
+    viewport_result_received_at: Option<Instant>,
+    viewport_present_input_started_at: Option<Instant>,
     presented_view: Option<PresentedView>,
     dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
     save_dialog_result: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -2050,6 +2086,135 @@ struct EditorApp {
 }
 
 impl EditorApp {
+    fn poll_multiplayer(&mut self, ctx: &egui::Context) {
+        let mut remote_changed = false;
+        while let Ok(event) = self.multiplayer.events.try_recv() {
+            match event {
+                MultiplayerEvent::Connected => {
+                    self.server_connected = true;
+                    self.server_status = "Connected".into();
+                    // A new server session has no knowledge of values sent by
+                    // the previous socket, even when they have not changed.
+                    self.multiplayer_last_sent.clear();
+                }
+                MultiplayerEvent::Disconnected(reason) => {
+                    self.server_connected = false;
+                    self.server_status = reason;
+                }
+                MultiplayerEvent::State(values) => {
+                    remote_changed = true;
+                    self.multiplayer_values.clear();
+                    self.multiplayer_latest.clear();
+                    for (player, variables) in values {
+                        for (variable, values) in variables {
+                            if player != self.server_player {
+                                self.multiplayer_latest
+                                    .insert(variable.clone(), values.clone());
+                            }
+                            self.multiplayer_values
+                                .insert((player.clone(), variable), values);
+                        }
+                    }
+                }
+                MultiplayerEvent::Update {
+                    player,
+                    variable,
+                    values,
+                } => {
+                    remote_changed = true;
+                    if player != self.server_player {
+                        self.multiplayer_latest
+                            .insert(variable.clone(), values.clone());
+                    }
+                    self.multiplayer_values.insert((player, variable), values);
+                }
+                MultiplayerEvent::Error(error) => {
+                    self.server_connected = false;
+                    self.server_status = format!("Error: {error}");
+                }
+            }
+            ctx.request_repaint();
+        }
+        if remote_changed {
+            // Remote array shape is part of the value. Grow/shrink matching
+            // nodes automatically so every received component is exposed.
+            for node in &mut self.compositor_nodes {
+                let NodeSettings::Broadcast { variable, values } = &mut node.settings else {
+                    continue;
+                };
+                if let Some(remote) = self.multiplayer_latest.get(variable) {
+                    values.resize(remote.len().clamp(1, 16), 0.0);
+                }
+            }
+            let broadcasts = self
+                .compositor_nodes
+                .iter()
+                .filter_map(|node| {
+                    matches!(node.settings, NodeSettings::Broadcast { .. }).then_some(node.id)
+                })
+                .collect::<Vec<_>>();
+            for id in broadcasts {
+                self.invalidate_compositor_from(id);
+            }
+            self.compositor_apply_due = Some(Instant::now());
+        }
+    }
+
+    fn tick_broadcast_nodes(&mut self) {
+        if !self.server_connected {
+            return;
+        }
+        let nodes = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| {
+                let NodeSettings::Broadcast { variable, values } = &node.settings else {
+                    return None;
+                };
+                Some((node.id, variable.clone(), values.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (id, variable, fallback) in nodes {
+            let packed_vector = self
+                .compositor_input_source(id, 0)
+                .ok()
+                .and_then(|(source, output)| {
+                    self.probe_compositor_node(source, output, &mut BTreeSet::new())
+                        .ok()
+                })
+                .and_then(|value| match value {
+                    CompositorProbeValue::Triple(values) => Some(values.to_vec()),
+                    _ => None,
+                });
+            let packed_vector_len = packed_vector.as_ref().map(Vec::len);
+            let values = packed_vector
+                .map(|values| values.into_iter().take(16).collect::<Vec<_>>())
+                .unwrap_or_else(|| {
+                    (0..fallback.len())
+                        .map(|input| {
+                            self.compositor_input_source(id, input)
+                                .ok()
+                                .and_then(|(source, output)| {
+                                    self.scalar_node_value(source, output, &mut BTreeSet::new())
+                                })
+                                .unwrap_or(fallback[input])
+                        })
+                        .collect::<Vec<_>>()
+                });
+            if let Some(vector_len) = packed_vector_len {
+                if let Some(node) = self.compositor_nodes.iter_mut().find(|node| node.id == id)
+                    && let NodeSettings::Broadcast { values, .. } = &mut node.settings
+                {
+                    values.resize(vector_len.clamp(1, 16), 0.0);
+                }
+            }
+            if self.multiplayer_last_sent.get(&id) != Some(&values) {
+                self.multiplayer.publish(variable, values.clone());
+                self.multiplayer_last_sent.insert(id, values);
+            }
+        }
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
         if let Some(render_state) = &cc.wgpu_render_state {
@@ -2111,11 +2276,22 @@ impl EditorApp {
             compositor_key_last_tick: Instant::now(),
             compositor_accumulator_last_tick: Instant::now(),
             last_camera_input_at: None,
+            camera_input_started_at: None,
+            camera_input_applied_at: None,
             gui_input_sequence: 0,
             gui_last_input_at: None,
             gui_last_event: "No GUI input received".into(),
             game_input_sequence: 0,
             game_last_input_at: None,
+            multiplayer: MultiplayerClient::new(),
+            server_url: "ws://127.0.0.1:8765".into(),
+            server_lobby: "default".into(),
+            server_player: format!("editor-{}", std::process::id()),
+            server_status: "Disconnected".into(),
+            server_connected: false,
+            multiplayer_values: HashMap::new(),
+            multiplayer_latest: HashMap::new(),
+            multiplayer_last_sent: HashMap::new(),
             dynamics_fields: HashMap::new(),
             dynamics_cloth: HashMap::new(),
             object_simulation_states: HashMap::new(),
@@ -2171,6 +2347,8 @@ impl EditorApp {
             viewport_focused: false,
             viewport_extent: 1.0,
             editor_camera_input_consumed: false,
+            editor_orbit_drag_active: false,
+            editor_pan_drag_active: false,
             camera_yaw: -0.55,
             camera_pitch: 0.42,
             camera_zoom: 1.0,
@@ -2219,6 +2397,8 @@ impl EditorApp {
             asset_import_worker: AssetImportWorker::new(cc.egui_ctx.clone()),
             viewport_requested_key: None,
             viewport_render_in_flight: false,
+            viewport_result_received_at: None,
+            viewport_present_input_started_at: None,
             presented_view: None,
             dialog_result: None,
             save_dialog_result: None,
@@ -3415,6 +3595,11 @@ impl EditorApp {
             ),
             ("editor.target_fps", self.target_fps.to_string()),
             ("editor.max_vram_gb", self.max_vram_gb.to_string()),
+            ("multiplayer.server_url", self.server_url.clone()),
+            ("multiplayer.lobby", self.server_lobby.clone()),
+            ("multiplayer.username", self.server_player.clone()),
+            // Retain the legacy key so older ZeroFPS builds can still read it.
+            ("multiplayer.player", self.server_player.clone()),
             (
                 "editor.save_cache_in_file",
                 self.save_cache_in_file.to_string(),
@@ -4104,6 +4289,16 @@ impl EditorApp {
                             .insert(format!("compositor.node.{id}.{suffix}"), value);
                     }
                 }
+                NodeSettings::Broadcast { variable, values } => {
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.broadcast_variable"),
+                        variable.clone(),
+                    );
+                    project.project.properties.insert(
+                        format!("compositor.node.{id}.broadcast_values"),
+                        serde_json::to_string(values).unwrap_or_else(|_| "[0.0]".into()),
+                    );
+                }
                 NodeSettings::Debug => {}
             }
         }
@@ -4178,6 +4373,19 @@ impl EditorApp {
             .and_then(|value| value.parse::<f32>().ok())
             .map(sanitize_max_vram_gb)
             .unwrap_or(self.max_vram_gb);
+        self.server_url = properties
+            .get("multiplayer.server_url")
+            .cloned()
+            .unwrap_or_else(|| self.server_url.clone());
+        self.server_lobby = properties
+            .get("multiplayer.lobby")
+            .cloned()
+            .unwrap_or_else(|| self.server_lobby.clone());
+        self.server_player = properties
+            .get("multiplayer.username")
+            .or_else(|| properties.get("multiplayer.player"))
+            .cloned()
+            .unwrap_or_else(|| self.server_player.clone());
         self.next_viewport_frame = Instant::now();
         self.save_cache_in_file = properties
             .get("editor.save_cache_in_file")
@@ -4710,6 +4918,23 @@ impl EditorApp {
                             .and_then(|value| value.parse().ok())
                             .unwrap_or(1.0),
                     },
+                    34 => NodeSettings::Broadcast {
+                        variable: properties
+                            .get(&format!("compositor.node.{id}.broadcast_variable"))
+                            .cloned()
+                            .unwrap_or_else(|| "value".into()),
+                        values: properties
+                            .get(&format!("compositor.node.{id}.broadcast_values"))
+                            .and_then(|value| serde_json::from_str::<Vec<f32>>(value).ok())
+                            .filter(|values| !values.is_empty())
+                            .or_else(|| {
+                                properties
+                                    .get(&format!("compositor.node.{id}.broadcast_value"))
+                                    .and_then(|value| value.parse::<f32>().ok())
+                                    .map(|value| vec![value])
+                            })
+                            .unwrap_or_else(|| vec![0.0]),
+                    },
                     _ => continue,
                 };
                 let legacy_graph_index = properties
@@ -5202,6 +5427,55 @@ impl EditorApp {
                     *value = 0.0;
                     changed = true;
                 }
+            }
+            34 => {
+                let remote = self
+                    .compositor_nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .and_then(|node| match &node.settings {
+                        NodeSettings::Broadcast { variable, .. } => {
+                            self.multiplayer_latest.get(variable).cloned()
+                        }
+                        _ => None,
+                    });
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Broadcast { variable, values } =
+                    &mut self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Variable");
+                changed |= ui.text_edit_singleline(variable).changed();
+                let mut element_count = values.len().clamp(1, 16);
+                ui.label("Array elements");
+                if ui
+                    .add(egui::DragValue::new(&mut element_count).range(1..=16))
+                    .changed()
+                {
+                    values.resize(element_count, 0.0);
+                    changed = true;
+                }
+                ui.label("Fallback values");
+                for (index, value) in values.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("[{index}]"));
+                        changed |= ui.add(egui::DragValue::new(value).speed(0.01)).changed();
+                    });
+                }
+                ui.monospace(remote.map_or_else(
+                    || "Remote: —".into(),
+                    |values| format!("Remote: {values:?}"),
+                ));
+                ui.small(if self.server_connected {
+                    "Publishing while connected"
+                } else {
+                    "Connect through Game-Server"
+                });
             }
             5 => {
                 let pos = self
@@ -6267,6 +6541,26 @@ impl EditorApp {
                             ui.small("Prototype surface");
                         });
                     }
+                    ui.menu_button("Game-Server", |ui| {
+                        ui.set_min_width(330.0);
+                        ui.strong("WebSocket lobby relay");
+                        let mut settings_changed = false;
+                        ui.horizontal(|ui| { ui.label("URL"); settings_changed |= ui.text_edit_singleline(&mut self.server_url).changed(); });
+                        ui.horizontal(|ui| { ui.label("Lobby"); settings_changed |= ui.text_edit_singleline(&mut self.server_lobby).changed(); });
+                        ui.horizontal(|ui| { ui.label("Username"); settings_changed |= ui.text_edit_singleline(&mut self.server_player).changed(); });
+                        self.project_dirty |= settings_changed;
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!self.server_connected, egui::Button::new("Connect")).clicked() {
+                                self.server_status = "Connecting…".into();
+                                self.multiplayer.connect(self.server_url.trim().into(), self.server_lobby.trim().into(), self.server_player.trim().into());
+                            }
+                            if ui.add_enabled(self.server_connected, egui::Button::new("Disconnect")).clicked() {
+                                self.multiplayer.disconnect();
+                            }
+                            ui.label(if self.server_connected { RichText::new(&self.server_status).color(Color32::LIGHT_GREEN) } else { RichText::new(&self.server_status).color(Color32::YELLOW) });
+                        });
+                        ui.small("Manual editor connection · username is unique inside the selected lobby");
+                    });
                     ui.menu_button("Settings", |ui| {
                         ui.strong("Device");
                         let previous_device = self.render_device;
@@ -6404,7 +6698,10 @@ impl EditorApp {
                         });
                         ui.separator();
                         ui.strong("Viewport");
-                        ui.checkbox(&mut self.show_grid, "Show grid");
+                        if ui.checkbox(&mut self.show_grid, "Show grid").changed() {
+                            self.project_dirty = true;
+                            ui.ctx().request_repaint();
+                        }
                         egui::ComboBox::from_id_salt("global_shadow_resolution")
                             .selected_text(if self.global_shadow_resolution == 0 {
                                 "Global shadows: Off".into()
@@ -6518,7 +6815,21 @@ impl EditorApp {
                         );
                         ui.separator();
                         ui.toggle_value(&mut self.snap, "⌗ Snap");
-                        ui.toggle_value(&mut self.show_grid, "Grid");
+                        let grid_label = if self.show_grid {
+                            "Grid: ON"
+                        } else {
+                            "Grid: OFF"
+                        };
+                        if ui
+                            .toggle_value(&mut self.show_grid, grid_label)
+                            .on_hover_text(
+                                "Disable grid and axis overlay generation immediately for performance testing",
+                            )
+                            .changed()
+                        {
+                            self.project_dirty = true;
+                            ui.ctx().request_repaint();
+                        }
                         ui.separator();
                         if ui
                             .button(if self.dynamics_running {
@@ -9126,11 +9437,31 @@ impl EditorApp {
             } else {
                 vertical_degrees
             })),
+            NodeSettings::Broadcast { variable, values } => Ok(CompositorProbeValue::Number(
+                self.multiplayer_latest
+                    .get(&variable)
+                    .and_then(|remote| remote.get(output))
+                    .copied()
+                    .or_else(|| values.get(output).copied())
+                    .unwrap_or(0.0),
+            )),
             NodeSettings::Accumulator { value, .. } => Ok(CompositorProbeValue::Number(value)),
             NodeSettings::Position { .. } | NodeSettings::Rotation { .. } => self
                 .transform_vector_value(node_id)
                 .map(|(values, _)| CompositorProbeValue::Triple(values))
                 .ok_or_else(|| "could not evaluate the XYZ value".into()),
+            NodeSettings::ObjectSimulator { .. } => self
+                .object_simulation_states
+                .get(&node_id)
+                .map(|state| {
+                    let value = if output == 0 {
+                        state.position
+                    } else {
+                        state.rotation_degrees
+                    };
+                    CompositorProbeValue::Triple([value.x, value.y, value.z])
+                })
+                .ok_or_else(|| "object simulator has no active state".into()),
             NodeSettings::Algebra { expression } => {
                 let program = compositor_graph::compile_algebra_expression(&expression)?;
                 let mut inputs = Vec::with_capacity(3);
@@ -9239,6 +9570,12 @@ impl EditorApp {
                 vertical_degrees
             }),
             NodeSettings::Accumulator { value, .. } => Some(value),
+            NodeSettings::Broadcast { variable, values } => self
+                .multiplayer_latest
+                .get(&variable)
+                .and_then(|remote| remote.get(output))
+                .copied()
+                .or_else(|| values.get(output).copied()),
             NodeSettings::Algebra { .. } => {
                 match self.probe_compositor_node(node_id, output, &mut BTreeSet::new()) {
                     Ok(CompositorProbeValue::Number(value)) => Some(value),
@@ -9773,6 +10110,23 @@ impl EditorApp {
                 let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
                 Ok(Arc::new(TextureAsset {
                     name: "compositor-accumulator".into(),
+                    width: 1,
+                    height: 1,
+                    pixels: vec![channel, channel, channel, 255],
+                    cached_mips: Vec::new(),
+                }))
+            }
+            NodeSettings::Broadcast { variable, values } => {
+                let value = self
+                    .multiplayer_latest
+                    .get(&variable)
+                    .and_then(|remote| remote.get(output))
+                    .copied()
+                    .or_else(|| values.get(output).copied())
+                    .unwrap_or(0.0);
+                let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                Ok(Arc::new(TextureAsset {
+                    name: "multiplayer-broadcast".into(),
                     width: 1,
                     height: 1,
                     pixels: vec![channel, channel, channel, 255],
@@ -12102,7 +12456,7 @@ impl EditorApp {
                     ui.separator();
                     ui.menu_button("Add", |ui| {
                         ui.menu_button("Input", |ui| {
-                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time"), (31, "Key Input"), (32, "Mouse Input"), (33, "Accumulator"), (19, "Painted Texture")] {
+                            for (index, label) in [(0, "Object Texture"), (1, "Image Asset"), (2, "Constant Value"), (14, "Object Handle"), (15, "Time"), (31, "Key Input"), (32, "Mouse Input"), (33, "Accumulator"), (34, "Broadcast"), (19, "Painted Texture")] {
                                 if compositor_add_button(ui, true, label) {
                                     self.activate_compositor_node(index);
                                 }
@@ -12245,7 +12599,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 34] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 35] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -12296,12 +12650,13 @@ impl EditorApp {
                     ("Key Input", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Mouse Input", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Accumulator", "Input", Color32::from_rgb(76, 122, 155)),
+                    ("Broadcast", "Network", Color32::from_rgb(66, 145, 168)),
                 ];
-                let node_heights_by_kind: [f32; 34] = [
+                let node_heights_by_kind: [f32; 35] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
                     175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
                     285.0, 235.0, 245.0, 285.0, 190.0,
-                    205.0, 205.0, 360.0, 210.0, 190.0, 190.0, 430.0, 330.0, 190.0,
+                    205.0, 205.0, 360.0, 210.0, 190.0, 190.0, 430.0, 330.0, 190.0, 210.0,
                 ];
                 let node_width = 230.0;
 
@@ -12309,10 +12664,7 @@ impl EditorApp {
                 if let Some(id) = self.compositor_pending_spawn.take() {
                     if let Some(node) = self.compositor_nodes.iter_mut().find(|n| n.id == id) {
                         let kind = node.settings.kind();
-                        let combine_mode = match &node.settings {
-                            NodeSettings::TextureCombine { mode, .. } => *mode,
-                            _ => 0,
-                        };
+                        let combine_mode = compositor_socket_variant(&node.settings);
                         let height = compositor_node_height(
                             node_heights_by_kind[kind],
                             kind,
@@ -12329,10 +12681,7 @@ impl EditorApp {
                     .filter(|node| node.object_index == object_index)
                     .map(|node| {
                         let kind = node.settings.kind();
-                        let combine_mode = match &node.settings {
-                            NodeSettings::TextureCombine { mode, .. } => *mode,
-                            _ => 0,
-                        };
+                        let combine_mode = compositor_socket_variant(&node.settings);
                         let height = compositor_node_height(
                             node_heights_by_kind[kind],
                             kind,
@@ -12369,7 +12718,13 @@ impl EditorApp {
                     // Check output sockets
                     'outer: for &(node_id, node_rect) in &node_id_rects {
                         let kind = self.compositor_nodes.iter().find(|n| n.id == node_id).map(|n| n.settings.kind()).unwrap_or(0);
-                        for out_idx in 0..compositor_output_count(kind) {
+                        let cm = self
+                            .compositor_nodes
+                            .iter()
+                            .find(|node| node.id == node_id)
+                            .map(|node| compositor_socket_variant(&node.settings))
+                            .unwrap_or(0);
+                        for out_idx in 0..compositor_output_count(kind, cm) {
                             if ptr.distance(output_socket(node_rect, kind, out_idx)) <= socket_radius {
                                 self.compositor_pending_output = if self.compositor_pending_output == Some((node_id, out_idx)) {
                                     None
@@ -12382,11 +12737,6 @@ impl EditorApp {
                             }
                         }
                         // Check input sockets
-                        let cm = if kind == 9 {
-                            self.compositor_nodes.iter().find(|n| n.id == node_id)
-                                .and_then(|n| if let NodeSettings::TextureCombine { mode, .. } = n.settings { Some(mode) } else { None })
-                                .unwrap_or(0)
-                        } else { 0 };
                         for input in 0..compositor_input_count(kind, cm) {
                             if ptr.distance(input_socket(node_rect, kind, input)) <= socket_radius {
                                 if let Some((from_id, from_out)) = self.compositor_pending_output.take() {
@@ -12506,7 +12856,7 @@ impl EditorApp {
                     let (title, _, header_color) = node_specs_by_kind[kind];
                     let is_output = matches!(kind, 17 | 18 | 28 | 29);
                     let selected = self.compositor_selected_node == node_id;
-                    let cm = if let NodeSettings::TextureCombine { mode, .. } = node.settings { mode } else { 0 };
+                    let cm = compositor_socket_variant(&node.settings);
 
                     painter.rect_filled(node_rect, 6.0, if selected { Color32::from_rgb(47, 50, 61) } else { Color32::from_rgb(36, 39, 48) });
                     let header_rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), 30.0 * scale));
@@ -12551,7 +12901,7 @@ impl EditorApp {
                     }
 
                     // Draw output sockets
-                    for out_idx in 0..compositor_output_count(kind) {
+                    for out_idx in 0..compositor_output_count(kind, cm) {
                         let pos = output_socket(node_rect, kind, out_idx);
                         painter.circle_filled(
                             pos,
@@ -12922,13 +13272,10 @@ impl EditorApp {
 
     fn sample_editor_camera_input_early(&mut self, ctx: &egui::Context) {
         self.editor_camera_input_consumed = false;
-        if self.workspace_tab != WorkspaceTab::Scene
-            || self.camera_preview_visible
-            || self.compositor_mouse_capture
-            || !self.viewport_focused
-        {
-            return;
-        }
+        let eligible = self.workspace_tab == WorkspaceTab::Scene
+            && !self.camera_preview_visible
+            && !self.compositor_mouse_capture
+            && self.viewport_focused;
         let (delta, secondary, middle, scroll) = ctx.input(|input| {
             (
                 input.pointer.delta(),
@@ -12937,17 +13284,60 @@ impl EditorApp {
                 input.smooth_scroll_delta.y,
             )
         });
+        let orbit_started = eligible && secondary && !self.editor_orbit_drag_active;
+        let pan_started = eligible && middle && !self.editor_pan_drag_active;
+        self.editor_orbit_drag_active = eligible && secondary;
+        self.editor_pan_drag_active = eligible && middle;
+        // The activation frame defines the drag origin; its pointer delta may
+        // include motion from before the button press and must not move camera.
+        self.editor_camera_input_consumed = orbit_started || pan_started;
+        if !eligible {
+            return;
+        }
         let sample = InputSample {
-            orbit: if secondary { delta } else { Vec2::ZERO },
-            pan: if middle { delta } else { Vec2::ZERO },
+            orbit: if secondary && !orbit_started {
+                delta
+            } else {
+                Vec2::ZERO
+            },
+            pan: if middle && !pan_started {
+                delta
+            } else {
+                Vec2::ZERO
+            },
             zoom_log: scroll * 0.001,
             viewport_extent: self.viewport_extent.max(1.0),
+            captured_at: Some(Instant::now()),
         };
         if sample.orbit != Vec2::ZERO || sample.pan != Vec2::ZERO || sample.zoom_log != 0.0 {
-            self.apply_editor_camera_input(sample);
-            self.last_camera_input_at = Some(Instant::now());
+            self.input_worker.submit(sample);
             self.editor_camera_input_consumed = true;
         }
+    }
+
+    fn consume_editor_camera_register(&mut self) {
+        let snapshot = self.input_worker.consume();
+        if snapshot.orbit == Vec2::ZERO && snapshot.pan == Vec2::ZERO && snapshot.zoom_log == 0.0 {
+            return;
+        }
+        if let (Some(captured), Some(published)) = (snapshot.captured_at, snapshot.published_at) {
+            self.performance
+                .mouse_event_to_register
+                .record(published.saturating_duration_since(captured));
+            self.performance
+                .input_register_to_camera
+                .record(published.elapsed());
+            self.camera_input_started_at = Some(captured);
+        }
+        self.apply_editor_camera_input(InputSample {
+            orbit: snapshot.orbit,
+            pan: snapshot.pan,
+            zoom_log: snapshot.zoom_log,
+            viewport_extent: snapshot.viewport_extent,
+            captured_at: snapshot.captured_at,
+        });
+        self.camera_input_applied_at = Some(Instant::now());
+        self.last_camera_input_at = Some(Instant::now());
     }
 
     fn viewport(&mut self, ctx: &egui::Context) {
@@ -13150,12 +13540,26 @@ impl EditorApp {
                         input.pointer.button_down(egui::PointerButton::Middle),
                     )
                 });
-                let orbit = if !self.editor_camera_input_consumed && pointer_owned && secondary_down {
+                let orbit_started = pointer_owned
+                    && secondary_down
+                    && !self.editor_orbit_drag_active;
+                let pan_started = pointer_owned && middle_down && !self.editor_pan_drag_active;
+                self.editor_orbit_drag_active = pointer_owned && secondary_down;
+                self.editor_pan_drag_active = pointer_owned && middle_down;
+                let orbit = if !self.editor_camera_input_consumed
+                    && pointer_owned
+                    && secondary_down
+                    && !orbit_started
+                {
                     pointer_delta
                 } else {
                     Vec2::ZERO
                 };
-                let pan = if !self.editor_camera_input_consumed && pointer_owned && middle_down {
+                let pan = if !self.editor_camera_input_consumed
+                    && pointer_owned
+                    && middle_down
+                    && !pan_started
+                {
                     pointer_delta
                 } else {
                     Vec2::ZERO
@@ -13171,9 +13575,9 @@ impl EditorApp {
                         pan,
                         zoom_log,
                         viewport_extent: response.rect.width().min(response.rect.height()),
+                        captured_at: Some(Instant::now()),
                     };
-                    self.apply_editor_camera_input(sample);
-                    self.last_camera_input_at = Some(Instant::now());
+                    self.input_worker.submit(sample);
                 }
                 // Capture the camera only after applying this frame's input.
                 // Previously the submitted render job always trailed the mouse
@@ -13229,7 +13633,6 @@ impl EditorApp {
                         global_shadow_resolution: self.global_shadow_resolution,
                         shadow_quality: self.shadow_quality,
                         shadow_blur_radius: self.shadow_blur_radius,
-                        show_grid: self.show_grid && scene_camera.is_none(),
                         mode: self.viewport_mode,
                         tool: self.active_tool,
                         device: self.render_device,
@@ -13239,6 +13642,12 @@ impl EditorApp {
                         newest_completed = Some(result);
                     }
                     if let Some(result) = newest_completed {
+                        let received_at = Instant::now();
+                        self.performance.viewport_worker_to_gui.record(
+                            received_at.saturating_duration_since(result.worker_completed_at),
+                        );
+                        self.viewport_result_received_at = Some(received_at);
+                        self.viewport_present_input_started_at = result.camera_input_started_at;
                         // A newer camera state may already occupy the worker's
                         // replaceable pending slot. Do not erase that request when
                         // an older in-flight frame completes.
@@ -13378,7 +13787,6 @@ impl EditorApp {
                         self.presented_view = Some(PresentedView {
                             camera: result.camera,
                             triangles: result.triangles,
-                            show_grid: result.show_grid,
                             mode: result.mode,
                             tool: result.tool,
                         });
@@ -13387,7 +13795,11 @@ impl EditorApp {
                         && self.viewport_requested_key != Some(key)
                         && viewport_frame_due
                     {
-                        self.display_worker.submit_latest(RenderJob {
+                        let camera_input_started_at = self.camera_input_started_at.take();
+                        if let Some(started) = self.camera_input_applied_at.take() {
+                            self.performance.camera_to_viewport_submit.record(started.elapsed());
+                        }
+                        let replaced = self.display_worker.submit_latest(RenderJob {
                             key,
                             viewport_size: render_rect.size(),
                             triangles: Arc::clone(&preview),
@@ -13397,13 +13809,19 @@ impl EditorApp {
                             max_vram_bytes: safe_vram_budget_bytes(self.max_vram_gb),
                             camera: render_camera,
                             lighting: lighting.clone(),
-                            show_grid: self.show_grid && scene_camera.is_none(),
                             mode: self.viewport_mode,
                             tool: self.active_tool,
                             reusable_depth: std::mem::take(&mut self.viewport_depth),
                             device: self.render_device,
                             queued_at: Instant::now(),
+                            camera_input_started_at,
                         });
+                        if replaced {
+                            self.performance.viewport_jobs_replaced = self
+                                .performance
+                                .viewport_jobs_replaced
+                                .saturating_add(1);
+                        }
                         self.viewport_requested_key = Some(key);
                         self.viewport_render_in_flight = true;
                     }
@@ -13424,7 +13842,7 @@ impl EditorApp {
                     draw_viewport(
                         &painter,
                         render_rect,
-                        presented.show_grid,
+                        self.show_grid && scene_camera.is_none(),
                         presented.tool,
                         presented.camera,
                         &presented.triangles,
@@ -13457,6 +13875,14 @@ impl EditorApp {
                     }
                 } else {
                     painter.rect_filled(response.rect, 0.0, Color32::from_rgb(21, 24, 31));
+                }
+                if let Some(received_at) = self.viewport_result_received_at.take() {
+                    self.performance
+                        .viewport_gui_to_paint
+                        .record(received_at.elapsed());
+                    if let Some(started) = self.viewport_present_input_started_at.take() {
+                        self.performance.mouse_input_to_present.record(started.elapsed());
+                    }
                 }
                 self.performance
                     .editor_overlay_prepare
@@ -13779,11 +14205,13 @@ impl eframe::App for EditorApp {
         )));
         self.track_gui_inputs(ctx);
         self.sample_editor_camera_input_early(ctx);
+        self.consume_editor_camera_register();
         self.tick_compositor_mouse(ctx);
         self.capture_compositor_key(ctx);
         self.tick_compositor_keys(ctx);
         self.tick_compositor_accumulators(ctx);
         self.poll_asset_imports();
+        self.poll_multiplayer(ctx);
         self.poll_save_as();
         self.poll_load_project();
         self.poll_compositor_image_import();
@@ -13809,6 +14237,9 @@ impl eframe::App for EditorApp {
         self.apply_object_transform_graphs();
         self.poll_compositor_apply(ctx);
         self.tick_dynamics(ctx);
+        // Publish after graph and physics updates so the network observes the
+        // current simulation tick rather than the previous frame's transform.
+        self.tick_broadcast_nodes();
         self.poll_build(ctx);
         self.shortcuts(ctx);
         self.top_bar(ctx);
@@ -14460,6 +14891,14 @@ fn step_compositor_mouse_recall(
     offset
 }
 
+fn compositor_socket_variant(settings: &NodeSettings) -> usize {
+    match settings {
+        NodeSettings::TextureCombine { mode, .. } => *mode,
+        NodeSettings::Broadcast { values, .. } => values.len().clamp(1, 16),
+        _ => 0,
+    }
+}
+
 fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
     match kind {
         0 | 1 | 2 | 14 | 15 | 19 | 31 | 32 => 0,
@@ -14471,6 +14910,7 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
             }
         }
         13 => 4,
+        34 => combine_mode.clamp(1, 16),
         17 | 25 | 26 | 28 | 30 => 3,
         18 => 1,
         22 => 3,
@@ -14484,7 +14924,7 @@ fn compositor_input_socket_y(kind: usize, input: usize) -> f32 {
     match kind {
         9 => 85.0 + input as f32 * 30.0,
         13 => 75.0 + input as f32 * 22.0,
-        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 | 30 => 74.0 + input as f32 * 26.0,
+        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 34 => 74.0 + input as f32 * 26.0,
         _ => 70.0,
     }
 }
@@ -14493,7 +14933,7 @@ fn compositor_output_socket_y(kind: usize, output: usize) -> f32 {
     match kind {
         11 => 70.0 + output as f32 * 22.0,
         32 => 70.0 + output as f32 * 28.0,
-        27 => 74.0 + output as f32 * 26.0,
+        27 | 34 => 74.0 + output as f32 * 26.0,
         _ => 70.0,
     }
 }
@@ -14502,7 +14942,7 @@ fn compositor_controls_top(kind: usize, combine_mode: usize) -> f32 {
     let input_bottom = compositor_input_count(kind, combine_mode)
         .checked_sub(1)
         .map(|input| compositor_input_socket_y(kind, input));
-    let output_bottom = compositor_output_count(kind)
+    let output_bottom = compositor_output_count(kind, combine_mode)
         .checked_sub(1)
         .map(|output| compositor_output_socket_y(kind, output));
     input_bottom
@@ -14516,18 +14956,22 @@ fn compositor_node_height(base_height: f32, kind: usize, combine_mode: usize) ->
     base_height + (compositor_controls_top(kind, combine_mode) - 62.0).max(0.0)
 }
 
-fn compositor_output_count(kind: usize) -> usize {
+fn compositor_output_count(kind: usize, variant: usize) -> usize {
     match kind {
         8 | 16 | 17 | 18 | 28 | 29 => 0,
         11 => 4,
         27 => 2,
         32 => 2,
+        34 => variant.clamp(1, 16),
         _ => 1,
     }
 }
 
-fn compositor_input_label(kind: usize, input: usize) -> &'static str {
-    match kind {
+fn compositor_input_label(kind: usize, input: usize) -> String {
+    if kind == 34 {
+        return format!("Send [{input}]");
+    }
+    (match kind {
         3 => "Value",
         4 => "Value",
         5 | 6 => "Value",
@@ -14550,11 +14994,15 @@ fn compositor_input_label(kind: usize, input: usize) -> &'static str {
         29 => ["Throttle", "Torque"][input],
         30 => ["X", "Y", "Z"][input],
         _ => "Input",
-    }
+    })
+    .to_owned()
 }
 
-fn compositor_output_label(kind: usize, output: usize) -> &'static str {
-    match kind {
+fn compositor_output_label(kind: usize, output: usize) -> String {
+    if kind == 34 {
+        return format!("Remote [{output}]");
+    }
+    (match kind {
         11 => ["R", "G", "B", "A"][output],
         20 => "Mass Field",
         21 => "Spring Mesh",
@@ -14570,7 +15018,8 @@ fn compositor_output_label(kind: usize, output: usize) -> &'static str {
         2 => "Value / Color",
         16 => "Preview",
         _ => "Output",
-    }
+    })
+    .to_owned()
 }
 
 fn compositor_node_description(kind: usize) -> &'static str {
@@ -14609,6 +15058,9 @@ fn compositor_node_description(kind: usize) -> &'static str {
         31 => "Outputs -1, 0, or +1 from two configurable keyboard keys.",
         32 => "Captures FPS-style mouse motion as horizontal and vertical angles.",
         33 => "Integrates its input over time using value += input × rate × dt.",
+        34 => {
+            "Packs numeric inputs into a JSON array and unpacks the latest remote array into outputs."
+        }
         _ => "Node",
     }
 }
@@ -15221,6 +15673,12 @@ fn telemetry_panel(
                 ui.monospace(metric.samples.to_string());
                 ui.end_row();
             }
+            ui.label("Replaced pending viewport jobs");
+            ui.monospace(performance.viewport_jobs_replaced.to_string());
+            ui.monospace("—");
+            ui.monospace("—");
+            ui.monospace("count");
+            ui.end_row();
         });
     ui.add_space(8.0);
     ui.small(
@@ -15231,8 +15689,32 @@ fn telemetry_panel(
 
 fn telemetry_metrics(
     performance: &EditorPerformanceTelemetry,
-) -> [(&'static str, TimingMetric); 29] {
+) -> [(&'static str, TimingMetric); 35] {
     [
+        (
+            "Mouse event → input register",
+            performance.mouse_event_to_register,
+        ),
+        (
+            "Input register → camera",
+            performance.input_register_to_camera,
+        ),
+        (
+            "Camera → viewport submission",
+            performance.camera_to_viewport_submit,
+        ),
+        (
+            "Mouse event → presented frame",
+            performance.mouse_input_to_present,
+        ),
+        (
+            "Worker completion → GUI receive",
+            performance.viewport_worker_to_gui,
+        ),
+        (
+            "GUI receive → paint submission",
+            performance.viewport_gui_to_paint,
+        ),
         ("Vulkan viewport worker", performance.viewport_vulkan),
         ("GPU batch preparation", performance.viewport_prepare),
         (
@@ -15240,7 +15722,10 @@ fn telemetry_metrics(
             performance.viewport_present,
         ),
         ("Editor overlays + grid", performance.editor_overlay_prepare),
-        ("Viewport queue wait", performance.viewport_queue_wait),
+        (
+            "Viewport submission → worker start",
+            performance.viewport_queue_wait,
+        ),
         (
             "Shadow preparation / GPU encoding",
             performance.shadow_prepare,
@@ -15318,6 +15803,10 @@ fn format_telemetry_report(performance: &EditorPerformanceTelemetry) -> String {
             metric.latest_ms, metric.average_ms, metric.maximum_ms, metric.samples
         ));
     }
+    report.push_str(&format!(
+        "Replaced pending viewport jobs\t{}\t—\t—\tcount\n",
+        performance.viewport_jobs_replaced
+    ));
     report
 }
 
@@ -20822,31 +21311,34 @@ mod tests {
         assert_eq!(compositor_input_count(25, 0), 3);
         assert_eq!(compositor_input_count(26, 0), 3);
         assert_eq!(compositor_input_count(27, 0), 2);
-        assert_eq!(compositor_output_count(11), 4);
-        assert_eq!(compositor_output_count(25), 1);
-        assert_eq!(compositor_output_count(26), 1);
-        assert_eq!(compositor_output_count(27), 2);
-        assert_eq!(compositor_output_count(0), 1);
+        assert_eq!(compositor_output_count(11, 0), 4);
+        assert_eq!(compositor_output_count(25, 0), 1);
+        assert_eq!(compositor_output_count(26, 0), 1);
+        assert_eq!(compositor_output_count(27, 0), 2);
+        assert_eq!(compositor_output_count(0, 0), 1);
         assert_eq!(compositor_input_count(28, 0), 3);
-        assert_eq!(compositor_output_count(28), 0);
+        assert_eq!(compositor_output_count(28, 0), 0);
         assert_eq!(compositor_input_count(30, 0), 3);
-        assert_eq!(compositor_output_count(30), 1);
-        for kind in 0..31 {
+        assert_eq!(compositor_output_count(30, 0), 1);
+        assert_eq!(compositor_input_count(34, 3), 3);
+        assert_eq!(compositor_output_count(34, 3), 3);
+        for kind in 0..35 {
+            let variant = if kind == 34 { 3 } else { 0 };
             assert!(!compositor_node_description(kind).is_empty());
-            for input in 0..compositor_input_count(kind, 0) {
+            for input in 0..compositor_input_count(kind, variant) {
                 assert!(!compositor_input_label(kind, input).is_empty());
             }
-            for output in 0..compositor_output_count(kind) {
+            for output in 0..compositor_output_count(kind, variant) {
                 assert!(!compositor_output_label(kind, output).is_empty());
             }
-            let socket_bottom = (0..compositor_input_count(kind, 0))
+            let socket_bottom = (0..compositor_input_count(kind, variant))
                 .map(|input| compositor_input_socket_y(kind, input))
                 .chain(
-                    (0..compositor_output_count(kind))
+                    (0..compositor_output_count(kind, variant))
                         .map(|output| compositor_output_socket_y(kind, output)),
                 )
                 .fold(0.0_f32, f32::max);
-            assert!(compositor_controls_top(kind, 0) >= socket_bottom + 20.0);
+            assert!(compositor_controls_top(kind, variant) >= socket_bottom + 20.0);
         }
         assert!(
             compositor_controls_top(9, 1) > compositor_controls_top(9, 0),
@@ -21127,7 +21619,48 @@ mod tests {
         assert!(report.contains("GPU viewport timestamp"));
         assert!(report.contains("Vulkan renderer initialization"));
         assert!(report.contains("Editor overlays + grid"));
-        assert_eq!(report.lines().count(), 30);
+        assert!(report.contains("Mouse event → input register"));
+        assert!(report.contains("Input register → camera"));
+        assert!(report.contains("Camera → viewport submission"));
+        assert!(report.contains("Mouse event → presented frame"));
+        assert!(report.contains("Viewport submission → worker start"));
+        assert!(report.contains("Worker completion → GUI receive"));
+        assert!(report.contains("GUI receive → paint submission"));
+        assert!(report.contains("Replaced pending viewport jobs\t0"));
+        assert_eq!(report.lines().count(), 37);
+    }
+
+    #[test]
+    fn input_register_publishes_immediately_and_coalesces_before_consumption() {
+        let worker = InputWorker::new(egui::Context::default());
+        worker.submit(InputSample {
+            orbit: Vec2::new(2.0, -1.0),
+            pan: Vec2::ZERO,
+            zoom_log: 0.1,
+            viewport_extent: 400.0,
+            captured_at: Some(Instant::now()),
+        });
+        worker.submit(InputSample {
+            orbit: Vec2::new(3.0, 4.0),
+            pan: Vec2::new(1.0, 2.0),
+            zoom_log: -0.05,
+            viewport_extent: 500.0,
+            captured_at: Some(Instant::now()),
+        });
+
+        let snapshot = worker.consume();
+        assert_eq!(snapshot.orbit, Vec2::new(5.0, 3.0));
+        assert_eq!(snapshot.pan, Vec2::new(1.0, 2.0));
+        assert!((snapshot.zoom_log - 0.05).abs() < f32::EPSILON);
+        assert_eq!(snapshot.viewport_extent, 500.0);
+        assert_eq!(snapshot.sequence, 2);
+        assert!(snapshot.captured_at.is_some());
+        assert!(snapshot.published_at.is_some());
+
+        let consumed = worker.consume();
+        assert_eq!(consumed.orbit, Vec2::ZERO);
+        assert_eq!(consumed.pan, Vec2::ZERO);
+        assert_eq!(consumed.zoom_log, 0.0);
     }
 
     #[test]

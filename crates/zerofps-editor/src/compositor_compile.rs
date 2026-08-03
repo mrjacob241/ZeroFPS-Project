@@ -286,6 +286,17 @@ impl Compiler<'_> {
             NodeSettings::Accumulator { value, .. } => {
                 self.add_source(GraphSource::Constant([value, value, value, 1.0]))
             }
+            NodeSettings::Broadcast { variable, values } => {
+                let remote = self
+                    .app
+                    .multiplayer_latest
+                    .get(&variable)
+                    .and_then(|remote| remote.get(socket.1))
+                    .copied()
+                    .or_else(|| values.get(socket.1).copied())
+                    .unwrap_or(0.0);
+                self.add_source(GraphSource::Constant([remote, remote, remote, 1.0]))
+            }
             // Debug is a sink and therefore has no connectable graph output.
             // This branch only satisfies exhaustive loading of legacy or
             // hand-edited project data; socket validation rejects it first.

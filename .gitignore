@@ -5,3 +5,5 @@
 *.zfp-cache
 *.zfp-cache.tmp
 .DS_Store
+__pycache__/
+*.py[cod]
