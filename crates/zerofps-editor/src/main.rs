@@ -214,6 +214,9 @@ impl Default for EditorScene {
 }
 
 impl EditorScene {
+    const PROTO_MARKER: &'static str = "zerofps:proto";
+    const PROTO_HIDDEN_MARKER: &'static str = "zerofps:proto-hidden";
+
     fn add(&mut self, name: &str, kind: ObjectKind, parent: Option<NodeId>) -> NodeId {
         let id = self
             .tree
@@ -273,8 +276,86 @@ impl EditorScene {
         )
     }
 
+    fn is_proto_root(&self, id: NodeId) -> bool {
+        self.tree.node(id).is_ok_and(|node| {
+            node.components.iter().any(|component| {
+                matches!(component, Component::Marker { kind } if kind == Self::PROTO_MARKER)
+            })
+        })
+    }
+
+    /// Proto status is inherited by the complete geometry subtree. A child
+    /// never needs a duplicate marker merely because its root is spawnable.
+    fn proto_root(&self, mut id: NodeId) -> Option<NodeId> {
+        loop {
+            if self.is_proto_root(id) {
+                return Some(id);
+            }
+            id = self.tree.node(id).ok()?.parent()?;
+        }
+    }
+
+    fn is_proto(&self, id: NodeId) -> bool {
+        self.proto_root(id).is_some()
+    }
+
+    fn set_proto(&mut self, id: NodeId, enabled: bool) -> Result<(), String> {
+        let node = self.tree.node_mut(id).map_err(|error| error.to_string())?;
+        node.components.retain(|component| {
+            !matches!(component, Component::Marker { kind } if kind == Self::PROTO_MARKER || (!enabled && kind == Self::PROTO_HIDDEN_MARKER))
+        });
+        if enabled {
+            node.components.push(Component::Marker {
+                kind: Self::PROTO_MARKER.into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn proto_hidden(&self, id: NodeId) -> bool {
+        self.proto_root(id).is_some_and(|root| {
+            self.tree.node(root).is_ok_and(|node| {
+                node.components.iter().any(|component| {
+                    matches!(component, Component::Marker { kind } if kind == Self::PROTO_HIDDEN_MARKER)
+                })
+            })
+        })
+    }
+
+    fn set_proto_hidden(&mut self, root: NodeId, hidden: bool) -> Result<(), String> {
+        let node = self
+            .tree
+            .node_mut(root)
+            .map_err(|error| error.to_string())?;
+        node.components.retain(|component| {
+            !matches!(component, Component::Marker { kind } if kind == Self::PROTO_HIDDEN_MARKER)
+        });
+        if hidden {
+            node.components.push(Component::Marker {
+                kind: Self::PROTO_HIDDEN_MARKER.into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn live_roots(&self) -> Vec<NodeId> {
+        self.tree
+            .roots()
+            .iter()
+            .copied()
+            .filter(|id| !self.is_proto(*id))
+            .collect()
+    }
+
+    fn proto_roots(&self) -> Vec<NodeId> {
+        self.tree
+            .iter()
+            .filter_map(|(id, _)| self.is_proto_root(id).then_some(id))
+            .collect()
+    }
+
     fn participates_in_physics(&self, id: NodeId) -> bool {
-        self.kind(id) != ObjectKind::Camera
+        !self.is_proto(id) && self.kind(id) != ObjectKind::Camera
     }
 
     fn remove_selected(&mut self) {
@@ -498,6 +579,7 @@ enum NodeSettings {
     ObjectTexture {
         object_index: usize,
         channel: usize,
+        material: String,
     },
     ImageAsset {
         path: String,
@@ -553,6 +635,7 @@ enum NodeSettings {
     Output {
         object_index: usize,
         channel: usize,
+        material: String,
     },
     TextureCombine {
         mode: usize,
@@ -739,6 +822,7 @@ impl NodeSettings {
             0 => Self::ObjectTexture {
                 object_index: 0,
                 channel: 0,
+                material: String::new(),
             },
             1 => Self::ImageAsset {
                 path: String::new(),
@@ -768,6 +852,7 @@ impl NodeSettings {
             8 => Self::Output {
                 object_index: 0,
                 channel: 0,
+                material: String::new(),
             },
             9 => Self::TextureCombine {
                 mode: 0,
@@ -899,6 +984,7 @@ struct JointSimulationState {
     angular_velocity: f32,
 }
 
+#[derive(Clone)]
 struct CompositorNode {
     id: usize,
     object_index: usize,
@@ -906,6 +992,26 @@ struct CompositorNode {
     settings_object_name: Option<String>,
     settings: NodeSettings,
     position: Vec2,
+}
+
+#[derive(Clone)]
+struct ObjectClipboard {
+    tree: GeometryTree,
+    root: NodeId,
+    nodes: Vec<CompositorNode>,
+    links: Vec<(usize, usize, usize, usize)>,
+    fields: HashMap<NodeId, MeshScalarField>,
+    masks: HashMap<NodeId, PaintedMask>,
+}
+
+enum HierarchyAction {
+    Proto(bool),
+    ProtoVisibility { root: NodeId, hidden: bool },
+    Copy,
+    PasteChild,
+    PasteSibling,
+    Rename,
+    Delete,
 }
 
 enum CompositorProbeValue {
@@ -916,7 +1022,9 @@ enum CompositorProbeValue {
 
 struct PendingCompositorGraph {
     graph: Arc<compositor_graph::CompiledGraph>,
+    output_node: usize,
     target: NodeId,
+    material: String,
 }
 
 #[derive(Clone, Copy)]
@@ -933,6 +1041,7 @@ struct PreviewVertex {
 #[derive(Clone)]
 struct PreviewTriangle {
     object_id: NodeId,
+    material_name: Option<String>,
     object_transform: Transform,
     vertices: [PreviewVertex; 3],
     base_color: [f32; 4],
@@ -1021,6 +1130,15 @@ struct DirectionalShadowCacheKey {
 enum TextureOverride {
     Cpu(Arc<TextureAsset>),
     Gpu(Arc<vulkan_runtime::GpuImage>),
+}
+
+#[derive(Clone)]
+struct MaterialTextureOverride {
+    output_node: usize,
+    target: NodeId,
+    /// Empty means every material below the target object.
+    material: String,
+    texture: TextureOverride,
 }
 
 struct DepthFrame {
@@ -1947,7 +2065,7 @@ struct EditorApp {
     compositor_mouse_offset: Vec2,
     compositor_mouse_window_position: Option<Pos2>,
     compositor_mouse_last_user_input: Option<Instant>,
-    compositor_texture_overrides: Vec<(NodeId, TextureOverride)>,
+    compositor_texture_overrides: Vec<MaterialTextureOverride>,
     compositor_eval_cache: HashMap<(usize, usize, u32), Arc<TextureAsset>>,
     compositor_gpu_cache: HashMap<(usize, usize, u32), Arc<vulkan_runtime::GpuImage>>,
     compositor_image_cache: HashMap<String, Arc<TextureAsset>>,
@@ -1965,7 +2083,7 @@ struct EditorApp {
     compositor_next_generation: u64,
     vulkan_latest_generation: u64,
     vulkan_waiting_generation: Option<u64>,
-    compositor_pending_target: Option<NodeId>,
+    compositor_pending_target: Option<(usize, NodeId, String)>,
     compositor_graph_queue: VecDeque<PendingCompositorGraph>,
     compositor_clock_started: Instant,
     compositor_next_time_tick: Instant,
@@ -2044,6 +2162,8 @@ struct EditorApp {
     camera_target: CoreVec3,
     hierarchy_filter: String,
     hierarchy_drag_candidate: Option<(NodeId, Instant)>,
+    object_clipboard: Option<ObjectClipboard>,
+    hierarchy_rename: Option<(NodeId, String)>,
     logs: Vec<LogEntry>,
     project_path: PathBuf,
     project_has_destination: bool,
@@ -2171,6 +2291,10 @@ impl EditorApp {
                 let NodeSettings::Broadcast { variable, values } = &node.settings else {
                     return None;
                 };
+                let id = self.object_node_id(node.object_index)?;
+                if self.scene.is_proto(id) {
+                    return None;
+                }
                 Some((node.id, variable.clone(), values.clone()))
             })
             .collect::<Vec<_>>();
@@ -2355,6 +2479,8 @@ impl EditorApp {
             camera_target: CoreVec3::ZERO,
             hierarchy_filter: String::new(),
             hierarchy_drag_candidate: None,
+            object_clipboard: None,
+            hierarchy_rename: None,
             logs: vec![
                 LogEntry {
                     level: "INFO",
@@ -2844,7 +2970,10 @@ impl EditorApp {
             .scene
             .tree
             .iter()
-            .filter_map(|(_, node)| {
+            .filter_map(|(id, node)| {
+                if self.scene.proto_hidden(id) {
+                    return None;
+                }
                 let (path, primitive) =
                     node.components
                         .iter()
@@ -2869,6 +2998,9 @@ impl EditorApp {
             .sum::<usize>();
         let mut output = Vec::with_capacity(total_scene_triangles);
         for (id, node) in self.scene.tree.iter() {
+            if self.scene.proto_hidden(id) {
+                continue;
+            }
             let Some((path, primitive_filter)) =
                 node.components
                     .iter()
@@ -2954,11 +3086,6 @@ impl EditorApp {
                     _ => None,
                 })
                 .unwrap_or([1.0; 4]);
-            let compositor_override = self
-                .compositor_texture_overrides
-                .iter()
-                .find(|(target, _)| *target == id)
-                .map(|(_, texture)| texture.clone());
             let deformation = self.dynamics_cloth.get(&id).map(|cloth| &cloth.snapshot);
             let field = self.dynamics_fields.get(&id);
             for (primitive_index, primitive) in asset.primitives.iter().enumerate() {
@@ -2969,6 +3096,12 @@ impl EditorApp {
                     .material
                     .as_ref()
                     .and_then(|name| asset.materials.get(name));
+                let compositor_override = inherited_texture_override(
+                    &self.scene.tree,
+                    &self.compositor_texture_overrides,
+                    id,
+                    material.map(|material| material.name.as_str()),
+                );
                 let source_base_color = material
                     .map(|material| material.base_color)
                     .unwrap_or([0.42, 0.64, 0.78, 1.0]);
@@ -3086,6 +3219,7 @@ impl EditorApp {
                     }
                     output.push(PreviewTriangle {
                         object_id: id,
+                        material_name: primitive.material.clone(),
                         object_transform: transform,
                         vertices,
                         base_color,
@@ -3114,21 +3248,22 @@ impl EditorApp {
         } else if self.cached_preview_texture_revision != self.texture_revision {
             let triangles = Arc::make_mut(&mut self.cached_preview);
             for triangle in triangles {
-                if let Some((_, texture)) = self
-                    .compositor_texture_overrides
-                    .iter()
-                    .find(|(target, _)| *target == triangle.object_id)
-                {
+                if let Some(texture) = inherited_texture_override(
+                    &self.scene.tree,
+                    &self.compositor_texture_overrides,
+                    triangle.object_id,
+                    triangle.material_name.as_deref(),
+                ) {
                     match texture {
                         TextureOverride::Cpu(texture) => {
-                            triangle.texture = Some(Arc::clone(texture));
-                            triangle.texture_cache_key = Arc::as_ptr(texture) as usize as u64;
+                            triangle.texture = Some(Arc::clone(&texture));
+                            triangle.texture_cache_key = Arc::as_ptr(&texture) as usize as u64;
                             triangle.gpu_texture = None;
                         }
                         TextureOverride::Gpu(texture) => {
                             triangle.texture = None;
                             triangle.texture_cache_key = 0;
-                            triangle.gpu_texture = Some(Arc::clone(texture));
+                            triangle.gpu_texture = Some(texture);
                         }
                     }
                     triangle.base_color = [1.0; 4];
@@ -3823,6 +3958,7 @@ impl EditorApp {
                 NodeSettings::ObjectTexture {
                     object_index,
                     channel,
+                    material,
                 } => {
                     project.project.properties.insert(
                         format!("compositor.node.{id}.object_index"),
@@ -3832,6 +3968,10 @@ impl EditorApp {
                         .project
                         .properties
                         .insert(format!("compositor.node.{id}.channel"), channel.to_string());
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.material"), material.clone());
                 }
                 NodeSettings::ImageAsset { path } => {
                     if !path.is_empty() {
@@ -3932,6 +4072,7 @@ impl EditorApp {
                 NodeSettings::Output {
                     object_index,
                     channel,
+                    material,
                 } => {
                     project.project.properties.insert(
                         format!("compositor.node.{id}.object_index"),
@@ -3941,6 +4082,10 @@ impl EditorApp {
                         .project
                         .properties
                         .insert(format!("compositor.node.{id}.channel"), channel.to_string());
+                    project
+                        .project
+                        .properties
+                        .insert(format!("compositor.node.{id}.material"), material.clone());
                 }
                 NodeSettings::TextureCombine {
                     mode,
@@ -4612,6 +4757,10 @@ impl EditorApp {
                     0 => NodeSettings::ObjectTexture {
                         object_index: get_usize(&format!("compositor.node.{id}.object_index")),
                         channel: get_usize(&format!("compositor.node.{id}.channel")),
+                        material: properties
+                            .get(&format!("compositor.node.{id}.material"))
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                     1 => {
                         let path = if let Some(p) =
@@ -4666,6 +4815,10 @@ impl EditorApp {
                     8 => NodeSettings::Output {
                         object_index: get_usize(&format!("compositor.node.{id}.object_index")),
                         channel: get_usize(&format!("compositor.node.{id}.channel")),
+                        material: properties
+                            .get(&format!("compositor.node.{id}.material"))
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                     9 => NodeSettings::TextureCombine {
                         mode: get_usize(&format!("compositor.node.{id}.combine_mode")),
@@ -5077,9 +5230,15 @@ impl EditorApp {
                     .iter()
                     .position(|n| n.id == node_id)
                     .unwrap();
+                let current_object = self.compositor_nodes[pos]
+                    .settings
+                    .object_index()
+                    .unwrap_or(0);
+                let materials = self.object_material_names(current_object);
                 let NodeSettings::ObjectTexture {
                     ref mut object_index,
                     ref mut channel,
+                    ref mut material,
                 } = self.compositor_nodes[pos].settings
                 else {
                     return;
@@ -5094,9 +5253,46 @@ impl EditorApp {
                     )
                     .show_ui(ui, |ui| {
                         for (index, name) in objects.iter().enumerate() {
-                            changed |= ui
+                            if ui
                                 .selectable_value(object_index, index, name.as_str())
+                                .changed()
+                            {
+                                *material = String::new();
+                                changed = true;
+                            }
+                        }
+                    });
+                if materials.len() == 1 && material.is_empty() {
+                    *material = materials[0].clone();
+                    changed = true;
+                }
+                ui.label("Material");
+                let material_label = if material.is_empty() {
+                    if materials.is_empty() {
+                        "Default material"
+                    } else {
+                        "All materials"
+                    }
+                } else {
+                    material.as_str()
+                };
+                egui::ComboBox::from_id_salt(("compositor_texture_material", node_id))
+                    .selected_text(material_label)
+                    .show_ui(ui, |ui| {
+                        if materials.len() > 1 {
+                            changed |= ui
+                                .selectable_value(material, String::new(), "All materials")
                                 .changed();
+                        }
+                        if materials.is_empty() {
+                            changed |= ui
+                                .selectable_value(material, String::new(), "Default material")
+                                .changed();
+                        } else {
+                            for name in &materials {
+                                changed |=
+                                    ui.selectable_value(material, name.clone(), name).changed();
+                            }
                         }
                     });
                 ui.label("Texture channel");
@@ -5556,9 +5752,15 @@ impl EditorApp {
                     .iter()
                     .position(|n| n.id == node_id)
                     .unwrap();
+                let current_object = self.compositor_nodes[pos]
+                    .settings
+                    .object_index()
+                    .unwrap_or(0);
+                let materials = self.object_material_names(current_object);
                 let NodeSettings::Output {
                     ref mut object_index,
                     ref mut channel,
+                    ref mut material,
                 } = self.compositor_nodes[pos].settings
                 else {
                     return;
@@ -5570,6 +5772,39 @@ impl EditorApp {
                         .map(String::as_str)
                         .unwrap_or("Object unavailable"),
                 );
+                if materials.len() == 1 && material.is_empty() {
+                    *material = materials[0].clone();
+                    changed = true;
+                }
+                ui.label("Target material");
+                let material_label = if material.is_empty() {
+                    if materials.is_empty() {
+                        "Default material"
+                    } else {
+                        "All materials"
+                    }
+                } else {
+                    material.as_str()
+                };
+                egui::ComboBox::from_id_salt(("compositor_output_material", node_id))
+                    .selected_text(material_label)
+                    .show_ui(ui, |ui| {
+                        if materials.len() > 1 {
+                            changed |= ui
+                                .selectable_value(material, String::new(), "All materials")
+                                .changed();
+                        }
+                        if materials.is_empty() {
+                            changed |= ui
+                                .selectable_value(material, String::new(), "Default material")
+                                .changed();
+                        } else {
+                            for name in &materials {
+                                changed |=
+                                    ui.selectable_value(material, name.clone(), name).changed();
+                            }
+                        }
+                    });
                 let channels = [
                     "Base Color",
                     "Normal",
@@ -6362,6 +6597,12 @@ impl EditorApp {
             } else {
                 self.invalidate_compositor_from(node_id);
             }
+            if self.compositor_node_drives_output(node_id) {
+                let now = Instant::now();
+                self.compositor_control_started = Some(now);
+                self.compositor_apply_due = Some(now + Duration::from_millis(8));
+                ui.ctx().request_repaint_after(Duration::from_millis(8));
+            }
         }
         self.project_dirty |= changed;
     }
@@ -6421,9 +6662,9 @@ impl EditorApp {
                 self.active_tool = Tool::Scale;
             }
             if ctx.input(|i| i.key_pressed(Key::Delete)) {
-                let previous = self.scene.tree.clone();
-                self.scene.remove_selected();
-                self.record_undo(previous);
+                if let Some(id) = self.scene.selected {
+                    self.delete_hierarchy_object(id);
+                }
             }
         }
         if ctx.input_mut(|i| {
@@ -6582,8 +6823,8 @@ impl EditorApp {
                             self.compositor_eval_cache.clear();
                             self.compositor_gpu_cache.clear();
                             if self.render_device == RenderDevice::Cpu {
-                                self.compositor_texture_overrides.retain(|(_, texture)| {
-                                    matches!(texture, TextureOverride::Cpu(_))
+                                self.compositor_texture_overrides.retain(|entry| {
+                                    matches!(entry.texture, TextureOverride::Cpu(_))
                                 });
                                 self.compositor_apply_due = Some(Instant::now());
                             }
@@ -6954,6 +7195,11 @@ impl EditorApp {
                         .hint_text("⌕  Filter objects")
                         .desired_width(f32::INFINITY),
                 );
+                ui.small(format!(
+                    "Live scene roots: {}  ·  Proto roots: {}",
+                    self.scene.live_roots().len(),
+                    self.scene.proto_roots().len()
+                ));
                 ui.add_space(5.0);
                 egui::ScrollArea::vertical()
                     .id_salt("scene_objects_scroll")
@@ -6998,6 +7244,42 @@ impl EditorApp {
                         }
                     });
             });
+
+        let mut rename_commit = None;
+        let mut rename_cancel = false;
+        if let Some((id, buffer)) = self.hierarchy_rename.as_mut() {
+            egui::Window::new("Rename Object")
+                .id(Id::new("rename_hierarchy_object"))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(buffer)
+                            .desired_width(280.0)
+                            .hint_text("Object name"),
+                    );
+                    response.request_focus();
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked()
+                            || response.lost_focus()
+                                && ui.input(|input| input.key_pressed(Key::Enter))
+                        {
+                            rename_commit = Some((*id, buffer.trim().to_owned()));
+                        }
+                        if ui.button("Cancel").clicked()
+                            || ui.input(|input| input.key_pressed(Key::Escape))
+                        {
+                            rename_cancel = true;
+                        }
+                    });
+                });
+        }
+        if rename_cancel {
+            self.hierarchy_rename = None;
+        } else if let Some((id, renamed)) = rename_commit {
+            self.rename_hierarchy_object(id, renamed);
+            self.hierarchy_rename = None;
+        }
     }
 
     fn object_tree(
@@ -7013,6 +7295,11 @@ impl EditorApp {
         let (display_name, name_truncated) = truncated_object_name(&name);
         let children = object.children().to_vec();
         let kind = self.scene.kind(id);
+        let proto_root = self.scene.proto_root(id);
+        let is_proto_root = proto_root == Some(id);
+        let is_inherited_proto = proto_root.is_some() && !is_proto_root;
+        let proto_hidden = self.scene.proto_hidden(id);
+        let mut action = None;
         let (_, dropped) = ui.dnd_drop_zone::<NodeId, _>(egui::Frame::new(), |ui| {
             let response = ui
                 .horizontal(|ui| {
@@ -7023,8 +7310,21 @@ impl EditorApp {
                         ui.add_space(11.0);
                     }
                     let selected = self.scene.selected == Some(id);
-                    let response =
-                        ui.selectable_label(selected, format!("{}  {}", kind.icon(), display_name));
+                    let proto_badge = if is_proto_root && proto_hidden {
+                        "  [PROTO hidden]"
+                    } else if is_proto_root {
+                        "  [PROTO]"
+                    } else if is_inherited_proto && proto_hidden {
+                        "  [proto hidden]"
+                    } else if is_inherited_proto {
+                        "  [proto]"
+                    } else {
+                        ""
+                    };
+                    let response = ui.selectable_label(
+                        selected,
+                        format!("{}  {}{}", kind.icon(), display_name, proto_badge),
+                    );
                     if name_truncated {
                         response.on_hover_ui(|ui| {
                             ui.strong(&name);
@@ -7040,6 +7340,70 @@ impl EditorApp {
                 Sense::click_and_drag(),
             );
             let row_response = drag_response | response;
+            row_response.context_menu(|ui| {
+                if let Some(root) = proto_root {
+                    if ui
+                        .button(if proto_hidden {
+                            "Show Proto"
+                        } else {
+                            "Hide Proto"
+                        })
+                        .clicked()
+                    {
+                        action = Some(HierarchyAction::ProtoVisibility {
+                            root,
+                            hidden: !proto_hidden,
+                        });
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
+                if is_inherited_proto {
+                    ui.add_enabled(false, egui::Button::new("Proto inherited from parent"));
+                    ui.small("Change Proto mode on the marked ancestor.");
+                } else if is_proto_root {
+                    if ui.button("Remove Proto / Spawnable").clicked() {
+                        action = Some(HierarchyAction::Proto(false));
+                        ui.close_menu();
+                    }
+                } else if ui.button("Set Proto / Spawnable").clicked() {
+                    action = Some(HierarchyAction::Proto(true));
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Copy").clicked() {
+                    action = Some(HierarchyAction::Copy);
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        self.object_clipboard.is_some(),
+                        egui::Button::new("Paste as Child"),
+                    )
+                    .clicked()
+                {
+                    action = Some(HierarchyAction::PasteChild);
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        self.object_clipboard.is_some(),
+                        egui::Button::new("Paste as Sibling"),
+                    )
+                    .clicked()
+                {
+                    action = Some(HierarchyAction::PasteSibling);
+                    ui.close_menu();
+                }
+                if ui.button("Rename").clicked() {
+                    action = Some(HierarchyAction::Rename);
+                    ui.close_menu();
+                }
+                if ui.button("Delete").clicked() {
+                    action = Some(HierarchyAction::Delete);
+                    ui.close_menu();
+                }
+            });
             if row_response.clicked() {
                 self.scene.selected = Some(id);
             }
@@ -7060,6 +7424,49 @@ impl EditorApp {
                 }
             }
         });
+        if let Some(action) = action {
+            match action {
+                HierarchyAction::Proto(enabled) => {
+                    let previous = self.scene.tree.clone();
+                    if self.scene.set_proto(id, enabled).is_ok() {
+                        self.record_undo(previous);
+                        self.scene_revision = self.scene_revision.wrapping_add(1);
+                        self.project_dirty = true;
+                        let live_count = self.scene.live_roots().len();
+                        let proto_count = self.scene.proto_roots().len();
+                        self.logs.push(LogEntry {
+                    level: "SCENE",
+                    color: Color32::from_rgb(235, 190, 80),
+                    message: format!(
+                        "{} `{name}` as Proto / Spawnable ({live_count} live scene roots, {proto_count} proto roots)",
+                        if enabled { "Marked" } else { "Unmarked" }
+                    ),
+                });
+                    }
+                }
+                HierarchyAction::ProtoVisibility { root, hidden } => {
+                    let previous = self.scene.tree.clone();
+                    if self.scene.set_proto_hidden(root, hidden).is_ok() {
+                        self.record_undo(previous);
+                        self.scene_revision = self.scene_revision.wrapping_add(1);
+                        self.project_dirty = true;
+                    }
+                }
+                HierarchyAction::Copy => self.copy_hierarchy_object(id),
+                HierarchyAction::PasteChild => self.paste_hierarchy_object(Some(id)),
+                HierarchyAction::PasteSibling => {
+                    let parent = self.scene.tree.node(id).ok().and_then(|node| node.parent());
+                    self.paste_hierarchy_object(parent);
+                }
+                HierarchyAction::Rename => {
+                    self.hierarchy_rename = Some((id, name.clone()));
+                }
+                HierarchyAction::Delete => {
+                    self.delete_hierarchy_object(id);
+                    return None;
+                }
+            }
+        }
         let mut reparent = dropped.map(|child| (*child, Some(id)));
         for child in children {
             if let Some(operation) = self.object_tree(ui, child, depth + 1) {
@@ -7067,6 +7474,277 @@ impl EditorApp {
             }
         }
         reparent
+    }
+
+    fn hierarchy_subtree_ids(tree: &GeometryTree, root: NodeId) -> Vec<NodeId> {
+        fn visit(tree: &GeometryTree, id: NodeId, output: &mut Vec<NodeId>) {
+            output.push(id);
+            if let Ok(node) = tree.node(id) {
+                for child in node.children() {
+                    visit(tree, *child, output);
+                }
+            }
+        }
+        let mut output = Vec::new();
+        visit(tree, root, &mut output);
+        output
+    }
+
+    fn copy_hierarchy_object(&mut self, root: NodeId) {
+        self.resolve_compositor_object_names();
+        let ids = Self::hierarchy_subtree_ids(&self.scene.tree, root);
+        let id_set = ids.iter().copied().collect::<BTreeSet<_>>();
+        let object_indices = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (id, _))| id_set.contains(&id).then_some(index))
+            .collect::<BTreeSet<_>>();
+        let nodes = self
+            .compositor_nodes
+            .iter()
+            .filter(|node| object_indices.contains(&node.object_index))
+            .cloned()
+            .collect::<Vec<_>>();
+        let node_ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
+        let links = self
+            .compositor_links
+            .iter()
+            .copied()
+            .filter(|(from, _, to, _)| node_ids.contains(from) && node_ids.contains(to))
+            .collect();
+        let fields = self
+            .dynamics_fields
+            .iter()
+            .filter(|(id, _)| id_set.contains(id))
+            .map(|(id, field)| (*id, field.clone()))
+            .collect();
+        let masks = self
+            .painted_masks
+            .iter()
+            .filter(|(id, _)| id_set.contains(id))
+            .map(|(id, mask)| (*id, mask.clone()))
+            .collect();
+        self.object_clipboard = Some(ObjectClipboard {
+            tree: self.scene.tree.clone(),
+            root,
+            nodes,
+            links,
+            fields,
+            masks,
+        });
+        let name = self
+            .scene
+            .tree
+            .node(root)
+            .map(|node| node.name.as_str())
+            .unwrap_or("Object");
+        self.logs.push(LogEntry {
+            level: "SCENE",
+            color: Color32::from_rgb(103, 191, 255),
+            message: format!("Copied `{name}` with its subtree, node graph, and painted data."),
+        });
+    }
+
+    fn unique_object_name(&self, requested: &str, reserved: &BTreeSet<String>) -> String {
+        let existing = self
+            .scene
+            .tree
+            .iter()
+            .map(|(_, node)| node.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if !existing.contains(requested) && !reserved.contains(requested) {
+            return requested.to_owned();
+        }
+        (2..)
+            .map(|number| format!("{requested} {number}"))
+            .find(|name| !existing.contains(name.as_str()) && !reserved.contains(name))
+            .unwrap()
+    }
+
+    fn paste_hierarchy_object(&mut self, parent: Option<NodeId>) {
+        let Some(clipboard) = self.object_clipboard.clone() else {
+            return;
+        };
+        let previous = self.scene.tree.clone();
+        let Ok((new_root, id_map)) =
+            self.scene
+                .tree
+                .clone_subtree_from(&clipboard.tree, clipboard.root, parent)
+        else {
+            return;
+        };
+
+        let mut reserved = BTreeSet::new();
+        let mut name_map = HashMap::new();
+        let mut copied_names = HashMap::new();
+        for (source, copied) in &id_map {
+            let old_name = clipboard.tree.node(*source).unwrap().name.clone();
+            let requested = if *source == clipboard.root {
+                format!("{old_name} Copy")
+            } else {
+                old_name.clone()
+            };
+            let new_name = self.unique_object_name(&requested, &reserved);
+            reserved.insert(new_name.clone());
+            self.scene.tree.node_mut(*copied).unwrap().name = new_name.clone();
+            name_map.insert(old_name, new_name);
+            copied_names.insert(*source, self.scene.tree.node(*copied).unwrap().name.clone());
+        }
+
+        let source_indices = clipboard
+            .tree
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _))| (index, id))
+            .collect::<HashMap<_, _>>();
+        let target_indices = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _))| (id, index))
+            .collect::<HashMap<_, _>>();
+        let index_map = source_indices
+            .iter()
+            .filter_map(|(old_index, old_id)| {
+                id_map
+                    .get(old_id)
+                    .and_then(|new_id| target_indices.get(new_id))
+                    .map(|new_index| (*old_index, *new_index))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut graph_id_map = HashMap::new();
+        for mut node in clipboard.nodes {
+            let old_id = node.id;
+            let old_object_index = node.object_index;
+            let old_settings_index = node.settings.object_index();
+            node.id = self.compositor_next_id;
+            self.compositor_next_id = self.compositor_next_id.wrapping_add(1);
+            graph_id_map.insert(old_id, node.id);
+            if let Some(index) = index_map.get(&node.object_index) {
+                node.object_index = *index;
+            }
+            if let Some(index) = node
+                .settings
+                .object_index()
+                .and_then(|index| index_map.get(&index))
+            {
+                node.settings.set_object_index(*index);
+            }
+            if let Some(name) = source_indices
+                .get(&old_object_index)
+                .and_then(|id| copied_names.get(id))
+                .or_else(|| name_map.get(&node.object_name))
+            {
+                node.object_name = name.clone();
+            }
+            if let Some(name) = old_settings_index
+                .and_then(|index| source_indices.get(&index))
+                .and_then(|id| copied_names.get(id))
+                .or_else(|| {
+                    node.settings_object_name
+                        .as_ref()
+                        .and_then(|name| name_map.get(name))
+                })
+            {
+                node.settings_object_name = Some(name.clone());
+            }
+            node.position += Vec2::splat(24.0);
+            self.compositor_nodes.push(node);
+        }
+        self.compositor_links
+            .extend(
+                clipboard
+                    .links
+                    .into_iter()
+                    .filter_map(|(from, output, to, input)| {
+                        Some((
+                            *graph_id_map.get(&from)?,
+                            output,
+                            *graph_id_map.get(&to)?,
+                            input,
+                        ))
+                    }),
+            );
+        for (source, field) in clipboard.fields {
+            if let Some(target) = id_map.get(&source) {
+                self.dynamics_fields.insert(*target, field);
+            }
+        }
+        for (source, mask) in clipboard.masks {
+            if let Some(target) = id_map.get(&source) {
+                self.painted_masks.insert(*target, mask);
+            }
+        }
+        self.scene.selected = Some(new_root);
+        self.record_undo(previous);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.texture_revision = self.texture_revision.wrapping_add(1);
+        self.project_dirty = true;
+        self.apply_compositor();
+    }
+
+    fn rename_hierarchy_object(&mut self, id: NodeId, renamed: String) {
+        if renamed.is_empty() {
+            return;
+        }
+        let Ok(node) = self.scene.tree.node(id) else {
+            return;
+        };
+        let previous_name = node.name.clone();
+        if previous_name == renamed {
+            return;
+        }
+        let renamed = self.unique_object_name(&renamed, &BTreeSet::new());
+        let previous = self.scene.tree.clone();
+        self.scene.tree.node_mut(id).unwrap().name = renamed.clone();
+        self.rename_compositor_object_reference(&previous_name, &renamed);
+        self.record_undo(previous);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+    }
+
+    fn delete_hierarchy_object(&mut self, root: NodeId) {
+        let ids = Self::hierarchy_subtree_ids(&self.scene.tree, root);
+        let id_set = ids.iter().copied().collect::<BTreeSet<_>>();
+        self.resolve_compositor_object_names();
+        let object_indices = self
+            .scene
+            .tree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (id, _))| id_set.contains(&id).then_some(index))
+            .collect::<BTreeSet<_>>();
+        let removed_graph_ids = self
+            .compositor_nodes
+            .iter()
+            .filter(|node| object_indices.contains(&node.object_index))
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        let previous = self.scene.tree.clone();
+        if self.scene.tree.remove(root).is_err() {
+            return;
+        }
+        self.compositor_nodes
+            .retain(|node| !removed_graph_ids.contains(&node.id));
+        self.compositor_links.retain(|(from, _, to, _)| {
+            !removed_graph_ids.contains(from) && !removed_graph_ids.contains(to)
+        });
+        self.dynamics_fields.retain(|id, _| !id_set.contains(id));
+        self.dynamics_cloth.retain(|id, _| !id_set.contains(id));
+        self.painted_masks.retain(|id, _| !id_set.contains(id));
+        self.compositor_texture_overrides
+            .retain(|entry| !id_set.contains(&entry.target));
+        if self.scene.selected.is_some_and(|id| id_set.contains(&id)) {
+            self.scene.selected = None;
+        }
+        self.record_undo(previous);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.texture_revision = self.texture_revision.wrapping_add(1);
+        self.project_dirty = true;
     }
 
     fn reparent_hierarchy_object(&mut self, child: NodeId, parent: Option<NodeId>) {
@@ -9082,6 +9760,7 @@ impl EditorApp {
             .tree
             .iter()
             .filter(|(id, _)| self.scene.visible(*id))
+            .filter(|(id, _)| !self.scene.is_proto(*id))
             .filter_map(|(_, node)| {
                 node.components
                     .iter()
@@ -9328,6 +10007,24 @@ impl EditorApp {
             .retain(|(cached_node, _, _), _| !affected.contains(cached_node));
     }
 
+    fn compositor_node_drives_output(&self, node_id: usize) -> bool {
+        let mut pending = vec![node_id];
+        let mut reachable = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if !reachable.insert(current) {
+                continue;
+            }
+            pending.extend(
+                self.compositor_links
+                    .iter()
+                    .filter_map(|&(from, _, to, _)| (from == current).then_some(to)),
+            );
+        }
+        self.compositor_nodes.iter().any(|node| {
+            reachable.contains(&node.id) && matches!(node.settings, NodeSettings::Output { .. })
+        })
+    }
+
     fn compositor_input_source(
         &self,
         to_id: usize,
@@ -9342,18 +10039,46 @@ impl EditorApp {
     }
 
     fn object_asset_path(&self, object_index: usize) -> Option<&str> {
-        self.scene
-            .tree
-            .iter()
-            .nth(object_index)
-            .and_then(|(_, node)| {
-                node.components
+        let (root, _) = self.scene.tree.iter().nth(object_index)?;
+        first_subtree_model_asset(&self.scene.tree, root)
+    }
+
+    fn object_material_names(&self, object_index: usize) -> Vec<String> {
+        fn collect(app: &EditorApp, id: NodeId, names: &mut BTreeSet<String>) {
+            let Ok(node) = app.scene.tree.node(id) else {
+                return;
+            };
+            for component in &node.components {
+                let Component::Model { asset, primitive } = component else {
+                    continue;
+                };
+                let Some(mesh) = app
+                    .imported_assets
                     .iter()
-                    .find_map(|component| match component {
-                        Component::Model { asset, .. } => Some(asset.as_str()),
-                        _ => None,
-                    })
-            })
+                    .find(|candidate| candidate.path == *asset)
+                    .map(|candidate| &candidate.mesh)
+                else {
+                    continue;
+                };
+                let primitives: Box<dyn Iterator<Item = _>> = match primitive {
+                    Some(index) => Box::new(mesh.primitives.get(*index).into_iter()),
+                    None => Box::new(mesh.primitives.iter()),
+                };
+                for material in primitives.filter_map(|primitive| primitive.material.as_ref()) {
+                    names.insert(material.clone());
+                }
+            }
+            for child in node.children() {
+                collect(app, *child, names);
+            }
+        }
+
+        let Some((root, _)) = self.scene.tree.iter().nth(object_index) else {
+            return Vec::new();
+        };
+        let mut names = BTreeSet::new();
+        collect(self, root, &mut names);
+        names.into_iter().collect()
     }
 
     fn object_node_id(&self, object_index: usize) -> Option<NodeId> {
@@ -9633,6 +10358,9 @@ impl EditorApp {
             let Some(id) = self.object_node_id(object_index) else {
                 continue;
             };
+            if self.scene.is_proto(id) {
+                continue;
+            }
             let Ok(node) = self.scene.tree.node(id) else {
                 continue;
             };
@@ -9862,7 +10590,11 @@ impl EditorApp {
             .map(|n| n.settings.clone())
             .ok_or_else(|| format!("node {} not found", node_id))?;
         let result = match settings {
-            NodeSettings::ObjectTexture { object_index, .. } => {
+            NodeSettings::ObjectTexture {
+                object_index,
+                material,
+                ..
+            } => {
                 let path = self
                     .object_asset_path(object_index)
                     .ok_or("Object Texture has no model object selected")?;
@@ -9872,19 +10604,28 @@ impl EditorApp {
                     .find(|asset| asset.path == path)
                     .map(|asset| &asset.mesh)
                     .ok_or("Object Texture model asset is unavailable")?;
-                let texture_name = mesh
-                    .primitives
-                    .iter()
-                    .filter_map(|primitive| primitive.material.as_ref())
-                    .filter_map(|name| mesh.materials.get(name))
-                    .find_map(|material| material.base_color_texture.as_ref())
-                    .ok_or("Object Texture source has no base-color texture")?;
-                let source = mesh
-                    .textures
-                    .get(texture_name)
-                    .cloned()
-                    .map(Arc::new)
-                    .ok_or_else(|| format!("texture `{texture_name}` is unavailable"))?;
+                let material = if material.is_empty() {
+                    mesh.primitives
+                        .iter()
+                        .filter_map(|primitive| primitive.material.as_ref())
+                        .filter_map(|name| mesh.materials.get(name))
+                        .next()
+                } else {
+                    mesh.materials.get(&material)
+                }
+                .ok_or("Object Texture source has no material")?;
+                let source = if let Some(texture_name) = &material.base_color_texture {
+                    mesh.textures
+                        .get(texture_name)
+                        .cloned()
+                        .map(Arc::new)
+                        .ok_or_else(|| format!("texture `{texture_name}` is unavailable"))?
+                } else {
+                    Arc::new(solid_color_texture(
+                        "material-base-color",
+                        material.base_color,
+                    ))
+                };
                 Ok(resize_texture_for_lod(&source, fallback_lod))
             }
             NodeSettings::PaintedMask { object_index } => {
@@ -10179,13 +10920,11 @@ impl EditorApp {
         for (output_id, object_index) in outputs {
             let target = self.object_node_id(object_index);
             if self.compositor_input_source(output_id, 0).is_err() {
-                if let Some(target) = target {
-                    let before = self.compositor_texture_overrides.len();
-                    self.compositor_texture_overrides
-                        .retain(|(id, _)| *id != target);
-                    if before != self.compositor_texture_overrides.len() {
-                        self.texture_revision = self.texture_revision.wrapping_add(1);
-                    }
+                let before = self.compositor_texture_overrides.len();
+                self.compositor_texture_overrides
+                    .retain(|entry| entry.output_node != output_id);
+                if before != self.compositor_texture_overrides.len() {
+                    self.texture_revision = self.texture_revision.wrapping_add(1);
                 }
                 continue;
             }
@@ -10205,7 +10944,9 @@ impl EditorApp {
                     self.compositor_graph_queue
                         .push_back(PendingCompositorGraph {
                             graph: Arc::new(compiled.graph),
+                            output_node: output_id,
                             target,
+                            material: compiled.material,
                         });
                 }
                 Ok(_) => {}
@@ -10238,7 +10979,8 @@ impl EditorApp {
         };
         let generation = pending.graph.generation;
         self.vulkan_latest_generation = generation;
-        self.compositor_pending_target = Some(pending.target);
+        self.compositor_pending_target =
+            Some((pending.output_node, pending.target, pending.material));
         self.vulkan_waiting_generation = Some(generation);
         if self.render_device == RenderDevice::Vulkan && self.ensure_vulkan_compositor() {
             self.vulkan_compositor
@@ -10739,7 +11481,7 @@ impl EditorApp {
                 .control_to_composite_ready
                 .record(started.elapsed());
         }
-        let Some(target) = self.compositor_pending_target.take() else {
+        let Some((output_node, target, material)) = self.compositor_pending_target.take() else {
             self.submit_next_compositor_graph();
             return;
         };
@@ -10757,15 +11499,15 @@ impl EditorApp {
         };
         match completed {
             Ok(texture) => {
-                if let Some((_, current)) = self
-                    .compositor_texture_overrides
-                    .iter_mut()
-                    .find(|(id, _)| *id == target)
-                {
-                    *current = texture;
-                } else {
-                    self.compositor_texture_overrides.push((target, texture));
-                }
+                self.compositor_texture_overrides
+                    .retain(|entry| entry.output_node != output_node);
+                self.compositor_texture_overrides
+                    .push(MaterialTextureOverride {
+                        output_node,
+                        target,
+                        material,
+                        texture,
+                    });
                 self.texture_revision = self.texture_revision.wrapping_add(1);
                 if let Some(started) = self.compositor_control_started {
                     self.compositor_present_revision = Some((self.texture_revision, started));
@@ -10852,6 +11594,7 @@ impl EditorApp {
             .tree
             .iter()
             .enumerate()
+            .filter(|(_, (id, _))| self.scene.participates_in_physics(*id))
             .filter_map(|(object_index, (id, _))| self.spring_graph_nodes(object_index).map(|_| id))
             .collect::<Vec<_>>();
         for id in graph_objects {
@@ -10866,19 +11609,23 @@ impl EditorApp {
             .min(0.1);
         self.dynamics_last_tick = now;
         let has_rigid_simulation = self.compositor_nodes.iter().any(|node| {
-            matches!(
-                node.settings,
-                NodeSettings::ObjectSimulator { .. } | NodeSettings::Engine { .. }
-            )
-        }) || self.scene.tree.iter().any(|(_, object)| {
-            object.components.iter().any(|component| {
-                matches!(
-                    component,
-                    Component::Collider { shape, joint, .. }
-                        if ColliderShape::from_storage(shape) == ColliderShape::Cylinder
-                            && CylinderJoint::from_storage(joint) == CylinderJoint::Wheel
-                )
-            })
+            let object_index = match node.settings {
+                NodeSettings::ObjectSimulator { object_index, .. }
+                | NodeSettings::Engine { object_index, .. } => object_index,
+                _ => return false,
+            };
+            self.object_node_id(object_index)
+                .is_some_and(|id| self.scene.participates_in_physics(id))
+        }) || self.scene.tree.iter().any(|(id, object)| {
+            self.scene.participates_in_physics(id)
+                && object.components.iter().any(|component| {
+                    matches!(
+                        component,
+                        Component::Collider { shape, joint, .. }
+                            if ColliderShape::from_storage(shape) == ColliderShape::Cylinder
+                                && CylinderJoint::from_storage(joint) == CylinderJoint::Wheel
+                    )
+                })
         });
         if (!self.dynamics_running && !self.dynamics_single_step)
             || (self.dynamics_enabled.is_empty() && !has_rigid_simulation)
@@ -12813,6 +13560,12 @@ impl EditorApp {
                         if !matches!(node.settings, NodeSettings::ObjectTransform { .. } | NodeSettings::ObjectMesh { .. } | NodeSettings::ForceOutput { .. }) {
                             self.compositor_nodes.retain(|n| n.id != sel);
                             self.compositor_links.retain(|&(fid, _, tid, _)| fid != sel && tid != sel);
+                            let before = self.compositor_texture_overrides.len();
+                            self.compositor_texture_overrides
+                                .retain(|entry| entry.output_node != sel);
+                            if before != self.compositor_texture_overrides.len() {
+                                self.texture_revision = self.texture_revision.wrapping_add(1);
+                            }
                             self.compositor_pending_output = None;
                             self.compositor_selected_node = self.compositor_nodes.iter().find(|n| n.object_index == object_index && matches!(n.settings, NodeSettings::ObjectMesh { .. })).map(|n| n.id).unwrap_or(0);
                             self.project_dirty = true;
@@ -13948,6 +14701,9 @@ impl EditorApp {
         let Some(id) = self.scene.selected else {
             return Vec::new();
         };
+        if self.scene.proto_hidden(id) {
+            return Vec::new();
+        }
         let Ok(node) = self.scene.tree.node(id) else {
             return Vec::new();
         };
@@ -13985,7 +14741,7 @@ impl EditorApp {
     fn camera_wireframes(&self) -> Vec<[[f32; 3]; 2]> {
         let mut output = Vec::new();
         for (id, node) in self.scene.tree.iter() {
-            if !self.scene.visible(id) {
+            if !self.scene.visible(id) || self.scene.proto_hidden(id) {
                 continue;
             }
             let Some(Component::Camera { .. }) = node
@@ -14032,7 +14788,7 @@ impl EditorApp {
 
     fn active_scene_camera(&self) -> Option<SceneCameraPreview> {
         self.scene.tree.iter().find_map(|(id, node)| {
-            if !self.scene.visible(id) {
+            if !self.scene.visible(id) || self.scene.is_proto(id) {
                 return None;
             }
             node.components.iter().find_map(|component| {
@@ -14189,7 +14945,7 @@ impl Drop for EditorApp {
         // renderer and native surface.
         self.compositor_gpu_cache.clear();
         self.compositor_texture_overrides
-            .retain(|(_, texture)| matches!(texture, TextureOverride::Cpu(_)));
+            .retain(|entry| matches!(entry.texture, TextureOverride::Cpu(_)));
         self.viewport_native_texture = None;
         self.viewport_native_view = None;
         self.viewport_color = None;
@@ -14409,6 +15165,65 @@ fn parse_compositor_position(value: &str) -> Option<Vec2> {
 
 fn object_index_by_name(names: &[String], target: &str) -> Option<usize> {
     names.iter().position(|name| name == target)
+}
+
+/// Resolve a model asset on an object or, for mesh-less grouping objects, on
+/// the first renderable descendant in stable hierarchy order.
+fn first_subtree_model_asset(tree: &GeometryTree, root: NodeId) -> Option<&str> {
+    let node = tree.node(root).ok()?;
+    if let Some(asset) = node
+        .components
+        .iter()
+        .find_map(|component| match component {
+            Component::Model { asset, .. } => Some(asset.as_str()),
+            _ => None,
+        })
+    {
+        return Some(asset);
+    }
+    node.children()
+        .iter()
+        .find_map(|child| first_subtree_model_asset(tree, *child))
+}
+
+/// Texture outputs cascade through geometry parents. Walking upward makes an
+/// exact/nearest override more specific than a group-level one. Reverse search
+/// also makes the newest result win while an asynchronous graph is replaced.
+fn inherited_texture_override(
+    tree: &GeometryTree,
+    overrides: &[MaterialTextureOverride],
+    mut id: NodeId,
+    material: Option<&str>,
+) -> Option<TextureOverride> {
+    loop {
+        let exact = material.and_then(|material| {
+            overrides
+                .iter()
+                .rev()
+                .find(|entry| entry.target == id && entry.material == material)
+        });
+        let inherited = overrides
+            .iter()
+            .rev()
+            .find(|entry| entry.target == id && entry.material.is_empty());
+        if let Some(entry) = exact.or(inherited) {
+            return Some(entry.texture.clone());
+        }
+        id = tree.node(id).ok()?.parent()?;
+    }
+}
+
+fn solid_color_texture(name: &str, color: [f32; 4]) -> TextureAsset {
+    TextureAsset {
+        name: name.into(),
+        width: 1,
+        height: 1,
+        pixels: color
+            .into_iter()
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect(),
+        cached_mips: Vec::new(),
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -20793,6 +21608,7 @@ mod tests {
                 slot: 0,
                 generation: 0,
             },
+            material_name: None,
             object_transform: Transform::IDENTITY,
             vertices: positions.map(|position| PreviewVertex {
                 source_index: 0,
@@ -21937,6 +22753,101 @@ mod tests {
 
         let model = scene.add("Model", ObjectKind::Model, None);
         assert!(scene.participates_in_physics(model));
+    }
+
+    #[test]
+    fn proto_marker_is_inherited_and_partitions_live_scene_roots() {
+        let mut scene = EditorScene::default();
+        let track = scene.add("Race Track", ObjectKind::Model, None);
+        let car = scene.add("Car", ObjectKind::Model, None);
+        let wheel = scene.add("Wheel", ObjectKind::Model, Some(car));
+
+        scene.set_proto(car, true).unwrap();
+        assert!(scene.is_proto_root(car));
+        assert!(scene.is_proto(car));
+        assert!(scene.is_proto(wheel));
+        assert_eq!(scene.proto_root(wheel), Some(car));
+        assert_eq!(scene.proto_roots(), vec![car]);
+        assert_eq!(scene.live_roots(), vec![track]);
+        assert!(!scene.participates_in_physics(car));
+        assert!(!scene.participates_in_physics(wheel));
+        assert!(scene.participates_in_physics(track));
+
+        scene.set_proto_hidden(car, true).unwrap();
+        assert!(scene.proto_hidden(car));
+        assert!(scene.proto_hidden(wheel));
+
+        let serialized = serde_json::to_string(&scene.tree).unwrap();
+        let restored: GeometryTree = serde_json::from_str(&serialized).unwrap();
+        scene.tree = restored;
+        assert!(scene.is_proto(car));
+        assert!(scene.is_proto(wheel));
+        assert!(scene.proto_hidden(wheel));
+
+        scene.set_proto(car, false).unwrap();
+        assert!(!scene.is_proto(car));
+        assert!(!scene.is_proto(wheel));
+        assert!(!scene.proto_hidden(car));
+        assert_eq!(scene.live_roots(), vec![track, car]);
+    }
+
+    #[test]
+    fn meshless_group_resolves_first_descendant_texture_asset() {
+        let mut tree = GeometryTree::new();
+        let group = tree.create("Chassis", None).unwrap();
+        let nested = tree.create("Body", Some(group)).unwrap();
+        let mesh = tree.create("Body Mesh", Some(nested)).unwrap();
+        tree.add_component(
+            mesh,
+            Component::Model {
+                asset: "assets/car.glb".into(),
+                primitive: Some(0),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_subtree_model_asset(&tree, group),
+            Some("assets/car.glb")
+        );
+    }
+
+    #[test]
+    fn compositor_texture_override_cascades_with_nearest_precedence() {
+        let mut tree = GeometryTree::new();
+        let car = tree.create("Car", None).unwrap();
+        let chassis = tree.create("Chassis", Some(car)).unwrap();
+        let body = tree.create("Body", Some(chassis)).unwrap();
+        let texture = |name: &str| {
+            TextureOverride::Cpu(Arc::new(TextureAsset {
+                name: name.into(),
+                width: 1,
+                height: 1,
+                pixels: vec![255, 255, 255, 255],
+                cached_mips: Vec::new(),
+            }))
+        };
+        let overrides = vec![
+            MaterialTextureOverride {
+                output_node: 1,
+                target: car,
+                material: String::new(),
+                texture: texture("car"),
+            },
+            MaterialTextureOverride {
+                output_node: 2,
+                target: chassis,
+                material: "Paint".into(),
+                texture: texture("chassis"),
+            },
+        ];
+
+        let Some(TextureOverride::Cpu(resolved)) =
+            inherited_texture_override(&tree, &overrides, body, Some("Paint"))
+        else {
+            panic!("expected inherited CPU texture");
+        };
+        assert_eq!(resolved.name, "chassis");
     }
 
     /// Headless rigid-body acceptance scenarios. These tests intentionally use

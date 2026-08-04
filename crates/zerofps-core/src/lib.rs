@@ -5,7 +5,7 @@
 //! components, not subclasses.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 const EPSILON: f32 = 1.0e-6;
@@ -660,6 +660,46 @@ impl GeometryTree {
         self.propagate_from(id)?;
         Ok(id)
     }
+
+    /// Deep-copy a subtree from another tree, preserving transforms,
+    /// components, and local attribute declarations. Returns the new root and
+    /// a complete source-to-copy handle map for attached editor data.
+    pub fn clone_subtree_from(
+        &mut self,
+        source_tree: &GeometryTree,
+        source: NodeId,
+        parent: Option<NodeId>,
+    ) -> Result<(NodeId, HashMap<NodeId, NodeId>), SceneError> {
+        fn clone_node(
+            target: &mut GeometryTree,
+            source_tree: &GeometryTree,
+            source: NodeId,
+            parent: Option<NodeId>,
+            mapping: &mut HashMap<NodeId, NodeId>,
+        ) -> Result<NodeId, SceneError> {
+            let source_node = source_tree.node(source)?.clone();
+            let copied = target.create(source_node.name, parent)?;
+            {
+                let target_node = target.node_mut(copied)?;
+                target_node.local = source_node.local;
+                target_node.components = source_node.components;
+                target_node.declarations = source_node.declarations;
+            }
+            mapping.insert(source, copied);
+            for child in source_node.children {
+                clone_node(target, source_tree, child, Some(copied), mapping)?;
+            }
+            target.propagate_from(copied)?;
+            Ok(copied)
+        }
+
+        if let Some(parent) = parent {
+            self.node(parent)?;
+        }
+        let mut mapping = HashMap::new();
+        let root = clone_node(self, source_tree, source, parent, &mut mapping)?;
+        Ok((root, mapping))
+    }
     /// Remove a whole subtree and invalidate every handle in it.
     pub fn remove(&mut self, id: NodeId) -> Result<Vec<NodeId>, SceneError> {
         self.node(id)?;
@@ -1221,5 +1261,52 @@ mod tests {
         let world = parent.compose(child);
         assert_eq!(world.scale, Vec3::new(10.0, 18.0, 28.0));
         assert_eq!(world.translation, Vec3::new(2.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn clone_subtree_remaps_handles_and_preserves_authored_data() {
+        let mut source = GeometryTree::new();
+        let root = source.create("car", None).unwrap();
+        let wheel = source.create("wheel", Some(root)).unwrap();
+        source.set_local_transform(wheel, t(1.0, 2.0, 3.0)).unwrap();
+        source
+            .add_component(
+                wheel,
+                Component::Marker {
+                    kind: "painted".into(),
+                },
+            )
+            .unwrap();
+        source
+            .set_attribute(
+                wheel,
+                AttributeKey::Visible,
+                AttributeDeclaration::Value(Attribute::Bool(false)),
+            )
+            .unwrap();
+
+        let mut target = GeometryTree::new();
+        let parent = target.create("scene", None).unwrap();
+        let (copy, mapping) = target
+            .clone_subtree_from(&source, root, Some(parent))
+            .unwrap();
+        let copied_wheel = mapping[&wheel];
+        assert_eq!(target.node(copy).unwrap().parent(), Some(parent));
+        assert_eq!(target.node(copied_wheel).unwrap().parent(), Some(copy));
+        assert_eq!(
+            target.node(copied_wheel).unwrap().local_transform(),
+            t(1.0, 2.0, 3.0)
+        );
+        assert_eq!(
+            target.node(copied_wheel).unwrap().components,
+            source.node(wheel).unwrap().components
+        );
+        assert_eq!(
+            target
+                .resolve_attribute(copied_wheel, &AttributeKey::Visible)
+                .unwrap()
+                .value,
+            Attribute::Bool(false)
+        );
     }
 }

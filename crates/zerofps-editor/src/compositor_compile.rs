@@ -20,6 +20,7 @@ pub(crate) struct CompiledCompositorOutput {
     pub graph: CompiledGraph,
     pub object_index: usize,
     pub channel: usize,
+    pub material: String,
 }
 
 struct Compiler<'a> {
@@ -50,11 +51,12 @@ impl EditorApp {
             .iter()
             .find(|node| node.id == output_node_id)
             .ok_or(GraphCompileError::MissingNode(output_node_id))?;
-        let (object_index, channel) = match output.settings {
+        let (object_index, channel, material) = match output.settings {
             NodeSettings::Output {
                 object_index,
                 channel,
-            } => (object_index, channel),
+                ref material,
+            } => (object_index, channel, material.clone()),
             _ => return Err(GraphCompileError::NotOutputNode(output_node_id)),
         };
         if channel != 0 {
@@ -88,6 +90,7 @@ impl EditorApp {
             },
             object_index,
             channel,
+            material,
         })
     }
 
@@ -160,6 +163,7 @@ impl Compiler<'_> {
             NodeSettings::ObjectTexture {
                 object_index,
                 channel,
+                material,
             } => {
                 if channel != 0 {
                     return Err(GraphCompileError::UnsupportedSourceChannel {
@@ -178,26 +182,38 @@ impl Compiler<'_> {
                     .find(|asset| asset.path == path)
                     .map(|asset| &asset.mesh)
                     .ok_or_else(|| source_error(socket.0, "selected model asset is unavailable"))?;
-                let texture_name = mesh
-                    .primitives
-                    .iter()
-                    .filter_map(|primitive| primitive.material.as_ref())
-                    .filter_map(|name| mesh.materials.get(name))
-                    .find_map(|material| material.base_color_texture.as_ref())
-                    .ok_or_else(|| source_error(socket.0, "model has no base-color texture"))?;
-                let source_key = format!("{path}\0{texture_name}");
+                let material = if material.is_empty() {
+                    mesh.primitives
+                        .iter()
+                        .filter_map(|primitive| primitive.material.as_ref())
+                        .filter_map(|name| mesh.materials.get(name))
+                        .next()
+                } else {
+                    mesh.materials.get(&material)
+                }
+                .ok_or_else(|| source_error(socket.0, "model has no material"))?;
+                let source_key = material.base_color_texture.as_ref().map_or_else(
+                    || format!("{path}\0material-color\0{:?}", material.base_color),
+                    |texture_name| format!("{path}\0{texture_name}"),
+                );
                 let texture =
                     if let Some(texture) = self.app.compositor_source_cache.get(&source_key) {
                         Arc::clone(texture)
                     } else {
-                        let texture = mesh
-                            .textures
-                            .get(texture_name)
-                            .cloned()
-                            .map(Arc::new)
-                            .ok_or_else(|| {
-                                source_error(socket.0, "base-color texture is unavailable")
-                            })?;
+                        let texture = if let Some(texture_name) = &material.base_color_texture {
+                            mesh.textures
+                                .get(texture_name)
+                                .cloned()
+                                .map(Arc::new)
+                                .ok_or_else(|| {
+                                    source_error(socket.0, "base-color texture is unavailable")
+                                })?
+                        } else {
+                            Arc::new(super::solid_color_texture(
+                                "material-base-color",
+                                material.base_color,
+                            ))
+                        };
                         self.app
                             .compositor_source_cache
                             .insert(source_key, Arc::clone(&texture));
