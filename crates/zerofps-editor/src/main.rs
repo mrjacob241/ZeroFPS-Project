@@ -12,10 +12,13 @@ mod multiplayer;
 mod vulkan_compositor;
 mod vulkan_runtime;
 mod vulkan_viewport;
+mod workflow;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    process::{Child, Command},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -23,6 +26,58 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+const EMBEDDED_GAME_MAGIC: &[u8; 16] = b"ZEROFPS_GAME_V1!";
+
+fn embedded_game_payload(executable: &std::path::Path) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(executable).ok()?;
+    let size = file.metadata().ok()?.len();
+    let trailer = EMBEDDED_GAME_MAGIC.len() as u64 + 8;
+    if size < trailer {
+        return None;
+    }
+    file.seek(SeekFrom::End(-(trailer as i64))).ok()?;
+    let mut length = [0_u8; 8];
+    let mut magic = [0_u8; 16];
+    file.read_exact(&mut length).ok()?;
+    file.read_exact(&mut magic).ok()?;
+    if &magic != EMBEDDED_GAME_MAGIC {
+        return None;
+    }
+    let payload_length = u64::from_le_bytes(length);
+    if payload_length > size - trailer {
+        return None;
+    }
+    file.seek(SeekFrom::Start(size - trailer - payload_length))
+        .ok()?;
+    let mut payload = vec![0_u8; payload_length.try_into().ok()?];
+    file.read_exact(&mut payload).ok()?;
+    Some(payload)
+}
+
+fn embedded_game_project() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let payload = embedded_game_payload(&executable)?;
+    let extracted = std::env::temp_dir().join(format!("zerofps-game-{}.zfp", std::process::id()));
+    std::fs::write(&extracted, payload).ok()?;
+    Some(extracted)
+}
+
+fn build_embedded_game_executable(snapshot: &PathBuf, output: &PathBuf) -> Result<(), String> {
+    let kernel = std::env::current_exe().map_err(|error| error.to_string())?;
+    std::fs::copy(&kernel, output).map_err(|error| error.to_string())?;
+    let payload = std::fs::read(snapshot).map_err(|error| error.to_string())?;
+    let mut executable = std::fs::OpenOptions::new()
+        .append(true)
+        .open(output)
+        .map_err(|error| error.to_string())?;
+    executable
+        .write_all(&payload)
+        .and_then(|_| executable.write_all(&(payload.len() as u64).to_le_bytes()))
+        .and_then(|_| executable.write_all(EMBEDDED_GAME_MAGIC))
+        .and_then(|_| executable.flush())
+        .map_err(|error| error.to_string())
+}
 
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, FontId, Id, Key, Layout, Pos2, Rect, RichText, Sense,
@@ -43,6 +98,12 @@ use crate::dynamics::{ClothSettings, ClothState, MeshScalarField, PaintMode, Win
 use crate::multiplayer::{MultiplayerClient, MultiplayerEvent};
 
 fn main() -> eframe::Result<()> {
+    let preview_project = std::env::args_os()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--game-preview").then(|| PathBuf::from(&pair[1])))
+        .or_else(embedded_game_project);
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
         setup.device_descriptor = Arc::new(|adapter| {
@@ -68,15 +129,36 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         viewport: egui::ViewportBuilder::default()
-            .with_title("ZeroFPS Project — Scene Editor")
-            .with_inner_size([1440.0, 900.0])
+            .with_title(if preview_project.is_some() {
+                "ZeroFPS Game Preview"
+            } else {
+                "ZeroFPS Project — Scene Editor"
+            })
+            .with_inner_size(if preview_project.is_some() {
+                [960.0, 540.0]
+            } else {
+                [1440.0, 900.0]
+            })
             .with_min_inner_size([980.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native(
         "ZeroFPS Project",
         options,
-        Box::new(|cc| Ok(Box::new(EditorApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = EditorApp::new(cc);
+            if let Some(path) = preview_project {
+                app.preview_mode = true;
+                app.load_project_from(path);
+                app.workspace_tab = WorkspaceTab::Scene;
+                app.play_state = PlayState::Running;
+                app.workflow_runtime.reset();
+                app.dynamics_running = true;
+                app.camera_preview_visible = true;
+                app.show_grid = false;
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -450,7 +532,9 @@ enum InspectorTab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkspaceTab {
     Scene,
+    Object,
     Compositing,
+    Workflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1002,6 +1086,27 @@ struct ObjectClipboard {
     links: Vec<(usize, usize, usize, usize)>,
     fields: HashMap<NodeId, MeshScalarField>,
     masks: HashMap<NodeId, PaintedMask>,
+}
+
+/// Transaction boundary for in-editor game preview. Runtime mutations must
+/// never leak back into the authored scene when Stop is pressed.
+struct PlaySnapshot {
+    tree: GeometryTree,
+    selected: Option<NodeId>,
+    compositor_nodes: Vec<CompositorNode>,
+    compositor_links: Vec<(usize, usize, usize, usize)>,
+    compositor_next_id: usize,
+    texture_overrides: Vec<MaterialTextureOverride>,
+    dynamics_fields: HashMap<NodeId, MeshScalarField>,
+    painted_masks: HashMap<NodeId, PaintedMask>,
+    object_simulation_states: HashMap<usize, ObjectSimulationState>,
+    joint_simulation_states: HashMap<NodeId, JointSimulationState>,
+    object_clipboard: Option<ObjectClipboard>,
+    undo_stack: Vec<GeometryTree>,
+    redo_stack: Vec<GeometryTree>,
+    dynamics_running: bool,
+    dynamics_time: f32,
+    project_dirty: bool,
 }
 
 enum HierarchyAction {
@@ -2042,6 +2147,12 @@ struct DepthCacheKey {
 struct EditorApp {
     scene: EditorScene,
     workspace_tab: WorkspaceTab,
+    workflow: workflow::Editor,
+    workflow_runtime: workflow::Runtime,
+    play_snapshot: Option<PlaySnapshot>,
+    preview_mode: bool,
+    preview_child: Option<Child>,
+    workflow_test_mode: bool,
     active_tool: Tool,
     play_state: PlayState,
     build_started: Option<Instant>,
@@ -2351,6 +2462,12 @@ impl EditorApp {
         Self {
             scene: EditorScene::default(),
             workspace_tab: WorkspaceTab::Scene,
+            workflow: workflow::Editor::default(),
+            workflow_runtime: workflow::Runtime::default(),
+            play_snapshot: None,
+            preview_mode: false,
+            preview_child: None,
+            workflow_test_mode: false,
             active_tool: Tool::Move,
             play_state: PlayState::Editing,
             build_started: None,
@@ -3757,7 +3874,9 @@ impl EditorApp {
                 "editor.workspace",
                 match self.workspace_tab {
                     WorkspaceTab::Scene => "scene",
-                    WorkspaceTab::Compositing => "nodes",
+                    WorkspaceTab::Object => "object",
+                    WorkspaceTab::Compositing => "compositing",
+                    WorkspaceTab::Workflow => "workflow",
                 }
                 .into(),
             ),
@@ -3777,6 +3896,12 @@ impl EditorApp {
             "compositor.selected".into(),
             self.compositor_selected_node.to_string(),
         );
+        if let Ok(serialized) = serde_json::to_string(&self.workflow.graph) {
+            project
+                .project
+                .properties
+                .insert("workflow.graph".into(), serialized);
+        }
         project.project.properties.insert(
             "dynamics.enabled".into(),
             self.dynamics_enabled
@@ -4559,10 +4684,16 @@ impl EditorApp {
         };
         self.workspace_tab = match properties.get("editor.workspace").map(String::as_str) {
             Some("scene") => WorkspaceTab::Scene,
-            Some("nodes" | "compositing") => WorkspaceTab::Compositing,
-            Some("dynamics") => WorkspaceTab::Compositing,
+            Some("nodes" | "object" | "dynamics") => WorkspaceTab::Object,
+            Some("compositing") => WorkspaceTab::Compositing,
+            Some("workflow") => WorkspaceTab::Workflow,
             _ => self.workspace_tab,
         };
+        if let Some(serialized) = properties.get("workflow.graph")
+            && let Ok(graph) = serde_json::from_str(serialized)
+        {
+            self.workflow = workflow::Editor::from_graph(graph);
+        }
         self.render_device = match properties
             .get("editor.device")
             .or_else(|| properties.get("compositor.backend"))
@@ -6607,38 +6738,150 @@ impl EditorApp {
         self.project_dirty |= changed;
     }
 
+    fn capture_play_snapshot(&mut self) {
+        if self.play_snapshot.is_none() {
+            self.play_snapshot = Some(PlaySnapshot {
+                tree: self.scene.tree.clone(),
+                selected: self.scene.selected,
+                compositor_nodes: self.compositor_nodes.clone(),
+                compositor_links: self.compositor_links.clone(),
+                compositor_next_id: self.compositor_next_id,
+                texture_overrides: self.compositor_texture_overrides.clone(),
+                dynamics_fields: self.dynamics_fields.clone(),
+                painted_masks: self.painted_masks.clone(),
+                object_simulation_states: self.object_simulation_states.clone(),
+                joint_simulation_states: self.joint_simulation_states.clone(),
+                object_clipboard: self.object_clipboard.clone(),
+                undo_stack: self.undo_stack.clone(),
+                redo_stack: self.redo_stack.clone(),
+                dynamics_running: self.dynamics_running,
+                dynamics_time: self.dynamics_time,
+                project_dirty: self.project_dirty,
+            });
+        }
+    }
+
     fn start_play(&mut self) {
+        self.capture_play_snapshot();
+        self.workflow_test_mode = false;
+        self.workflow_runtime.reset();
         self.play_state = PlayState::Building;
         self.build_started = Some(Instant::now());
+        let preview_dir = PathBuf::from("target/zerofps-preview");
+        let preview_path = preview_dir.join(format!("game-{}.zfp", std::process::id()));
+        let executable_path = preview_dir.join(format!("game-{}", std::process::id()));
+        let launch = (|| -> Result<Child, String> {
+            std::fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
+            let (project, files) = self.project_bundle();
+            let project = project?;
+            save_zfp(&preview_path, &project, &files).map_err(|error| error.to_string())?;
+            build_embedded_game_executable(&preview_path, &executable_path)?;
+            Command::new(&executable_path)
+                .spawn()
+                .map_err(|error| error.to_string())
+        })();
+        match launch {
+            Ok(child) => self.preview_child = Some(child),
+            Err(error) => {
+                self.project_error_dialog = Some((
+                    "Game Preview Failed".into(),
+                    format!("Could not build or launch the detached preview.\n\n{error}"),
+                ));
+                self.stop_play();
+                return;
+            }
+        }
         self.logs.push(LogEntry {
             level: "BUILD",
             color: Color32::from_rgb(244, 190, 88),
-            message: "Capturing scene snapshot and compiling zerofps-player…".into(),
+            message: format!(
+                "Built and launched self-contained game preview: {}",
+                executable_path.display()
+            ),
+        });
+    }
+
+    fn start_workflow_test(&mut self) {
+        self.capture_play_snapshot();
+        self.workflow_test_mode = true;
+        self.workflow_runtime.reset();
+        self.play_state = PlayState::Running;
+        self.build_started = None;
+        self.logs.push(LogEntry {
+            level: "WORKFLOW",
+            color: Color32::from_rgb(97, 219, 141),
+            message: "Workflow test is running inside the editor.".into(),
         });
     }
 
     fn stop_play(&mut self) {
+        if let Some(mut child) = self.preview_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         self.play_state = PlayState::Editing;
         self.build_started = None;
+        self.workflow_test_mode = false;
+        self.workflow_runtime.reset();
+        if let Some(snapshot) = self.play_snapshot.take() {
+            self.scene.tree = snapshot.tree;
+            self.scene.selected = snapshot.selected;
+            self.compositor_nodes = snapshot.compositor_nodes;
+            self.compositor_links = snapshot.compositor_links;
+            self.compositor_next_id = snapshot.compositor_next_id;
+            self.compositor_texture_overrides = snapshot.texture_overrides;
+            self.dynamics_fields = snapshot.dynamics_fields;
+            self.painted_masks = snapshot.painted_masks;
+            self.object_simulation_states = snapshot.object_simulation_states;
+            self.joint_simulation_states = snapshot.joint_simulation_states;
+            self.object_clipboard = snapshot.object_clipboard;
+            self.undo_stack = snapshot.undo_stack;
+            self.redo_stack = snapshot.redo_stack;
+            self.dynamics_running = snapshot.dynamics_running;
+            self.dynamics_time = snapshot.dynamics_time;
+            self.project_dirty = snapshot.project_dirty;
+            self.dynamics_cloth.clear();
+            self.compositor_eval_cache.clear();
+            self.compositor_gpu_cache.clear();
+            self.compositor_graph_queue.clear();
+            self.compositor_apply_due = None;
+            self.scene_revision = self.scene_revision.wrapping_add(1);
+            self.transform_revision = self.transform_revision.wrapping_add(1);
+            self.texture_revision = self.texture_revision.wrapping_add(1);
+            self.viewport_requested_key = None;
+        }
         self.logs.push(LogEntry {
             level: "INFO",
             color: Color32::from_rgb(103, 191, 255),
-            message: "Preview process stopped; editor state was preserved.".into(),
+            message: "Preview stopped; the authored scene snapshot was restored.".into(),
         });
     }
 
     fn poll_build(&mut self, ctx: &egui::Context) {
+        if let Some(child) = &mut self.preview_child
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.preview_child = None;
+            self.logs.push(LogEntry {
+                level: "GAME",
+                color: Color32::from_rgb(244, 190, 88),
+                message: format!("Detached game preview exited with {status}."),
+            });
+            self.stop_play();
+            return;
+        }
         if self.play_state == PlayState::Building {
             ctx.request_repaint_after(Duration::from_millis(50));
             if self
                 .build_started
-                .is_some_and(|started| started.elapsed() > Duration::from_millis(900))
+                .is_some_and(|started| started.elapsed() > Duration::from_millis(150))
             {
                 self.play_state = PlayState::Running;
                 self.logs.push(LogEntry {
                     level: "LIVE",
                     color: Color32::from_rgb(97, 219, 141),
-                    message: "Game connected on telemetry://127.0.0.1 (prototype).".into(),
+                    message: "Detached game kernel is running; editor telemetry remains available."
+                        .into(),
                 });
             }
         }
@@ -7038,9 +7281,15 @@ impl EditorApp {
                     ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Scene, "Scene");
                     ui.selectable_value(
                         &mut self.workspace_tab,
-                        WorkspaceTab::Compositing,
-                        "Nodes",
+                        WorkspaceTab::Object,
+                        "Object",
                     );
+                    ui.selectable_value(
+                        &mut self.workspace_tab,
+                        WorkspaceTab::Compositing,
+                        "Compositor",
+                    );
+                    ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Workflow, "Workflow");
                     ui.separator();
                     if self.workspace_tab == WorkspaceTab::Scene {
                         tool_button(ui, &mut self.active_tool, Tool::Select, "Q", "Select");
@@ -7111,7 +7360,7 @@ impl EditorApp {
                                 .small(),
                         )
                         .on_hover_text("Simulation time · executable object graphs");
-                    } else if self.workspace_tab == WorkspaceTab::Compositing {
+                    } else if matches!(self.workspace_tab, WorkspaceTab::Object | WorkspaceTab::Compositing) {
                         ui.label(RichText::new("Object Graph").weak().small());
                         if ui.button("Frame All").clicked() {
                             self.compositor_pan = Vec2::ZERO;
@@ -7122,6 +7371,21 @@ impl EditorApp {
                                 .weak()
                                 .small(),
                         );
+                    } else if self.workspace_tab == WorkspaceTab::Workflow {
+                        if self.workflow_test_mode {
+                            ui.label(RichText::new("● Testing Workflow").color(Color32::LIGHT_GREEN));
+                        } else if ui
+                            .add_enabled(
+                                self.play_state == PlayState::Editing,
+                                egui::Button::new("Test Workflow in Editor"),
+                            )
+                            .on_hover_text(
+                                "Run Workflow, object/input nodes and compositing in this editor process without opening a game window",
+                            )
+                            .clicked()
+                        {
+                            self.start_workflow_test();
+                        }
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -7169,8 +7433,10 @@ impl EditorApp {
                     });
                 });
             });
-        if previous_workspace == WorkspaceTab::Compositing
-            && self.workspace_tab == WorkspaceTab::Scene
+        if matches!(
+            previous_workspace,
+            WorkspaceTab::Object | WorkspaceTab::Compositing
+        ) && self.workspace_tab == WorkspaceTab::Scene
         {
             self.apply_compositor();
         }
@@ -7453,7 +7719,9 @@ impl EditorApp {
                     }
                 }
                 HierarchyAction::Copy => self.copy_hierarchy_object(id),
-                HierarchyAction::PasteChild => self.paste_hierarchy_object(Some(id)),
+                HierarchyAction::PasteChild => {
+                    self.paste_hierarchy_object(Some(id));
+                }
                 HierarchyAction::PasteSibling => {
                     let parent = self.scene.tree.node(id).ok().and_then(|node| node.parent());
                     self.paste_hierarchy_object(parent);
@@ -7563,9 +7831,9 @@ impl EditorApp {
             .unwrap()
     }
 
-    fn paste_hierarchy_object(&mut self, parent: Option<NodeId>) {
+    fn paste_hierarchy_object(&mut self, parent: Option<NodeId>) -> Option<NodeId> {
         let Some(clipboard) = self.object_clipboard.clone() else {
-            return;
+            return None;
         };
         let previous = self.scene.tree.clone();
         let Ok((new_root, id_map)) =
@@ -7573,7 +7841,7 @@ impl EditorApp {
                 .tree
                 .clone_subtree_from(&clipboard.tree, clipboard.root, parent)
         else {
-            return;
+            return None;
         };
 
         let mut reserved = BTreeSet::new();
@@ -7685,6 +7953,66 @@ impl EditorApp {
         self.texture_revision = self.texture_revision.wrapping_add(1);
         self.project_dirty = true;
         self.apply_compositor();
+        Some(new_root)
+    }
+
+    fn tick_workflow(&mut self) {
+        if self.play_state != PlayState::Running {
+            return;
+        }
+        let commands = self.workflow_runtime.tick(&self.workflow.graph, 1.0 / 60.0);
+        for command in commands {
+            match command {
+                workflow::Command::Spawn {
+                    proto,
+                    transform,
+                    parameters,
+                } => {
+                    let root = self.scene.tree.iter().find_map(|(id, node)| {
+                        (node.name == proto && self.scene.is_proto_root(id)).then_some(id)
+                    });
+                    let Some(root) = root else {
+                        self.logs.push(LogEntry {
+                            level: "WORKFLOW",
+                            color: Color32::YELLOW,
+                            message: format!("Spawn failed: proto `{proto}` was not found."),
+                        });
+                        continue;
+                    };
+                    self.copy_hierarchy_object(root);
+                    if let Some(instance) = self.paste_hierarchy_object(None) {
+                        let _ = self.scene.set_proto(instance, false);
+                        if let workflow::Value::Vector3(position) = transform {
+                            let mut local = self
+                                .scene
+                                .tree
+                                .node(instance)
+                                .map(|node| node.local_transform())
+                                .unwrap_or_default();
+                            local.translation = CoreVec3::new(
+                                position[0] as f32,
+                                position[1] as f32,
+                                position[2] as f32,
+                            );
+                            let _ = self.scene.tree.set_local_transform(instance, local);
+                        }
+                        for (name, value) in parameters {
+                            self.workflow_runtime
+                                .parameters
+                                .insert((instance.slot as u64, name), value);
+                        }
+                    }
+                }
+                workflow::Command::Despawn(_) => {}
+                workflow::Command::SetParameter { .. }
+                | workflow::Command::Force(_)
+                | workflow::Command::Torque(_) => {
+                    // These commands are already represented in the shared
+                    // runtime state and are consumed by object graphs as they
+                    // gain their matching exposed inputs.
+                }
+            }
+        }
     }
 
     fn rename_hierarchy_object(&mut self, id: NodeId, renamed: String) {
@@ -14924,6 +15252,10 @@ impl EditorApp {
 
 impl Drop for EditorApp {
     fn drop(&mut self) {
+        if let Some(mut child) = self.preview_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         // Stop producers first so shutdown cannot race a freshly queued animation frame.
         self.dynamics_running = false;
         self.dynamics_single_step = false;
@@ -14955,10 +15287,11 @@ impl Drop for EditorApp {
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "{} — ZeroFPS Project",
-            self.project_display_name()
-        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(if self.preview_mode {
+            format!("{} — Game Preview", self.project_display_name())
+        } else {
+            format!("{} — ZeroFPS Project", self.project_display_name())
+        }));
         self.track_gui_inputs(ctx);
         self.sample_editor_camera_input_early(ctx);
         self.consume_editor_camera_register();
@@ -14997,7 +15330,13 @@ impl eframe::App for EditorApp {
         // current simulation tick rather than the previous frame's transform.
         self.tick_broadcast_nodes();
         self.poll_build(ctx);
+        self.tick_workflow();
         self.shortcuts(ctx);
+        if self.preview_mode {
+            self.viewport(ctx);
+            self.loading_overlay(ctx);
+            return;
+        }
         self.top_bar(ctx);
         match self.workspace_tab {
             WorkspaceTab::Scene => {
@@ -15006,7 +15345,8 @@ impl eframe::App for EditorApp {
                 self.bottom_panel(ctx);
                 self.viewport(ctx);
             }
-            WorkspaceTab::Compositing => self.compositing_workspace(ctx),
+            WorkspaceTab::Object | WorkspaceTab::Compositing => self.compositing_workspace(ctx),
+            WorkspaceTab::Workflow => self.workflow.ui(ctx, &mut self.project_dirty),
         }
         self.loading_overlay(ctx);
         self.status_bar(ctx);
@@ -20192,6 +20532,23 @@ fn truncated_object_name(name: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_game_image_recovers_embedded_project() {
+        let path =
+            std::env::temp_dir().join(format!("zerofps-embedded-game-test-{}", std::process::id()));
+        let payload = b"PK\x03\x04fake-zfp";
+        let mut bytes = b"fake-elf-kernel".to_vec();
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(EMBEDDED_GAME_MAGIC);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            embedded_game_payload(&path).as_deref(),
+            Some(payload.as_slice())
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn vram_setting_defaults_and_safety_budget_are_bounded() {
