@@ -853,6 +853,29 @@ impl VulkanViewport {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut live_bind_groups = HashSet::new();
         let mut live_vertex_buffers = HashSet::new();
+        let mut viewport_batches = batches.iter().collect::<Vec<_>>();
+        let camera_depth = |batch: &GpuBatch| {
+            let local_center = (batch.local_bounds_min + batch.local_bounds_max) * 0.5;
+            let world_center = batch
+                .object_transform
+                .rotation
+                .rotate(batch.object_transform.scale.component_mul(local_center))
+                + batch.object_transform.translation;
+            let relative = world_center - camera.4;
+            let forward = relative.x * camera.0.sin() + relative.y * camera.0.cos();
+            relative.z * camera.1.sin() + forward * camera.1.cos()
+        };
+        viewport_batches.sort_by(|left, right| {
+            left.transparent.cmp(&right.transparent).then_with(|| {
+                if left.transparent {
+                    camera_depth(right)
+                        .partial_cmp(&camera_depth(left))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport pass"),
@@ -876,51 +899,46 @@ impl VulkanViewport {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, camera_group.as_ref(), &[]);
-            for transparent in [false, true] {
-                pass.set_pipeline(if transparent {
+            for batch in viewport_batches {
+                pass.set_pipeline(if batch.transparent {
                     &self.transparent_pipeline
                 } else {
                     &self.pipeline
                 });
-                for batch in batches
-                    .iter()
-                    .filter(|batch| batch.transparent == transparent)
-                {
-                    if batch.vertices.is_empty() {
-                        continue;
-                    }
-                    let view = batch
-                        .gpu_texture
-                        .as_ref()
-                        .map(|image| Arc::clone(&image.view))
-                        .unwrap_or_else(|| {
-                            self.texture_view(batch.texture_cache_key, batch.texture.as_ref())
-                        });
-                    let view_key = Arc::as_ptr(&view) as usize;
-                    live_bind_groups.insert(view_key);
-                    let texture_group =
-                        Arc::clone(self.bind_group_cache.entry(view_key).or_insert_with(|| {
-                            Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("viewport texture group"),
-                                layout: &self.texture_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(&view),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                    },
-                                ],
-                            }))
-                        }));
-                    let vertices = self.vertex_buffer(batch, batch_revision);
-                    live_vertex_buffers.insert(batch.cache_key);
-                    pass.set_bind_group(1, texture_group.as_ref(), &[]);
-                    pass.set_vertex_buffer(0, vertices.as_ref().slice(..));
-                    pass.draw(0..batch.vertices.len() as u32, 0..1);
+                if batch.vertices.is_empty() {
+                    continue;
                 }
+                let view = batch
+                    .gpu_texture
+                    .as_ref()
+                    .map(|image| Arc::clone(&image.view))
+                    .unwrap_or_else(|| {
+                        self.texture_view(batch.texture_cache_key, batch.texture.as_ref())
+                    });
+                let view_key = Arc::as_ptr(&view) as usize;
+                live_bind_groups.insert(view_key);
+                let texture_group =
+                    Arc::clone(self.bind_group_cache.entry(view_key).or_insert_with(|| {
+                        Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("viewport texture group"),
+                            layout: &self.texture_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                            ],
+                        }))
+                    }));
+                let vertices = self.vertex_buffer(batch, batch_revision);
+                live_vertex_buffers.insert(batch.cache_key);
+                pass.set_bind_group(1, texture_group.as_ref(), &[]);
+                pass.set_vertex_buffer(0, vertices.as_ref().slice(..));
+                pass.draw(0..batch.vertices.len() as u32, 0..1);
             }
         }
         // Bind groups retain their texture views, and therefore the complete

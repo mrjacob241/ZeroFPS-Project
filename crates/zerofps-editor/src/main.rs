@@ -84,8 +84,9 @@ use eframe::egui::{
     Stroke, TextureHandle, TextureId, TextureOptions, Vec2,
 };
 use zerofps_assets::{
-    MeshAsset, MeshAutofixReport, Primitive, TextureAsset, Vertex, autofix_mesh, import_file,
-    load_texture_mip_cache, mip_cache_path, prepare_texture_mips, save_texture_mip_cache,
+    MaterialAlphaMode, MeshAsset, MeshAutofixReport, Primitive, TextureAsset, Vertex, autofix_mesh,
+    import_file, load_texture_mip_cache, mip_cache_path, prepare_texture_mips,
+    save_texture_mip_cache,
 };
 use zerofps_core::{
     Attribute, AttributeDeclaration, AttributeKey, Component, GeometryTree, NodeId, Quat,
@@ -701,6 +702,10 @@ enum NodeSettings {
         value: f32,
         rate: f32,
     },
+    Character3D {
+        initial_position: [f32; 3],
+        position: [f32; 3],
+    },
     Broadcast {
         variable: String,
         values: Vec<f32>,
@@ -898,6 +903,7 @@ impl NodeSettings {
             Self::MouseInput { .. } => 32,
             Self::Accumulator { .. } => 33,
             Self::Broadcast { .. } => 34,
+            Self::Character3D { .. } => 35,
         }
     }
 
@@ -1040,6 +1046,10 @@ impl NodeSettings {
                 variable: "value".into(),
                 values: vec![0.0],
             },
+            35 => Self::Character3D {
+                initial_position: [0.0; 3],
+                position: [0.0; 3],
+            },
             _ => return None,
         })
     }
@@ -1159,6 +1169,9 @@ struct PreviewTriangle {
     smooth_normals: bool,
     transmission: f32,
     ior: f32,
+    alpha_mode: MaterialAlphaMode,
+    alpha_cutoff: f32,
+    water_fallback: bool,
     casts_shadows: bool,
 }
 
@@ -1938,7 +1951,7 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
                     .map(|texture| Arc::as_ptr(texture) as usize)
             })
             .unwrap_or(0);
-        let transparent = triangle.base_color[3] < 0.999;
+        let transparent = matches!(triangle.alpha_mode, MaterialAlphaMode::Blend);
         let batch = groups
             .entry((triangle.object_id, key, triangle.casts_shadows, transparent))
             .or_insert_with(|| vulkan_viewport::GpuBatch {
@@ -2013,7 +2026,15 @@ fn build_vulkan_batches(triangles: &[PreviewTriangle]) -> Vec<vulkan_viewport::G
                     triangle.base_color[2],
                     triangle.base_color[3],
                     f32::from(triangle.shader == ShaderMode::Toon),
-                    triangle.transmission,
+                    if triangle.water_fallback {
+                        -1.0
+                    } else if matches!(triangle.alpha_mode, MaterialAlphaMode::Mask) {
+                        -2.0 - triangle.alpha_cutoff.clamp(0.0, 1.0)
+                    } else if matches!(triangle.alpha_mode, MaterialAlphaMode::Blend) {
+                        100.0 + triangle.transmission
+                    } else {
+                        triangle.transmission
+                    },
                 ],
                 object_translation: [
                     transform.translation.x,
@@ -2263,8 +2284,8 @@ struct EditorApp {
     grid_spacing: f32,
     snap: bool,
     viewport_focused: bool,
+    editor_viewport_rect: Option<Rect>,
     viewport_extent: f32,
-    editor_camera_input_consumed: bool,
     editor_orbit_drag_active: bool,
     editor_pan_drag_active: bool,
     camera_yaw: f32,
@@ -2586,8 +2607,8 @@ impl EditorApp {
             grid_spacing: 1.0,
             snap: false,
             viewport_focused: false,
+            editor_viewport_rect: None,
             viewport_extent: 1.0,
-            editor_camera_input_consumed: false,
             editor_orbit_drag_active: false,
             editor_pan_drag_active: false,
             camera_yaw: -0.55,
@@ -3284,6 +3305,20 @@ impl EditorApp {
                 } else {
                     1.5
                 };
+                let alpha_mode = material
+                    .map(|material| material.alpha_mode)
+                    .unwrap_or(MaterialAlphaMode::Opaque);
+                let alpha_cutoff = material
+                    .map(|material| material.alpha_cutoff)
+                    .unwrap_or(0.5);
+                // Some legacy glTF water assets are nearly transparent white
+                // planes with no transmission extension or river-bottom mesh.
+                // Give those surfaces a stable deep-water fallback instead of
+                // exposing the viewport sky as a bright cyan patch.
+                let water_fallback = matches!(alpha_mode, MaterialAlphaMode::Blend)
+                    && base_color[3] < 0.1
+                    && source_texture.is_none()
+                    && transmission <= 0.0;
                 for triangle in primitive.indices.chunks_exact(3) {
                     let mut vertices = [PreviewVertex {
                         source_index: 0,
@@ -3349,6 +3384,9 @@ impl EditorApp {
                         smooth_normals,
                         transmission,
                         ior,
+                        alpha_mode,
+                        alpha_cutoff,
+                        water_fallback,
                         casts_shadows,
                     });
                 }
@@ -4361,6 +4399,23 @@ impl EditorApp {
                         rate.to_string(),
                     );
                 }
+                NodeSettings::Character3D {
+                    initial_position,
+                    position,
+                } => {
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(initial_position) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.character_initial_{axis}"),
+                            value.to_string(),
+                        );
+                    }
+                    for (axis, value) in ["x", "y", "z"].into_iter().zip(position) {
+                        project.project.properties.insert(
+                            format!("compositor.node.{id}.character_position_{axis}"),
+                            value.to_string(),
+                        );
+                    }
+                }
                 NodeSettings::Position { values } => {
                     for (axis, value) in ["x", "y", "z"].into_iter().zip(values) {
                         project.project.properties.insert(
@@ -5219,6 +5274,30 @@ impl EditorApp {
                             })
                             .unwrap_or_else(|| vec![0.0]),
                     },
+                    35 => {
+                        let initial_position = std::array::from_fn(|axis| {
+                            properties
+                                .get(&format!(
+                                    "compositor.node.{id}.character_initial_{}",
+                                    ["x", "y", "z"][axis]
+                                ))
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or(0.0)
+                        });
+                        let position = std::array::from_fn(|axis| {
+                            properties
+                                .get(&format!(
+                                    "compositor.node.{id}.character_position_{}",
+                                    ["x", "y", "z"][axis]
+                                ))
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or(initial_position[axis])
+                        });
+                        NodeSettings::Character3D {
+                            initial_position,
+                            position,
+                        }
+                    }
                     _ => continue,
                 };
                 let legacy_graph_index = properties
@@ -5707,7 +5786,7 @@ impl EditorApp {
                     .changed();
                 ui.label("Vertical angle");
                 changed |= ui
-                    .add(egui::Slider::new(vertical_degrees, -89.0..=89.0).suffix("°"))
+                    .add(egui::Slider::new(vertical_degrees, -180.0..=180.0).suffix("°"))
                     .changed();
                 ui.label("Sensitivity (degrees / pixel)");
                 changed |= ui
@@ -5803,6 +5882,44 @@ impl EditorApp {
                 } else {
                     "Connect through Game-Server"
                 });
+            }
+            35 => {
+                let pos = self
+                    .compositor_nodes
+                    .iter()
+                    .position(|node| node.id == node_id)
+                    .unwrap();
+                let NodeSettings::Character3D {
+                    initial_position,
+                    position,
+                } = &mut self.compositor_nodes[pos].settings
+                else {
+                    return;
+                };
+                ui.label("Initial position");
+                for (index, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(axis);
+                        let old_initial = initial_position[index];
+                        let follows_initial = position[index] == old_initial;
+                        let edited = ui
+                            .add(egui::DragValue::new(&mut initial_position[index]).speed(0.05))
+                            .changed();
+                        if edited && follows_initial {
+                            position[index] = initial_position[index];
+                        }
+                        changed |= edited;
+                    });
+                }
+                ui.monospace(format!(
+                    "Position: {:.3}, {:.3}, {:.3}",
+                    position[0], position[1], position[2]
+                ));
+                if ui.small_button("Reset to initial position").clicked() {
+                    *position = *initial_position;
+                    changed = true;
+                }
+                ui.small("Speeds are local X/Y/Z; mouse-style look angles rotate their sum.");
             }
             5 => {
                 let pos = self
@@ -10499,6 +10616,9 @@ impl EditorApp {
                     .unwrap_or(0.0),
             )),
             NodeSettings::Accumulator { value, .. } => Ok(CompositorProbeValue::Number(value)),
+            NodeSettings::Character3D { position, .. } => {
+                Ok(CompositorProbeValue::Triple(position))
+            }
             NodeSettings::Position { .. } | NodeSettings::Rotation { .. } => self
                 .transform_vector_value(node_id)
                 .map(|(values, _)| CompositorProbeValue::Triple(values))
@@ -10657,6 +10777,7 @@ impl EditorApp {
         let mut values = match settings {
             NodeSettings::Position { values } => values,
             NodeSettings::Rotation { degrees } => degrees,
+            NodeSettings::Character3D { position, .. } => return Some((position, true)),
             _ => return None,
         };
         let mut driven = false;
@@ -10701,7 +10822,7 @@ impl EditorApp {
                     .find(|node| node.id == source)
                     .map(|node| &node.settings)
                 {
-                    Some(NodeSettings::Position { .. }) => {
+                    Some(NodeSettings::Position { .. } | NodeSettings::Character3D { .. }) => {
                         if let Some((position, _)) = self.transform_vector_value(source) {
                             transform.translation =
                                 CoreVec3::new(position[0], position[1], position[2]);
@@ -11209,6 +11330,7 @@ impl EditorApp {
             NodeSettings::ObjectTransform { .. }
             | NodeSettings::ObjectMesh { .. }
             | NodeSettings::Position { .. }
+            | NodeSettings::Character3D { .. }
             | NodeSettings::Rotation { .. }
             | NodeSettings::ObjectSimulator { .. }
             | NodeSettings::ForceOutput { .. }
@@ -11424,11 +11546,10 @@ impl EditorApp {
         let center = square.center();
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(center));
         let canonical_warp = self.compositor_mouse_mode() == 1;
-        // Confine instead of asking the compositor for a relative-pointer lock:
-        // canonical warp needs real absolute motion events before each recenter.
-        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-            egui::CursorGrab::Confined,
-        ));
+        // A lock gives us unaccelerated relative motion that cannot be clipped by
+        // a window or screen edge. Pointer-position events remain as a fallback
+        // for integrations that do not provide raw mouse motion.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!canonical_warp));
         self.compositor_mouse_capture = true;
         self.compositor_mouse_last_tick = Instant::now();
@@ -11484,8 +11605,8 @@ impl EditorApp {
         if mouse_mode == 1 {
             let center = square.center();
             let delta = ctx.input(|input| canonical_cursor_warp_delta(&input.events, center));
-            // Canonical relative mouse input: consume motion from the fixed origin,
-            // then warp straight back so screen edges can never limit rotation.
+            // Keep recentering for the absolute-position fallback. Under a working
+            // pointer lock this is redundant, but harmless.
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(center));
             self.compositor_mouse_window_position = Some(center);
             self.compositor_mouse_offset = Vec2::ZERO;
@@ -11693,6 +11814,54 @@ impl EditorApp {
                 && let NodeSettings::Accumulator { value, .. } = &mut node.settings
             {
                 *value = next;
+            }
+            self.invalidate_compositor_from(node_id);
+            self.compositor_apply_due = Some(now);
+        }
+        let character_ids = self
+            .compositor_nodes
+            .iter()
+            .filter_map(|node| {
+                matches!(node.settings, NodeSettings::Character3D { .. }).then_some(node.id)
+            })
+            .collect::<Vec<_>>();
+        let mut character_updates = Vec::new();
+        for node_id in character_ids {
+            let inputs: [f32; 5] = std::array::from_fn(|input| {
+                self.compositor_input_source(node_id, input)
+                    .ok()
+                    .and_then(|(source, output)| {
+                        self.scalar_node_value(source, output, &mut BTreeSet::new())
+                    })
+                    .unwrap_or(0.0)
+            });
+            let Some(position) = self.compositor_nodes.iter().find_map(|node| {
+                (node.id == node_id).then(|| match node.settings {
+                    NodeSettings::Character3D { position, .. } => Some(position),
+                    _ => None,
+                })?
+            }) else {
+                continue;
+            };
+            let next = advance_3d_character(
+                position,
+                [inputs[0], inputs[1], inputs[2]],
+                inputs[3],
+                inputs[4],
+                dt,
+            );
+            if next != position && next.iter().all(|value| value.is_finite()) {
+                character_updates.push((node_id, next));
+            }
+        }
+        for (node_id, next) in character_updates {
+            if let Some(node) = self
+                .compositor_nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                && let NodeSettings::Character3D { position, .. } = &mut node.settings
+            {
+                *position = next;
             }
             self.invalidate_compositor_from(node_id);
             self.compositor_apply_due = Some(now);
@@ -13544,6 +13713,9 @@ impl EditorApp {
                             if compositor_add_button(ui, true, "XYZ Rotation") {
                                 self.activate_compositor_node(26);
                             }
+                            if compositor_add_button(ui, true, "3D Character") {
+                                self.activate_compositor_node(35);
+                            }
                         });
                         ui.menu_button("Color", |ui| {
                             for (index, label) in [(3, "Remap"), (10, "Color Space Convert"), (11, "Color Decoder"), (13, "Color Encoder"), (12, "Grayscale")] {
@@ -13674,7 +13846,7 @@ impl EditorApp {
 
                 let origin = canvas.min + Vec2::new(70.0, 100.0) + self.compositor_pan;
                 let scale = self.compositor_zoom;
-                let node_specs_by_kind: [(&str, &str, Color32); 35] = [
+                let node_specs_by_kind: [(&str, &str, Color32); 36] = [
                     ("Object Texture", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Image Asset", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Constant Value", "Input", Color32::from_rgb(76, 122, 155)),
@@ -13726,12 +13898,14 @@ impl EditorApp {
                     ("Mouse Input", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Accumulator", "Input", Color32::from_rgb(76, 122, 155)),
                     ("Broadcast", "Network", Color32::from_rgb(66, 145, 168)),
+                    ("3D Character", "Transform", Color32::from_rgb(91, 118, 166)),
                 ];
-                let node_heights_by_kind: [f32; 35] = [
+                let node_heights_by_kind: [f32; 36] = [
                     205.0, 165.0, 215.0, 390.0, 175.0, 150.0, 185.0, 175.0, 220.0, 220.0,
                     175.0, 140.0, 140.0, 165.0, 285.0, 205.0, 270.0, 190.0, 165.0, 150.0,
                     285.0, 235.0, 245.0, 285.0, 190.0,
                     205.0, 205.0, 360.0, 210.0, 190.0, 190.0, 430.0, 330.0, 190.0, 210.0,
+                    300.0,
                 ];
                 let node_width = 230.0;
 
@@ -14352,47 +14526,49 @@ impl EditorApp {
     }
 
     fn sample_editor_camera_input_early(&mut self, ctx: &egui::Context) {
-        self.editor_camera_input_consumed = false;
-        let eligible = self.workspace_tab == WorkspaceTab::Scene
+        let camera_available = self.workspace_tab == WorkspaceTab::Scene
             && !self.camera_preview_visible
-            && !self.compositor_mouse_capture
-            && self.viewport_focused;
-        let (delta, secondary, middle, scroll) = ctx.input(|input| {
+            && !self.compositor_mouse_capture;
+        let (delta, pointer_position, secondary, middle, scroll) = ctx.input(|input| {
             (
                 input.pointer.delta(),
+                input.pointer.interact_pos(),
                 input.pointer.button_down(egui::PointerButton::Secondary),
                 input.pointer.button_down(egui::PointerButton::Middle),
                 input.smooth_scroll_delta.y,
             )
         });
-        let orbit_started = eligible && secondary && !self.editor_orbit_drag_active;
-        let pan_started = eligible && middle && !self.editor_pan_drag_active;
-        self.editor_orbit_drag_active = eligible && secondary;
-        self.editor_pan_drag_active = eligible && middle;
-        // The activation frame defines the drag origin; its pointer delta may
-        // include motion from before the button press and must not move camera.
-        self.editor_camera_input_consumed = orbit_started || pan_started;
-        if !eligible {
-            return;
-        }
+        let pointer_over_viewport = camera_available
+            && pointer_position.is_some_and(|position| {
+                self.editor_viewport_rect
+                    .is_some_and(|viewport| viewport.contains(position))
+            });
+        let orbit_was_active = self.editor_orbit_drag_active;
+        let pan_was_active = self.editor_pan_drag_active;
+        let orbit_down =
+            camera_available && secondary && (orbit_was_active || pointer_over_viewport);
+        let pan_down = camera_available && middle && (pan_was_active || pointer_over_viewport);
+        self.editor_orbit_drag_active = orbit_down;
+        self.editor_pan_drag_active = pan_down;
+
+        // Both camera gestures use one policy: the activation frame establishes
+        // a clean drag origin, and movement starts from the next coalesced GUI
+        // delta. This prevents pre-press motion from leaking into either gesture.
+        let orbit = continuing_camera_drag_delta(orbit_was_active, orbit_down, delta);
+        let pan = continuing_camera_drag_delta(pan_was_active, pan_down, delta);
         let sample = InputSample {
-            orbit: if secondary && !orbit_started {
-                delta
+            orbit,
+            pan,
+            zoom_log: if pointer_over_viewport {
+                scroll * 0.001
             } else {
-                Vec2::ZERO
+                0.0
             },
-            pan: if middle && !pan_started {
-                delta
-            } else {
-                Vec2::ZERO
-            },
-            zoom_log: scroll * 0.001,
             viewport_extent: self.viewport_extent.max(1.0),
             captured_at: Some(Instant::now()),
         };
         if sample.orbit != Vec2::ZERO || sample.pan != Vec2::ZERO || sample.zoom_log != 0.0 {
             self.input_worker.submit(sample);
-            self.editor_camera_input_consumed = true;
         }
     }
 
@@ -14523,10 +14699,10 @@ impl EditorApp {
                 });
                 self.compositor_mouse_square = (self.camera_preview_visible
                     && scene_camera.is_some())
-                .then(|| Rect::from_center_size(render_rect.center(), Vec2::splat(192.0)));
+                    .then(|| Rect::from_center_size(render_rect.center(), Vec2::splat(192.0)));
                 self.viewport_focused = response.hovered();
+                self.editor_viewport_rect = Some(response.rect);
                 self.viewport_extent = response.rect.width().min(response.rect.height()).max(1.0);
-                let pointer_delta = ui.input(|input| input.pointer.delta());
                 if matches!(self.active_tool, Tool::FieldPaint | Tool::TexturePaint) {
                     let (pointer, pressed, down, released) = ui.input(|input| {
                         (
@@ -14609,57 +14785,6 @@ impl EditorApp {
                         }
                     }
                 }
-                // `Response::dragged_by` waits for egui's drag-distance threshold.
-                // Camera controls should react on the press frame, while the
-                // viewport owns the pointer, to avoid an initial dead zone.
-                let pointer_owned = response.hovered()
-                    || response.is_pointer_button_down_on()
-                    || response.dragged();
-                let (secondary_down, middle_down) = ui.input(|input| {
-                    (
-                        input.pointer.button_down(egui::PointerButton::Secondary),
-                        input.pointer.button_down(egui::PointerButton::Middle),
-                    )
-                });
-                let orbit_started = pointer_owned
-                    && secondary_down
-                    && !self.editor_orbit_drag_active;
-                let pan_started = pointer_owned && middle_down && !self.editor_pan_drag_active;
-                self.editor_orbit_drag_active = pointer_owned && secondary_down;
-                self.editor_pan_drag_active = pointer_owned && middle_down;
-                let orbit = if !self.editor_camera_input_consumed
-                    && pointer_owned
-                    && secondary_down
-                    && !orbit_started
-                {
-                    pointer_delta
-                } else {
-                    Vec2::ZERO
-                };
-                let pan = if !self.editor_camera_input_consumed
-                    && pointer_owned
-                    && middle_down
-                    && !pan_started
-                {
-                    pointer_delta
-                } else {
-                    Vec2::ZERO
-                };
-                let zoom_log = if !self.editor_camera_input_consumed && response.hovered() {
-                    ui.input(|input| input.smooth_scroll_delta.y) * 0.001
-                } else {
-                    0.0
-                };
-                if orbit != Vec2::ZERO || pan != Vec2::ZERO || zoom_log != 0.0 {
-                    let sample = InputSample {
-                        orbit,
-                        pan,
-                        zoom_log,
-                        viewport_extent: response.rect.width().min(response.rect.height()),
-                        captured_at: Some(Instant::now()),
-                    };
-                    self.input_worker.submit(sample);
-                }
                 // Capture the camera only after applying this frame's input.
                 // Previously the submitted render job always trailed the mouse
                 // by one frame at the beginning of an interaction.
@@ -14682,8 +14807,14 @@ impl EditorApp {
                 let preview = Arc::clone(&self.cached_preview);
                 let lighting = self.viewport_lighting(&preview);
                 let frame_now = Instant::now();
-                let viewport_frame_due = frame_now >= self.next_viewport_frame;
-                if viewport_frame_due {
+                let scheduled_frame_due = frame_now >= self.next_viewport_frame;
+                // Camera interaction must not wait behind the idle frame cap.
+                // The display worker already replaces obsolete pending jobs, so
+                // publishing the newest camera immediately is both bounded and
+                // avoids a perceptible first-pan/first-orbit hitch.
+                let viewport_frame_due =
+                    scheduled_frame_due || self.camera_input_applied_at.is_some();
+                if scheduled_frame_due {
                     self.next_viewport_frame = advance_frame_deadline(
                         self.next_viewport_frame,
                         frame_now,
@@ -14912,6 +15043,17 @@ impl EditorApp {
                 let overlay_started = Instant::now();
                 if let Some(presented) = &self.presented_view {
                     painter.rect_filled(response.rect, 0.0, Color32::BLACK);
+                    // With no rendered geometry there is nothing that needs to
+                    // remain aligned to an asynchronous frame. Draw the grid
+                    // from the live camera so empty-scene navigation responds
+                    // in the same GUI pass as the mouse event.
+                    let display_camera = if presented.triangles.is_empty()
+                        && scene_camera.is_none()
+                    {
+                        render_camera
+                    } else {
+                        presented.camera
+                    };
                     let collider_wireframe = scene_camera
                         .is_none()
                         .then(|| self.selected_collider_wireframe())
@@ -14925,7 +15067,7 @@ impl EditorApp {
                         render_rect,
                         self.show_grid && scene_camera.is_none(),
                         presented.tool,
-                        presented.camera,
+                        display_camera,
                         &presented.triangles,
                         presented.mode,
                         viewport_texture,
@@ -15984,7 +16126,9 @@ fn advance_compositor_mouse_angles(
     sensitivity: f32,
 ) -> (f32, f32) {
     let horizontal = (horizontal_degrees + delta.x * sensitivity + 180.0).rem_euclid(360.0) - 180.0;
-    let vertical = (vertical_degrees - delta.y * sensitivity).clamp(-89.0, 89.0);
+    // Mouse Input is a generic graph source, so neither axis should silently stop.
+    // Camera-specific pitch limits belong downstream in the graph.
+    let vertical = (vertical_degrees - delta.y * sensitivity + 180.0).rem_euclid(360.0) - 180.0;
     (horizontal, vertical)
 }
 
@@ -16010,8 +16154,23 @@ fn latest_genuine_pointer_position(events: &[egui::Event], expected: Pos2) -> Op
 }
 
 fn canonical_cursor_warp_delta(events: &[egui::Event], origin: Pos2) -> Vec2 {
+    // Prefer raw, unaccelerated relative motion. Both PointerMoved and MouseMoved
+    // may be emitted for the same physical movement, so never combine the two.
+    let mut raw_delta = Vec2::ZERO;
+    let mut has_raw_motion = false;
+    for event in events {
+        if let egui::Event::MouseMoved(delta) = event {
+            raw_delta += *delta;
+            has_raw_motion = true;
+        }
+    }
+    if has_raw_motion {
+        return raw_delta;
+    }
+
     // A warp-generated event lands exactly on the origin and must not undo the
-    // physical movement event that preceded it in the same input batch.
+    // physical movement event that preceded it in the same input batch. This is
+    // the compatibility path for platforms that do not expose raw motion.
     events
         .iter()
         .filter_map(|event| match event {
@@ -16067,6 +16226,7 @@ fn compositor_input_count(kind: usize, combine_mode: usize) -> usize {
         13 => 4,
         34 => combine_mode.clamp(1, 16),
         17 | 25 | 26 | 28 | 30 => 3,
+        35 => 5,
         18 => 1,
         22 => 3,
         23 => 1,
@@ -16079,7 +16239,7 @@ fn compositor_input_socket_y(kind: usize, input: usize) -> f32 {
     match kind {
         9 => 85.0 + input as f32 * 30.0,
         13 => 75.0 + input as f32 * 22.0,
-        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 34 => 74.0 + input as f32 * 26.0,
+        17 | 22 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 34 | 35 => 74.0 + input as f32 * 26.0,
         _ => 70.0,
     }
 }
@@ -16148,6 +16308,7 @@ fn compositor_input_label(kind: usize, input: usize) -> String {
         28 => ["X", "Y", "Z"][input],
         29 => ["Throttle", "Torque"][input],
         30 => ["X", "Y", "Z"][input],
+        35 => ["Speed X", "Speed Y", "Speed Z", "Horizontal", "Vertical"][input],
         _ => "Input",
     })
     .to_owned()
@@ -16167,6 +16328,7 @@ fn compositor_output_label(kind: usize, output: usize) -> String {
         25 => "Position",
         26 => "Rotation",
         27 => ["Position", "Rotation"][output],
+        35 => "Position",
         0 | 1 | 7 | 8 | 9 | 10 | 12 | 13 | 19 => "Texture",
         3 | 4 | 5 | 6 | 14 | 15 | 30 | 31 | 33 => "Value",
         32 => ["Horizontal", "Vertical"][output],
@@ -16216,6 +16378,9 @@ fn compositor_node_description(kind: usize) -> &'static str {
         34 => {
             "Packs numeric inputs into a JSON array and unpacks the latest remote array into outputs."
         }
+        35 => {
+            "Integrates three local speeds after rotating them by horizontal and vertical look angles."
+        }
         _ => "Node",
     }
 }
@@ -16262,6 +16427,31 @@ fn scaled_modulated_time(seconds: f32, scale: f32, modulus: f32) -> f32 {
 
 fn advance_accumulator(value: f32, input: f32, rate: f32, delta_seconds: f32) -> f32 {
     value + input * rate * delta_seconds.max(0.0)
+}
+
+fn advance_3d_character(
+    position: [f32; 3],
+    local_speed: [f32; 3],
+    horizontal_degrees: f32,
+    vertical_degrees: f32,
+    delta_seconds: f32,
+) -> [f32; 3] {
+    let rotation = Quat::from_euler_xyz(CoreVec3::new(
+        vertical_degrees.to_radians(),
+        0.0,
+        horizontal_degrees.to_radians(),
+    ));
+    let world_speed = rotation.rotate(CoreVec3::new(
+        local_speed[0],
+        local_speed[1],
+        local_speed[2],
+    ));
+    let dt = delta_seconds.max(0.0);
+    [
+        position[0] + world_speed.x * dt,
+        position[1] + world_speed.y * dt,
+        position[2] + world_speed.z * dt,
+    ]
 }
 
 fn select_compositor_lod_for_backend(
@@ -16993,6 +17183,10 @@ struct PreparedRasterTriangle {
     smooth_normals: bool,
     transmission: f32,
     ior: f32,
+    alpha_mode: MaterialAlphaMode,
+    alpha_cutoff: f32,
+    water_fallback: bool,
+    sort_depth: f32,
     texture_mips: Option<Arc<Vec<TextureAsset>>>,
     texture_lod: usize,
     min_y: usize,
@@ -17136,6 +17330,14 @@ fn rasterize_depth_frame(
                 smooth_normals: triangle.smooth_normals,
                 transmission: triangle.transmission,
                 ior: triangle.ior,
+                alpha_mode: triangle.alpha_mode,
+                alpha_cutoff: triangle.alpha_cutoff,
+                water_fallback: triangle.water_fallback,
+                sort_depth: raster_vertices
+                    .iter()
+                    .map(|vertex| vertex.camera_depth)
+                    .sum::<f32>()
+                    / 3.0,
                 texture_mips,
                 texture_lod,
                 min_y,
@@ -17144,9 +17346,18 @@ fn rasterize_depth_frame(
         }
     }
     workspace.prepared.sort_by(|left, right| {
-        left.transmission
-            .partial_cmp(&right.transmission)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let left_blend = matches!(left.alpha_mode, MaterialAlphaMode::Blend);
+        let right_blend = matches!(right.alpha_mode, MaterialAlphaMode::Blend);
+        left_blend.cmp(&right_blend).then_with(|| {
+            if left_blend {
+                right
+                    .sort_depth
+                    .partial_cmp(&left.sort_depth)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
     });
     let workers = std::thread::available_parallelism()
         .map(usize::from)
@@ -17188,6 +17399,9 @@ fn rasterize_depth_frame(
                         lighting,
                         triangle.transmission,
                         triangle.ior,
+                        triangle.alpha_mode,
+                        triangle.alpha_cutoff,
+                        triangle.water_fallback,
                         camera_position,
                         triangle
                             .texture_mips
@@ -17247,6 +17461,9 @@ fn rasterize_triangle_band(
     lighting: &ViewportLighting,
     transmission: f32,
     ior: f32,
+    alpha_mode: MaterialAlphaMode,
+    alpha_cutoff: f32,
+    water_fallback: bool,
     camera_position: CoreVec3,
     texture: Option<&TextureAsset>,
     object_id: NodeId,
@@ -17398,13 +17615,22 @@ fn rasterize_triangle_band(
                         (base_color[channel] * vertex_color[channel] * texel[channel] * lighting)
                             .clamp(0.0, 1.0)
                     });
-                    let surface = Color32::from_rgba_unmultiplied(
+                    let mut surface = Color32::from_rgba_unmultiplied(
                         (rgba[0] * 255.0).round() as u8,
                         (rgba[1] * 255.0).round() as u8,
                         (rgba[2] * 255.0).round() as u8,
                         (rgba[3] * 255.0).round() as u8,
                     );
-                    if transmission > 0.0 && color[pixel] != Color32::TRANSPARENT {
+                    if water_fallback {
+                        surface = Color32::from_rgba_unmultiplied(6, 18, 23, 230);
+                    }
+                    let masked_out =
+                        matches!(alpha_mode, MaterialAlphaMode::Mask) && rgba[3] < alpha_cutoff;
+                    if masked_out {
+                        // Keep both color and depth untouched.
+                    } else if matches!(alpha_mode, MaterialAlphaMode::Blend) {
+                        color[pixel] = blend_alpha_over(color[pixel], surface);
+                    } else if transmission > 0.0 && color[pixel] != Color32::TRANSPARENT {
                         let view_direction = (camera_position - world_position).normalized();
                         let fresnel =
                             schlick_fresnel(shading_normal.dot(view_direction).abs(), ior);
@@ -17412,9 +17638,16 @@ fn rasterize_triangle_band(
                         color[pixel] =
                             blend_preview_surface(color[pixel], surface, background_share);
                     } else {
-                        color[pixel] = surface;
+                        color[pixel] = Color32::from_rgb(
+                            (rgba[0] * 255.0).round() as u8,
+                            (rgba[1] * 255.0).round() as u8,
+                            (rgba[2] * 255.0).round() as u8,
+                        );
                     }
-                    if transmission <= 0.0 {
+                    if !masked_out
+                        && !matches!(alpha_mode, MaterialAlphaMode::Blend)
+                        && transmission <= 0.0
+                    {
                         linear_depth[pixel] = depth;
                     }
                 }
@@ -17461,6 +17694,31 @@ fn blend_preview_surface(background: Color32, surface: Color32, background_share
         mix(background.g(), surface.g()),
         mix(background.b(), surface.b()),
         surface.a(),
+    )
+}
+
+fn blend_alpha_over(background: Color32, surface: Color32) -> Color32 {
+    let [surface_r, surface_g, surface_b, surface_a] = surface.to_srgba_unmultiplied();
+    let [background_r, background_g, background_b, background_a] =
+        background.to_srgba_unmultiplied();
+    let source_alpha = f32::from(surface_a) / 255.0;
+    let background_alpha = f32::from(background_a) / 255.0;
+    let output_alpha = source_alpha + background_alpha * (1.0 - source_alpha);
+    if output_alpha <= f32::EPSILON {
+        return Color32::TRANSPARENT;
+    }
+    let channel = |front: u8, behind: u8| {
+        ((f32::from(front) * source_alpha
+            + f32::from(behind) * background_alpha * (1.0 - source_alpha))
+            / output_alpha)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        channel(surface_r, background_r),
+        channel(surface_g, background_g),
+        channel(surface_b, background_b),
+        (output_alpha * 255.0).round() as u8,
     )
 }
 
@@ -20224,6 +20482,13 @@ fn collider_wireframe_segments(
     segments
 }
 
+fn continuing_camera_drag_delta(was_active: bool, is_active: bool, frame_delta: Vec2) -> Vec2 {
+    if was_active && is_active {
+        return frame_delta;
+    }
+    Vec2::ZERO
+}
+
 fn pan_camera_target(
     target: CoreVec3,
     pointer_delta: Vec2,
@@ -20833,6 +21098,22 @@ mod tests {
     fn middle_mouse_pan_moves_target_in_view_plane() {
         let target = pan_camera_target(CoreVec3::ZERO, Vec2::new(20.0, -10.0), 10.0, 0.0, 0.0);
         assert!(target.approx_eq(CoreVec3::new(-2.0, 0.0, -1.0), 1.0e-5));
+    }
+
+    #[test]
+    fn camera_drag_policy_establishes_origin_then_uses_frame_delta() {
+        assert_eq!(
+            continuing_camera_drag_delta(false, true, Vec2::new(40.0, 30.0)),
+            Vec2::ZERO
+        );
+        assert_eq!(
+            continuing_camera_drag_delta(true, true, Vec2::new(2.0, -1.0)),
+            Vec2::new(2.0, -1.0)
+        );
+        assert_eq!(
+            continuing_camera_drag_delta(true, false, Vec2::new(2.0, -1.0)),
+            Vec2::ZERO
+        );
     }
 
     #[test]
@@ -21986,6 +22267,9 @@ mod tests {
             smooth_normals: false,
             transmission: 0.0,
             ior: 1.5,
+            alpha_mode: MaterialAlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+            water_fallback: false,
             casts_shadows: true,
         };
         let triangles = [
@@ -22169,6 +22453,13 @@ mod tests {
         assert_eq!(
             blend_preview_surface(background, surface, 0.5),
             Color32::from_rgb(100, 150, 198)
+        );
+        assert_eq!(
+            blend_alpha_over(
+                Color32::from_rgb(20, 80, 140),
+                Color32::from_rgba_unmultiplied(180, 220, 255, 128),
+            ),
+            Color32::from_rgb(101, 151, 198)
         );
     }
 
@@ -22678,6 +22969,19 @@ mod tests {
     }
 
     #[test]
+    fn character_3d_rotates_local_speed_before_integration() {
+        let yawed = advance_3d_character([1.0, 2.0, 3.0], [2.0, 0.0, 0.0], 90.0, 0.0, 0.5);
+        assert!((yawed[0] - 1.0).abs() < 1.0e-5);
+        assert!((yawed[1] - 3.0).abs() < 1.0e-5);
+        assert!((yawed[2] - 3.0).abs() < 1.0e-5);
+
+        let pitched = advance_3d_character([0.0; 3], [0.0, 2.0, 0.0], 0.0, 90.0, 0.5);
+        assert!(pitched[0].abs() < 1.0e-5);
+        assert!(pitched[1].abs() < 1.0e-5);
+        assert!((pitched[2] - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn compositor_key_axis_reports_negative_neutral_positive_and_cancellation() {
         assert_eq!(compositor_key_axis_value(true, false), -1.0);
         assert_eq!(compositor_key_axis_value(false, false), 0.0);
@@ -22716,7 +23020,7 @@ mod tests {
         let (horizontal, vertical) =
             advance_compositor_mouse_angles(179.0, 88.0, Vec2::new(20.0, -20.0), 0.1);
         assert_eq!(horizontal, -179.0);
-        assert_eq!(vertical, 89.0);
+        assert_eq!(vertical, 90.0);
 
         assert_eq!(joystick_axis(0.05, 0.08), 0.0);
         assert_eq!(joystick_axis(1.0, 0.08), 1.0);
@@ -22735,6 +23039,15 @@ mod tests {
         assert_eq!(
             canonical_cursor_warp_delta(&movement_then_warp, expected),
             Vec2::new(12.0, -4.0)
+        );
+        let raw_and_absolute = [
+            egui::Event::MouseMoved(Vec2::new(3.0, -2.0)),
+            egui::Event::PointerMoved(expected + Vec2::new(30.0, 40.0)),
+            egui::Event::MouseMoved(Vec2::new(4.0, 5.0)),
+        ];
+        assert_eq!(
+            canonical_cursor_warp_delta(&raw_and_absolute, expected),
+            Vec2::new(7.0, 3.0)
         );
         assert_eq!(
             step_compositor_mouse_recall(Vec2::ZERO, Vec2::ZERO, false, true, 96.0),

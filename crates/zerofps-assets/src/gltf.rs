@@ -6,8 +6,8 @@
 
 use crate::{
     AssetAnimationChannel, AssetAnimationClip, AssetNode, AssetTransform, AxisConvention,
-    Handedness, ImportError, Material, MeshAsset, Primitive, SourceInfo, TextureAsset, Vertex,
-    VertexScalarField,
+    Handedness, ImportError, Material, MaterialAlphaMode, MeshAsset, Primitive, SourceInfo,
+    TextureAsset, Vertex, VertexScalarField,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -112,6 +112,13 @@ pub fn import_gltf(path: &Path) -> Result<MeshAsset, ImportError> {
                 specular,
                 shininess,
                 opacity: base_color[3],
+                alpha_mode: match material.alpha_mode() {
+                    ::gltf::material::AlphaMode::Opaque => MaterialAlphaMode::Opaque,
+                    ::gltf::material::AlphaMode::Mask => MaterialAlphaMode::Mask,
+                    ::gltf::material::AlphaMode::Blend => MaterialAlphaMode::Blend,
+                },
+                alpha_cutoff: material.alpha_cutoff().unwrap_or(0.5),
+                double_sided: material.double_sided(),
                 base_color_texture,
                 transmission: material
                     .transmission()
@@ -494,5 +501,9 @@ mod tests {
                 && material.specular.iter().all(|value| value.is_finite())
                 && material.shininess.is_finite()
         }));
+        let water = &asset.materials["PlaneShape"];
+        assert_eq!(water.alpha_mode, MaterialAlphaMode::Blend);
+        assert!(water.double_sided);
+        assert!(water.opacity < 0.1);
     }
 }

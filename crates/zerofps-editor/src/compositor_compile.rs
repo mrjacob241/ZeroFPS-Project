@@ -302,6 +302,9 @@ impl Compiler<'_> {
             NodeSettings::Accumulator { value, .. } => {
                 self.add_source(GraphSource::Constant([value, value, value, 1.0]))
             }
+            NodeSettings::Character3D { .. } => {
+                return Err(GraphCompileError::NotOutputNode(socket.0));
+            }
             NodeSettings::Broadcast { variable, values } => {
                 let remote = self
                     .app

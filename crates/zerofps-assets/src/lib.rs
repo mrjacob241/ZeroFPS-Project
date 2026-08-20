@@ -24,6 +24,14 @@ pub struct Vertex {
     pub color: [f32; 4],
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaterialAlphaMode {
+    #[default]
+    Opaque,
+    Mask,
+    Blend,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Material {
     pub name: String,
@@ -32,6 +40,9 @@ pub struct Material {
     pub specular: [f32; 3],
     pub shininess: f32,
     pub opacity: f32,
+    pub alpha_mode: MaterialAlphaMode,
+    pub alpha_cutoff: f32,
+    pub double_sided: bool,
     pub base_color_texture: Option<String>,
     pub transmission: Option<f32>,
     pub ior: Option<f32>,

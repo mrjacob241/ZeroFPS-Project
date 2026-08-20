@@ -5,7 +5,9 @@
 //! ignored, while malformed statements that we do understand report their
 //! source line.
 
-use crate::{ImportError, Material, MeshAsset, Primitive, SourceInfo, Vertex, parse_f32};
+use crate::{
+    ImportError, Material, MaterialAlphaMode, MeshAsset, Primitive, SourceInfo, Vertex, parse_f32,
+};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -313,6 +315,9 @@ pub fn import_mtl(
                 specular: [0.0; 3],
                 shininess: 0.0,
                 opacity: 1.0,
+                alpha_mode: MaterialAlphaMode::Opaque,
+                alpha_cutoff: 0.5,
+                double_sided: false,
                 base_color_texture: None,
                 transmission: None,
                 ior: None,
@@ -351,6 +356,11 @@ pub fn import_mtl(
                     value
                 };
                 material.base_color[3] = material.opacity;
+                material.alpha_mode = if material.opacity < 1.0 {
+                    MaterialAlphaMode::Blend
+                } else {
+                    MaterialAlphaMode::Opaque
+                };
             }
             "map_Kd" => {
                 if args.is_empty() {

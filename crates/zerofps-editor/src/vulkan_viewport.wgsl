@@ -349,8 +349,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     diffuse = clamp(diffuse, 0.0, 2.0);
     let lighting = clamp(select(0.28 + diffuse * 0.72, select(0.42, 0.86, diffuse > 0.5), input.material.x > 0.5), 0.0, 2.0);
+    let surface_alpha = sampled.a * input.color.a * input.base_color.a;
+    if input.material.y <= -2.0 {
+        let alpha_cutoff = -input.material.y - 2.0;
+        if surface_alpha < alpha_cutoff {
+            discard;
+        }
+        return vec4<f32>(
+            sampled_rgb * input.color.rgb * input.base_color.rgb * lighting,
+            1.0
+        );
+    }
+    if input.material.y < 0.0 {
+        // Stable fallback for legacy, nearly invisible water planes that have
+        // no transmission model and no river-bottom geometry. A modest opacity
+        // prevents the raw viewport sky from becoming the apparent water color.
+        return vec4<f32>(vec3<f32>(0.025, 0.07, 0.09) * lighting, 0.90);
+    }
     return vec4<f32>(
         sampled_rgb * input.color.rgb * input.base_color.rgb * lighting,
-        sampled.a * input.color.a * input.base_color.a
+        select(1.0, surface_alpha, input.material.y >= 100.0)
     );
 }
