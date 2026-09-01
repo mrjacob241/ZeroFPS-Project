@@ -93,6 +93,10 @@ use zerofps_core::{
     ReparentMode, Transform, Vec3 as CoreVec3,
 };
 use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
+use zerofps_voxel::{
+    CellCounts as VoxelCellCounts, SurfaceMesh as VoxelSurfaceMesh, Triangle as VoxelTriangle,
+    VoxelizeOptions, voxelize,
+};
 
 use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
 use crate::dynamics::{ClothSettings, ClothState, MeshScalarField, PaintMode, WindField, heatmap};
@@ -657,6 +661,13 @@ struct ImportedAsset {
     autofixed_mesh: MeshAsset,
     autofix_report: MeshAutofixReport,
     bounds: ([f32; 3], [f32; 3]),
+}
+
+struct VoxelPreview {
+    object_id: NodeId,
+    surface: VoxelSurfaceMesh,
+    counts: VoxelCellCounts,
+    resolution: u32,
 }
 
 #[derive(Clone)]
@@ -2307,6 +2318,9 @@ struct EditorApp {
     asset_loading: BTreeMap<String, &'static str>,
     asset_loading_present_revision: BTreeMap<String, u64>,
     imported_assets: Vec<ImportedAsset>,
+    voxel_preview: Option<VoxelPreview>,
+    show_voxels: bool,
+    voxel_resolution: u32,
     viewport_mode: ViewportMode,
     projection_mode: ProjectionMode,
     viewport_color: Option<TextureHandle>,
@@ -2641,6 +2655,9 @@ impl EditorApp {
             asset_loading: BTreeMap::new(),
             asset_loading_present_revision: BTreeMap::new(),
             imported_assets: builtin_imported_assets(),
+            voxel_preview: None,
+            show_voxels: true,
+            voxel_resolution: 64,
             viewport_mode: ViewportMode::Shaded,
             projection_mode: ProjectionMode::Orthographic,
             viewport_color: None,
@@ -2681,6 +2698,89 @@ impl EditorApp {
         self.asset_import_worker
             .submit(path, add_to_scene, self.save_cache_in_file);
         self.asset_import_path.clear();
+    }
+
+    fn selected_mesh_triangles(&self) -> Option<(NodeId, Vec<VoxelTriangle>)> {
+        let id = self.scene.selected?;
+        let node = self.scene.tree.node(id).ok()?;
+        let (path, primitive_filter) = node.components.iter().find_map(|component| {
+            let Component::Model { asset, primitive } = component else {
+                return None;
+            };
+            Some((asset.as_str(), *primitive))
+        })?;
+        let mesh = &self
+            .imported_assets
+            .iter()
+            .find(|asset| asset.path == path)?
+            .mesh;
+        let triangles = mesh
+            .primitives
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| primitive_filter.is_none_or(|selected| selected == *index))
+            .flat_map(|(_, primitive)| primitive.indices.chunks_exact(3))
+            .filter_map(|indices| {
+                Some([
+                    mesh.vertices.get(indices[0] as usize)?.position,
+                    mesh.vertices.get(indices[1] as usize)?.position,
+                    mesh.vertices.get(indices[2] as usize)?.position,
+                ])
+            })
+            .collect::<Vec<_>>();
+        (!triangles.is_empty()).then_some((id, triangles))
+    }
+
+    fn compute_selected_voxels(&mut self) {
+        let Some((object_id, triangles)) = self.selected_mesh_triangles() else {
+            self.logs.push(LogEntry {
+                level: "VOXEL",
+                color: Color32::from_rgb(235, 167, 88),
+                message: "Select a mesh object before voxelizing.".into(),
+            });
+            return;
+        };
+        let started = Instant::now();
+        match voxelize(
+            &triangles,
+            VoxelizeOptions {
+                longest_axis_cells: self.voxel_resolution,
+                padding: 2,
+            },
+        ) {
+            Ok(grid) => {
+                let counts = grid.counts();
+                let surface = grid.surface_mesh();
+                let surface_triangles = surface.indices.len() / 3;
+                self.voxel_preview = Some(VoxelPreview {
+                    object_id,
+                    surface,
+                    counts,
+                    resolution: self.voxel_resolution,
+                });
+                self.show_voxels = true;
+                self.scene_revision = self.scene_revision.wrapping_add(1);
+                self.viewport_requested_key = None;
+                self.logs.push(LogEntry {
+                    level: "VOXEL",
+                    color: Color32::from_rgb(112, 210, 156),
+                    message: format!(
+                        "Voxelized {} triangles at resolution {}: {} boundary, {} interior cells, {} surface triangles in {:.2} ms.",
+                        triangles.len(),
+                        self.voxel_resolution,
+                        counts.boundary,
+                        counts.interior,
+                        surface_triangles,
+                        started.elapsed().as_secs_f64() * 1_000.0,
+                    ),
+                });
+            }
+            Err(error) => self.logs.push(LogEntry {
+                level: "VOXEL",
+                color: Color32::from_rgb(235, 100, 100),
+                message: format!("Voxelization failed: {error}"),
+            }),
+        }
     }
 
     fn poll_asset_imports(&mut self) {
@@ -3390,6 +3490,67 @@ impl EditorApp {
                         casts_shadows,
                     });
                 }
+            }
+        }
+        if self.show_voxels
+            && let Some(voxels) = &self.voxel_preview
+            && let Ok(node) = self.scene.tree.node(voxels.object_id)
+        {
+            let transform = node.global_transform();
+            for indices in voxels.surface.indices.chunks_exact(3) {
+                let mut vertices = [PreviewVertex {
+                    source_index: 0,
+                    local_position: [0.0; 3],
+                    local_normal: [0.0, 0.0, 1.0],
+                    position: [0.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0; 2],
+                    color: [1.0; 4],
+                }; 3];
+                for (destination, &index) in vertices.iter_mut().zip(indices) {
+                    let source_index = index as usize;
+                    let source = voxels.surface.positions[source_index];
+                    let source_normal = voxels.surface.normals[source_index];
+                    let local = CoreVec3::new(source[0], source[1], source[2]);
+                    let world = transform
+                        .rotation
+                        .rotate(transform.scale.component_mul(local))
+                        + transform.translation;
+                    let normal = transform_normal(
+                        CoreVec3::new(source_normal[0], source_normal[1], source_normal[2]),
+                        transform.scale,
+                        transform.rotation,
+                    );
+                    *destination = PreviewVertex {
+                        source_index,
+                        local_position: source,
+                        local_normal: source_normal,
+                        position: [world.x, world.y, world.z],
+                        normal: [normal.x, normal.y, normal.z],
+                        uv: [0.0; 2],
+                        color: [1.0; 4],
+                    };
+                }
+                output.push(PreviewTriangle {
+                    object_id: voxels.object_id,
+                    material_name: Some("__voxel_preview".into()),
+                    object_transform: transform,
+                    vertices,
+                    base_color: [0.95, 0.42, 0.12, 1.0],
+                    source_base_color: [0.95, 0.42, 0.12, 1.0],
+                    texture: None,
+                    texture_cache_key: 0,
+                    gpu_texture: None,
+                    source_texture: None,
+                    shader: ShaderMode::Diffuse,
+                    smooth_normals: false,
+                    transmission: 0.0,
+                    ior: 1.5,
+                    alpha_mode: MaterialAlphaMode::Opaque,
+                    alpha_cutoff: 0.5,
+                    water_fallback: false,
+                    casts_shadows: false,
+                });
             }
         }
         output
@@ -7436,6 +7597,55 @@ impl EditorApp {
                         {
                             self.project_dirty = true;
                             ui.ctx().request_repaint();
+                        }
+                        ui.separator();
+                        egui::ComboBox::from_id_salt("voxel_resolution")
+                            .selected_text(format!("Voxels: {}", self.voxel_resolution))
+                            .show_ui(ui, |ui| {
+                                for resolution in [32, 64, 128, 256] {
+                                    ui.selectable_value(
+                                        &mut self.voxel_resolution,
+                                        resolution,
+                                        resolution.to_string(),
+                                    );
+                                }
+                            });
+                        if ui
+                            .button("Voxelize")
+                            .on_hover_text("Compute a voxel surface for the selected mesh")
+                            .clicked()
+                        {
+                            self.compute_selected_voxels();
+                            ui.ctx().request_repaint();
+                        }
+                        let voxel_label = if self.show_voxels {
+                            "Voxels: ON"
+                        } else {
+                            "Voxels: OFF"
+                        };
+                        if ui
+                            .add_enabled(
+                                self.voxel_preview.is_some(),
+                                egui::Button::new(voxel_label).selected(self.show_voxels),
+                            )
+                            .on_hover_text("Hide or show the computed voxel mesh")
+                            .clicked()
+                        {
+                            self.show_voxels = !self.show_voxels;
+                            self.scene_revision = self.scene_revision.wrapping_add(1);
+                            self.viewport_requested_key = None;
+                            ui.ctx().request_repaint();
+                        }
+                        if let Some(voxels) = &self.voxel_preview {
+                            ui.small(format!(
+                                "B{} I{}",
+                                voxels.counts.boundary, voxels.counts.interior
+                            ))
+                            .on_hover_text(format!(
+                                "Resolution {} · {} rendered triangles",
+                                voxels.resolution,
+                                voxels.surface.indices.len() / 3
+                            ));
                         }
                         ui.separator();
                         if ui

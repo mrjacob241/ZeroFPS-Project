@@ -4,6 +4,7 @@ members = [
     "crates/zerofps-formats",
     "crates/zerofps-assets",
     "crates/zerofps-telemetry",
+    "crates/zerofps-voxel",
     "crates/zerofps-editor",
 ]
 resolver = "2"

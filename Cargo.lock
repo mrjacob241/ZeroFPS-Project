@@ -4245,6 +4245,7 @@ dependencies = [
  "zerofps-core",
  "zerofps-formats",
  "zerofps-telemetry",
+ "zerofps-voxel",
 ]
 
 [[package]]
@@ -4264,6 +4265,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "zerofps-voxel"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "zerofps-assets",
 ]
 
 [[package]]

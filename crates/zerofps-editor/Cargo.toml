@@ -16,6 +16,7 @@ zerofps-core = { path = "../zerofps-core" }
 zerofps-assets = { path = "../zerofps-assets" }
 zerofps-formats = { path = "../zerofps-formats" }
 zerofps-telemetry = { path = "../zerofps-telemetry" }
+zerofps-voxel = { path = "../zerofps-voxel" }
 pollster = "0.4"
 wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }
