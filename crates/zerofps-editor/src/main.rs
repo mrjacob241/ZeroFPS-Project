@@ -94,8 +94,8 @@ use zerofps_core::{
 };
 use zerofps_formats::{BundleAsset, ProjectFile, load_zfp, save_zfp};
 use zerofps_voxel::{
-    CellCounts as VoxelCellCounts, SurfaceMesh as VoxelSurfaceMesh, Triangle as VoxelTriangle,
-    VoxelizeOptions, voxelize,
+    CellCounts as VoxelCellCounts, SurfaceMesh as VoxelSurfaceMesh,
+    TetrahedralMesh as VoxelTetrahedralMesh, Triangle as VoxelTriangle, VoxelizeOptions, voxelize,
 };
 
 use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
@@ -666,8 +666,35 @@ struct ImportedAsset {
 struct VoxelPreview {
     object_id: NodeId,
     surface: VoxelSurfaceMesh,
+    tetrahedral: VoxelTetrahedralMesh,
     counts: VoxelCellCounts,
     resolution: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VoxelDisplayMode {
+    #[default]
+    ObjectOnly,
+    ObjectAndTetrahedral,
+    TetrahedralOnly,
+}
+
+impl VoxelDisplayMode {
+    fn next(self) -> Self {
+        match self {
+            Self::ObjectOnly => Self::ObjectAndTetrahedral,
+            Self::ObjectAndTetrahedral => Self::TetrahedralOnly,
+            Self::TetrahedralOnly => Self::ObjectOnly,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ObjectOnly => "Mesh: Object",
+            Self::ObjectAndTetrahedral => "Mesh: Both",
+            Self::TetrahedralOnly => "Mesh: Tetrahedral",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2319,7 +2346,7 @@ struct EditorApp {
     asset_loading_present_revision: BTreeMap<String, u64>,
     imported_assets: Vec<ImportedAsset>,
     voxel_preview: Option<VoxelPreview>,
-    show_voxels: bool,
+    voxel_display_mode: VoxelDisplayMode,
     voxel_resolution: u32,
     viewport_mode: ViewportMode,
     projection_mode: ProjectionMode,
@@ -2656,7 +2683,7 @@ impl EditorApp {
             asset_loading_present_revision: BTreeMap::new(),
             imported_assets: builtin_imported_assets(),
             voxel_preview: None,
-            show_voxels: true,
+            voxel_display_mode: VoxelDisplayMode::ObjectOnly,
             voxel_resolution: 64,
             viewport_mode: ViewportMode::Shaded,
             projection_mode: ProjectionMode::Orthographic,
@@ -2750,27 +2777,44 @@ impl EditorApp {
         ) {
             Ok(grid) => {
                 let counts = grid.counts();
-                let surface = grid.surface_mesh();
+                let tetrahedral = match grid.fitted_tetrahedral_mesh(&triangles) {
+                    Ok(mesh) => mesh,
+                    Err(error) => {
+                        self.logs.push(LogEntry {
+                            level: "TETRA",
+                            color: Color32::from_rgb(235, 100, 100),
+                            message: format!(
+                                "Tetrahedralization failed at resolution {}: {error}. Try a lower voxel resolution.",
+                                self.voxel_resolution
+                            ),
+                        });
+                        return;
+                    }
+                };
+                let surface = tetrahedral.surface_mesh();
                 let surface_triangles = surface.indices.len() / 3;
+                let tetrahedron_count = tetrahedral.tetrahedra.len();
                 self.voxel_preview = Some(VoxelPreview {
                     object_id,
                     surface,
+                    tetrahedral,
                     counts,
                     resolution: self.voxel_resolution,
                 });
-                self.show_voxels = true;
+                self.voxel_display_mode = VoxelDisplayMode::ObjectAndTetrahedral;
                 self.scene_revision = self.scene_revision.wrapping_add(1);
                 self.viewport_requested_key = None;
                 self.logs.push(LogEntry {
                     level: "VOXEL",
                     color: Color32::from_rgb(112, 210, 156),
                     message: format!(
-                        "Voxelized {} triangles at resolution {}: {} boundary, {} interior cells, {} surface triangles in {:.2} ms.",
+                        "Voxelized {} triangles at resolution {}: {} boundary, {} interior cells, {} surface triangles, {} tetrahedra in {:.2} ms.",
                         triangles.len(),
                         self.voxel_resolution,
                         counts.boundary,
                         counts.interior,
                         surface_triangles,
+                        tetrahedron_count,
                         started.elapsed().as_secs_f64() * 1_000.0,
                     ),
                 });
@@ -3239,6 +3283,14 @@ impl EditorApp {
             if self.scene.proto_hidden(id) {
                 continue;
             }
+            if self.voxel_display_mode == VoxelDisplayMode::TetrahedralOnly
+                && self
+                    .voxel_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.object_id == id)
+            {
+                continue;
+            }
             let Some((path, primitive_filter)) =
                 node.components
                     .iter()
@@ -3492,7 +3544,7 @@ impl EditorApp {
                 }
             }
         }
-        if self.show_voxels
+        if self.voxel_display_mode != VoxelDisplayMode::ObjectOnly
             && let Some(voxels) = &self.voxel_preview
             && let Ok(node) = self.scene.tree.node(voxels.object_id)
         {
@@ -3543,7 +3595,7 @@ impl EditorApp {
                     gpu_texture: None,
                     source_texture: None,
                     shader: ShaderMode::Diffuse,
-                    smooth_normals: false,
+                    smooth_normals: true,
                     transmission: 0.0,
                     ior: 1.5,
                     alpha_mode: MaterialAlphaMode::Opaque,
@@ -7611,40 +7663,43 @@ impl EditorApp {
                                 }
                             });
                         if ui
-                            .button("Voxelize")
-                            .on_hover_text("Compute a voxel surface for the selected mesh")
+                            .button("Tetrahedralize")
+                            .on_hover_text(
+                                "Build an object-sized tetrahedral volume from occupied voxels",
+                            )
                             .clicked()
                         {
                             self.compute_selected_voxels();
                             ui.ctx().request_repaint();
                         }
-                        let voxel_label = if self.show_voxels {
-                            "Voxels: ON"
-                        } else {
-                            "Voxels: OFF"
-                        };
                         if ui
                             .add_enabled(
                                 self.voxel_preview.is_some(),
-                                egui::Button::new(voxel_label).selected(self.show_voxels),
+                                egui::Button::new(self.voxel_display_mode.label()),
                             )
-                            .on_hover_text("Hide or show the computed voxel mesh")
+                            .on_hover_text(
+                                "Cycle between object only, object plus tetrahedral mesh, and tetrahedral mesh only",
+                            )
                             .clicked()
                         {
-                            self.show_voxels = !self.show_voxels;
+                            self.voxel_display_mode = self.voxel_display_mode.next();
                             self.scene_revision = self.scene_revision.wrapping_add(1);
                             self.viewport_requested_key = None;
                             ui.ctx().request_repaint();
                         }
                         if let Some(voxels) = &self.voxel_preview {
                             ui.small(format!(
-                                "B{} I{}",
-                                voxels.counts.boundary, voxels.counts.interior
+                                "B{} I{} T{}",
+                                voxels.counts.boundary,
+                                voxels.counts.interior,
+                                voxels.tetrahedral.tetrahedra.len(),
                             ))
                             .on_hover_text(format!(
-                                "Resolution {} · {} rendered triangles",
+                                "Resolution {} · {} rendered triangles · {} tetrahedra · {} shared volume vertices",
                                 voxels.resolution,
-                                voxels.surface.indices.len() / 3
+                                voxels.surface.indices.len() / 3,
+                                voxels.tetrahedral.tetrahedra.len(),
+                                voxels.tetrahedral.positions.len(),
                             ));
                         }
                         ui.separator();
