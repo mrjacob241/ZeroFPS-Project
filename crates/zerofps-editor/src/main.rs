@@ -99,7 +99,10 @@ use zerofps_voxel::{
 };
 
 use crate::compositor_graph::{CpuGraphExecutor, GraphExecutor};
-use crate::dynamics::{ClothSettings, ClothState, MeshScalarField, PaintMode, WindField, heatmap};
+use crate::dynamics::{
+    ClothSettings, ClothState, MeshScalarField, PaintMode, SoftBodySettings, SoftBodyState,
+    WindField, heatmap,
+};
 use crate::multiplayer::{MultiplayerClient, MultiplayerEvent};
 
 fn main() -> eframe::Result<()> {
@@ -2278,6 +2281,10 @@ struct EditorApp {
     multiplayer_last_sent: HashMap<usize, Vec<f32>>,
     dynamics_fields: HashMap<NodeId, MeshScalarField>,
     dynamics_cloth: HashMap<NodeId, ClothState>,
+    dynamics_soft_body: HashMap<NodeId, SoftBodyState>,
+    soft_body_settings: SoftBodySettings,
+    soft_body_force_direction: CoreVec3,
+    soft_body_force_strength: f32,
     object_simulation_states: HashMap<usize, ObjectSimulationState>,
     joint_simulation_states: HashMap<NodeId, JointSimulationState>,
     dynamics_enabled: BTreeSet<NodeId>,
@@ -2597,6 +2604,10 @@ impl EditorApp {
             multiplayer_last_sent: HashMap::new(),
             dynamics_fields: HashMap::new(),
             dynamics_cloth: HashMap::new(),
+            dynamics_soft_body: HashMap::new(),
+            soft_body_settings: SoftBodySettings::default(),
+            soft_body_force_direction: CoreVec3::new(0.0, 0.0, 1.0),
+            soft_body_force_strength: 12.0,
             object_simulation_states: HashMap::new(),
             joint_simulation_states: HashMap::new(),
             dynamics_enabled: BTreeSet::new(),
@@ -2801,6 +2812,7 @@ impl EditorApp {
                     counts,
                     resolution: self.voxel_resolution,
                 });
+                self.dynamics_soft_body.remove(&object_id);
                 self.voxel_display_mode = VoxelDisplayMode::ObjectAndTetrahedral;
                 self.scene_revision = self.scene_revision.wrapping_add(1);
                 self.viewport_requested_key = None;
@@ -3376,7 +3388,11 @@ impl EditorApp {
                     _ => None,
                 })
                 .unwrap_or([1.0; 4]);
-            let deformation = self.dynamics_cloth.get(&id).map(|cloth| &cloth.snapshot);
+            let deformation = self
+                .dynamics_soft_body
+                .get(&id)
+                .map(|soft_body| &soft_body.snapshot)
+                .or_else(|| self.dynamics_cloth.get(&id).map(|cloth| &cloth.snapshot));
             let field = self.dynamics_fields.get(&id);
             for (primitive_index, primitive) in asset.primitives.iter().enumerate() {
                 if primitive_filter.is_some_and(|selected| selected != primitive_index) {
@@ -3399,8 +3415,10 @@ impl EditorApp {
                     source_base_color[channel] * material_tint[channel]
                 });
                 let field_preview = self.active_tool == Tool::FieldPaint && field.is_some();
-                let texture_paint_preview =
-                    self.active_tool == Tool::TexturePaint && self.painted_masks.contains_key(&id);
+                let painted_mask = (self.active_tool == Tool::TexturePaint)
+                    .then(|| inherited_painted_mask(&self.scene.tree, &self.painted_masks, id))
+                    .flatten();
+                let texture_paint_preview = painted_mask.is_some();
                 let base_color =
                     if compositor_override.is_some() || field_preview || texture_paint_preview {
                         [1.0; 4]
@@ -3414,8 +3432,8 @@ impl EditorApp {
                     .map(|texture| texture as *const TextureAsset as usize as u64)
                     .unwrap_or(0);
                 let source_texture = source_texture_asset.cloned().map(Arc::new);
-                let painted_preview = texture_paint_preview
-                    .then(|| Arc::new(self.painted_masks[&id].texture(self.texture_paint_heatmap)));
+                let painted_preview =
+                    painted_mask.map(|mask| Arc::new(mask.texture(self.texture_paint_heatmap)));
                 let texture = match (&compositor_override, field_preview, painted_preview) {
                     (_, true, _) => None,
                     (_, false, Some(texture)) => Some(texture),
@@ -4200,6 +4218,50 @@ impl EditorApp {
             (
                 "dynamics.cloth.iterations",
                 self.dynamics_settings.iterations.to_string(),
+            ),
+            (
+                "dynamics.soft_body.force_x",
+                self.soft_body_force_direction.x.to_string(),
+            ),
+            (
+                "dynamics.soft_body.force_y",
+                self.soft_body_force_direction.y.to_string(),
+            ),
+            (
+                "dynamics.soft_body.force_z",
+                self.soft_body_force_direction.z.to_string(),
+            ),
+            (
+                "dynamics.soft_body.force_strength",
+                self.soft_body_force_strength.to_string(),
+            ),
+            (
+                "dynamics.soft_body.mass",
+                self.soft_body_settings.particle_mass.to_string(),
+            ),
+            (
+                "dynamics.soft_body.edge_compliance",
+                self.soft_body_settings.edge_compliance.to_string(),
+            ),
+            (
+                "dynamics.soft_body.volume_compliance",
+                self.soft_body_settings.volume_compliance.to_string(),
+            ),
+            (
+                "dynamics.soft_body.damping",
+                self.soft_body_settings.damping.to_string(),
+            ),
+            (
+                "dynamics.soft_body.iterations",
+                self.soft_body_settings.iterations.to_string(),
+            ),
+            (
+                "dynamics.soft_body.gravity",
+                self.soft_body_settings.gravity.to_string(),
+            ),
+            (
+                "dynamics.soft_body.anchor_bottom",
+                self.soft_body_settings.anchor_bottom.to_string(),
             ),
         ] {
             project.project.properties.insert(key.into(), value);
@@ -4998,6 +5060,38 @@ impl EditorApp {
             .get("dynamics.cloth.iterations")
             .and_then(|value| value.parse().ok())
             .unwrap_or(self.dynamics_settings.iterations);
+        self.soft_body_force_direction = CoreVec3::new(
+            number("dynamics.soft_body.force_x").unwrap_or(self.soft_body_force_direction.x),
+            number("dynamics.soft_body.force_y").unwrap_or(self.soft_body_force_direction.y),
+            number("dynamics.soft_body.force_z").unwrap_or(self.soft_body_force_direction.z),
+        );
+        self.soft_body_force_strength = number("dynamics.soft_body.force_strength")
+            .unwrap_or(self.soft_body_force_strength)
+            .max(0.0);
+        self.soft_body_settings.particle_mass = number("dynamics.soft_body.mass")
+            .unwrap_or(self.soft_body_settings.particle_mass)
+            .max(1.0e-6);
+        self.soft_body_settings.edge_compliance = number("dynamics.soft_body.edge_compliance")
+            .unwrap_or(self.soft_body_settings.edge_compliance)
+            .max(0.0);
+        self.soft_body_settings.volume_compliance = number("dynamics.soft_body.volume_compliance")
+            .unwrap_or(self.soft_body_settings.volume_compliance)
+            .max(0.0);
+        self.soft_body_settings.damping = number("dynamics.soft_body.damping")
+            .unwrap_or(self.soft_body_settings.damping)
+            .clamp(0.0, 1.0);
+        self.soft_body_settings.iterations = properties
+            .get("dynamics.soft_body.iterations")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(self.soft_body_settings.iterations);
+        self.soft_body_settings.gravity = properties
+            .get("dynamics.soft_body.gravity")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(self.soft_body_settings.gravity);
+        self.soft_body_settings.anchor_bottom = properties
+            .get("dynamics.soft_body.anchor_bottom")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(self.soft_body_settings.anchor_bottom);
         self.dynamics_fields.clear();
         for (key, encoded) in properties {
             let Some(identity) = key.strip_prefix("dynamics.field.") else {
@@ -5104,6 +5198,7 @@ impl EditorApp {
             );
         }
         self.dynamics_cloth.clear();
+        self.dynamics_soft_body.clear();
         let unsigned = |key: &str| {
             properties
                 .get(key)
@@ -7171,6 +7266,7 @@ impl EditorApp {
             self.dynamics_time = snapshot.dynamics_time;
             self.project_dirty = snapshot.project_dirty;
             self.dynamics_cloth.clear();
+            self.dynamics_soft_body.clear();
             self.compositor_eval_cache.clear();
             self.compositor_gpu_cache.clear();
             self.compositor_graph_queue.clear();
@@ -8445,6 +8541,7 @@ impl EditorApp {
         });
         self.dynamics_fields.retain(|id, _| !id_set.contains(id));
         self.dynamics_cloth.retain(|id, _| !id_set.contains(id));
+        self.dynamics_soft_body.retain(|id, _| !id_set.contains(id));
         self.painted_masks.retain(|id, _| !id_set.contains(id));
         self.compositor_texture_overrides
             .retain(|entry| !id_set.contains(&entry.target));
@@ -9499,6 +9596,111 @@ impl EditorApp {
                                     if model_asset.is_none() {
                                         ui.weak("Assign a mesh before enabling dynamics.");
                                         return;
+                                    }
+                                    let mut soft_enabled = self.dynamics_soft_body.contains_key(&id);
+                                    if ui
+                                        .checkbox(&mut soft_enabled, "Enable tetrahedral soft body")
+                                        .changed()
+                                    {
+                                        if soft_enabled {
+                                            if let Err(message) = self.enable_soft_body_for(id) {
+                                                self.logs.push(LogEntry {
+                                                    level: "SOFT BODY",
+                                                    color: Color32::from_rgb(235, 91, 91),
+                                                    message,
+                                                });
+                                            }
+                                        } else {
+                                            self.dynamics_soft_body.remove(&id);
+                                            self.scene_revision =
+                                                self.scene_revision.wrapping_add(1);
+                                        }
+                                    }
+                                    if let Some((particle_count, tetrahedron_count)) = self
+                                        .dynamics_soft_body
+                                        .get(&id)
+                                        .map(|state| {
+                                            (state.particle_count(), state.tetrahedron_count())
+                                        })
+                                    {
+                                        ui.small(format!(
+                                            "{particle_count} particles · {tetrahedron_count} volume constraints"
+                                        ));
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Paint force texture").clicked() {
+                                                self.ensure_painted_texture(id);
+                                                self.texture_paint_heatmap = true;
+                                                self.active_tool = Tool::TexturePaint;
+                                            }
+                                            ui.small("Black=0 · white=full force");
+                                        });
+                                        let mut direction = [
+                                            self.soft_body_force_direction.x,
+                                            self.soft_body_force_direction.y,
+                                            self.soft_body_force_direction.z,
+                                        ];
+                                        ui.horizontal(|ui| {
+                                            ui.label("Force XYZ");
+                                            for component in &mut direction {
+                                                ui.add(egui::DragValue::new(component).speed(0.05));
+                                            }
+                                        });
+                                        self.soft_body_force_direction = CoreVec3::new(
+                                            direction[0],
+                                            direction[1],
+                                            direction[2],
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.soft_body_force_strength,
+                                                0.0..=100.0,
+                                            )
+                                            .text("Force strength"),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.soft_body_settings.particle_mass,
+                                            )
+                                            .speed(0.005)
+                                            .range(0.001..=100.0)
+                                            .prefix("Particle mass "),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.soft_body_settings.damping,
+                                                0.0..=0.5,
+                                            )
+                                            .text("Damping"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.soft_body_settings.iterations,
+                                                1..=12,
+                                            )
+                                            .text("Solver iterations"),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.soft_body_settings.edge_compliance,
+                                            )
+                                            .speed(0.000_001)
+                                            .range(0.0..=0.01)
+                                            .prefix("Edge compliance "),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.soft_body_settings.volume_compliance,
+                                            )
+                                            .speed(0.000_001)
+                                            .range(0.0..=0.01)
+                                            .prefix("Volume compliance "),
+                                        );
+                                        ui.checkbox(&mut self.soft_body_settings.gravity, "Gravity");
+                                        ui.checkbox(
+                                            &mut self.soft_body_settings.anchor_bottom,
+                                            "Anchor bottom 6%",
+                                        );
+                                        ui.separator();
                                     }
                                     let mut enabled = self.dynamics_enabled.contains(&id);
                                     if ui
@@ -12315,6 +12517,7 @@ impl EditorApp {
     }
 
     fn enable_dynamics_for(&mut self, id: NodeId) -> Result<(), String> {
+        self.dynamics_soft_body.remove(&id);
         let path = self
             .scene
             .tree
@@ -12345,6 +12548,45 @@ impl EditorApp {
             ClothState::new(mesh, &field, self.dynamics_settings.clone()),
         );
         self.dynamics_enabled.insert(id);
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        self.project_dirty = true;
+        Ok(())
+    }
+
+    fn enable_soft_body_for(&mut self, id: NodeId) -> Result<(), String> {
+        let tetrahedral = self
+            .voxel_preview
+            .as_ref()
+            .filter(|preview| preview.object_id == id)
+            .map(|preview| preview.tetrahedral.clone())
+            .ok_or_else(|| {
+                "Tetrahedralize the selected object before enabling soft body".to_owned()
+            })?;
+        let path = self
+            .scene
+            .tree
+            .node(id)
+            .ok()
+            .and_then(|node| {
+                node.components
+                    .iter()
+                    .find_map(|component| match component {
+                        Component::Model { asset, .. } => Some(asset.clone()),
+                        _ => None,
+                    })
+            })
+            .ok_or_else(|| "Selected object has no mesh".to_owned())?;
+        let mesh = self
+            .imported_assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .map(|asset| asset.mesh.clone())
+            .ok_or_else(|| "Selected mesh asset is not loaded".to_owned())?;
+        self.ensure_painted_texture(id);
+        let state = SoftBodyState::new(&mesh, &tetrahedral, self.soft_body_settings.clone())?;
+        self.dynamics_cloth.remove(&id);
+        self.dynamics_enabled.remove(&id);
+        self.dynamics_soft_body.insert(id, state);
         self.scene_revision = self.scene_revision.wrapping_add(1);
         self.project_dirty = true;
         Ok(())
@@ -12390,7 +12632,9 @@ impl EditorApp {
                 })
         });
         if (!self.dynamics_running && !self.dynamics_single_step)
-            || (self.dynamics_enabled.is_empty() && !has_rigid_simulation)
+            || (self.dynamics_enabled.is_empty()
+                && self.dynamics_soft_body.is_empty()
+                && !has_rigid_simulation)
         {
             return;
         }
@@ -12449,6 +12693,30 @@ impl EditorApp {
                     }
                     stepped = true;
                 }
+            }
+            let direction = if self.soft_body_force_direction.length() > 1.0e-6 {
+                self.soft_body_force_direction.normalized()
+            } else {
+                CoreVec3::ZERO
+            };
+            let strength = self.soft_body_force_strength.max(0.0);
+            let masks = &self.painted_masks;
+            for (&id, soft_body) in &mut self.dynamics_soft_body {
+                soft_body.settings = self.soft_body_settings.clone();
+                let forces = soft_body
+                    .force_uvs()
+                    .iter()
+                    .map(|&uv| {
+                        direction
+                            * strength
+                            * masks
+                                .get(&id)
+                                .map(|mask| sample_painted_mask(mask, uv))
+                                .unwrap_or(0.0)
+                    })
+                    .collect::<Vec<_>>();
+                soft_body.step(dt, &forces);
+                stepped = true;
             }
         }
         self.dynamics_single_step = false;
@@ -13641,6 +13909,9 @@ impl EditorApp {
         for cloth in self.dynamics_cloth.values_mut() {
             cloth.reset();
         }
+        for soft_body in self.dynamics_soft_body.values_mut() {
+            soft_body.reset();
+        }
         self.scene_revision = self.scene_revision.wrapping_add(1);
     }
 
@@ -13751,14 +14022,16 @@ impl EditorApp {
         let Some(presented) = self.presented_view.as_ref() else {
             return;
         };
+        let (yaw, pitch, roll, zoom, camera_target, perspective_unit, projection_mode) =
+            presented.camera;
         let center = viewport.center();
-        let projection_scale = viewport.width().min(viewport.height()) * 0.18 * self.camera_zoom;
-        let (right, up, forward) = camera_basis(self.camera_yaw, self.camera_pitch, 0.0);
-        let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * self.grid_spacing.max(1.0e-4);
-        let camera_origin = self.camera_target - forward * camera_distance;
+        let projection_scale = viewport.width().min(viewport.height()) * 0.18 * zoom;
+        let (right, up, forward) = camera_basis(yaw, pitch, roll);
+        let camera_distance = PERSPECTIVE_CAMERA_DISTANCE * perspective_unit.max(1.0e-4);
+        let camera_origin = camera_target - forward * camera_distance;
         let screen_x = (pointer.x - center.x) / projection_scale;
         let screen_y = -(pointer.y - center.y) / projection_scale;
-        let (ray_origin, ray_direction) = match self.projection_mode {
+        let (ray_origin, ray_direction) = match projection_mode {
             ProjectionMode::Perspective => (
                 camera_origin,
                 (forward
@@ -13767,16 +14040,15 @@ impl EditorApp {
                     .normalized(),
             ),
             ProjectionMode::Orthographic => (
-                self.camera_target + right * screen_x + up * screen_y - forward * camera_distance,
+                camera_target + right * screen_x + up * screen_y - forward * camera_distance,
                 forward,
             ),
         };
         let mut hit: Option<([f32; 2], f32)> = None;
-        for triangle in presented
-            .triangles
-            .iter()
-            .filter(|triangle| triangle.object_id == id)
-        {
+        for triangle in presented.triangles.iter().filter(|triangle| {
+            node_is_in_subtree(&self.scene.tree, id, triangle.object_id)
+                && triangle.material_name.as_deref() != Some("__voxel_preview")
+        }) {
             let points = triangle.vertices.map(|vertex| {
                 CoreVec3::new(vertex.position[0], vertex.position[1], vertex.position[2])
             });
@@ -14977,7 +15249,7 @@ impl EditorApp {
                             input.pointer.button_released(egui::PointerButton::Primary),
                         )
                     });
-                    if let Some(pointer) = pointer.filter(|point| response.rect.contains(*point)) {
+                    if let Some(pointer) = pointer.filter(|point| render_rect.contains(*point)) {
                         painter.circle_stroke(
                             pointer,
                             self.paint_radius_pixels,
@@ -15009,7 +15281,7 @@ impl EditorApp {
                                     self.paint_selected_field(pointer, response.rect)
                                 }
                                 Tool::TexturePaint => {
-                                    self.paint_selected_texture(pointer, response.rect)
+                                    self.paint_selected_texture(pointer, render_rect)
                                 }
                                 _ => {}
                             }
@@ -15931,6 +16203,31 @@ fn first_subtree_model_asset(tree: &GeometryTree, root: NodeId) -> Option<&str> 
     node.children()
         .iter()
         .find_map(|child| first_subtree_model_asset(tree, *child))
+}
+
+fn node_is_in_subtree(tree: &GeometryTree, root: NodeId, mut candidate: NodeId) -> bool {
+    loop {
+        if candidate == root {
+            return true;
+        }
+        let Some(parent) = tree.node(candidate).ok().and_then(|node| node.parent()) else {
+            return false;
+        };
+        candidate = parent;
+    }
+}
+
+fn inherited_painted_mask<'a>(
+    tree: &GeometryTree,
+    masks: &'a HashMap<NodeId, PaintedMask>,
+    mut id: NodeId,
+) -> Option<&'a PaintedMask> {
+    loop {
+        if let Some(mask) = masks.get(&id) {
+            return Some(mask);
+        }
+        id = tree.node(id).ok()?.parent()?;
+    }
 }
 
 /// Texture outputs cascade through geometry parents. Walking upward makes an
@@ -23745,6 +24042,25 @@ mod tests {
             first_subtree_model_asset(&tree, group),
             Some("assets/car.glb")
         );
+    }
+
+    #[test]
+    fn texture_paint_owner_cascades_to_renderable_descendants() {
+        let mut tree = GeometryTree::new();
+        let group = tree.create("Imported Model", None).unwrap();
+        let mesh = tree.create("Mesh", Some(group)).unwrap();
+        let sibling = tree.create("Other", None).unwrap();
+        let mut masks = HashMap::new();
+        masks.insert(group, PaintedMask::uniform(2, 2, 173));
+
+        assert!(node_is_in_subtree(&tree, group, group));
+        assert!(node_is_in_subtree(&tree, group, mesh));
+        assert!(!node_is_in_subtree(&tree, group, sibling));
+        assert_eq!(
+            inherited_painted_mask(&tree, &masks, mesh).unwrap().pixels,
+            vec![173; 4]
+        );
+        assert!(inherited_painted_mask(&tree, &masks, sibling).is_none());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use zerofps_assets::MeshAsset;
 use zerofps_core::Vec3;
+use zerofps_voxel::TetrahedralMesh;
 
 #[derive(Clone)]
 pub struct MeshScalarField {
@@ -257,6 +258,340 @@ pub struct DeformationSnapshot {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub revision: u64,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct SoftBodySettings {
+    pub particle_mass: f32,
+    pub edge_compliance: f32,
+    pub volume_compliance: f32,
+    pub damping: f32,
+    pub iterations: usize,
+    pub gravity: bool,
+    pub anchor_bottom: bool,
+}
+
+impl Default for SoftBodySettings {
+    fn default() -> Self {
+        Self {
+            particle_mass: 0.05,
+            edge_compliance: 0.000_02,
+            volume_compliance: 0.000_001,
+            damping: 0.035,
+            iterations: 3,
+            gravity: false,
+            anchor_bottom: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VolumeConstraint {
+    indices: [usize; 4],
+    rest_volume: f32,
+    lambda: f32,
+}
+
+pub struct SoftBodyState {
+    particles: Vec<Particle>,
+    edges: Vec<DistanceConstraint>,
+    volumes: Vec<VolumeConstraint>,
+    surface_bindings: Vec<usize>,
+    surface_offsets: Vec<Vec3>,
+    surface_triangles: Vec<[usize; 3]>,
+    rest_surface_normals: Vec<[f32; 3]>,
+    force_uvs: Vec<[f32; 2]>,
+    anchor_height: f32,
+    applied_mass: f32,
+    applied_anchor_bottom: bool,
+    pub snapshot: DeformationSnapshot,
+    pub settings: SoftBodySettings,
+}
+
+impl SoftBodyState {
+    pub fn new(
+        surface: &MeshAsset,
+        tetrahedral: &TetrahedralMesh,
+        settings: SoftBodySettings,
+    ) -> Result<Self, String> {
+        if tetrahedral.positions.is_empty() || tetrahedral.tetrahedra.is_empty() {
+            return Err("Tetrahedralize the selected object before enabling soft body".into());
+        }
+        if tetrahedral.positions.len() > 250_000 || tetrahedral.tetrahedra.len() > 600_000 {
+            return Err(format!(
+                "Soft body has {} particles and {} tetrahedra; use a lower tetrahedral resolution (limits: 250000 / 600000)",
+                tetrahedral.positions.len(),
+                tetrahedral.tetrahedra.len(),
+            ));
+        }
+        let minimum_z = tetrahedral
+            .positions
+            .iter()
+            .map(|point| point[2])
+            .fold(f32::INFINITY, f32::min);
+        let maximum_z = tetrahedral
+            .positions
+            .iter()
+            .map(|point| point[2])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let anchor_height = minimum_z + (maximum_z - minimum_z).max(1.0e-5) * 0.06;
+        let inverse_mass = 1.0 / settings.particle_mass.max(1.0e-6);
+        let particles = tetrahedral
+            .positions
+            .iter()
+            .map(|&position| {
+                let position = from_array(position);
+                Particle {
+                    position,
+                    previous: position,
+                    rest: position,
+                    inverse_mass: if settings.anchor_bottom && position.z <= anchor_height {
+                        0.0
+                    } else {
+                        inverse_mass
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut edge_pairs = BTreeSet::new();
+        let mut volumes = Vec::with_capacity(tetrahedral.tetrahedra.len());
+        for tetrahedron in &tetrahedral.tetrahedra {
+            let indices = tetrahedron.map(|index| index as usize);
+            for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+                let pair = (indices[a].min(indices[b]), indices[a].max(indices[b]));
+                edge_pairs.insert(pair);
+            }
+            volumes.push(VolumeConstraint {
+                indices,
+                rest_volume: signed_tetrahedron_volume(indices.map(|index| particles[index].rest)),
+                lambda: 0.0,
+            });
+        }
+        let edges = edge_pairs
+            .into_iter()
+            .map(|(a, b)| DistanceConstraint {
+                a,
+                b,
+                rest_length: (particles[b].rest - particles[a].rest).length(),
+                kind: ConstraintKind::Stretch,
+                lambda: 0.0,
+            })
+            .collect();
+
+        let nearest_surface_vertex = |point: [f32; 3]| {
+            surface
+                .vertices
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    squared_distance_array(point, left.position)
+                        .partial_cmp(&squared_distance_array(point, right.position))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(0)
+        };
+        let force_uvs = tetrahedral
+            .positions
+            .iter()
+            .map(|&position| surface.vertices[nearest_surface_vertex(position)].uv)
+            .collect();
+        let surface_bindings = surface
+            .vertices
+            .iter()
+            .map(|vertex| {
+                tetrahedral
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        squared_distance_array(vertex.position, **left)
+                            .partial_cmp(&squared_distance_array(vertex.position, **right))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let surface_offsets = surface
+            .vertices
+            .iter()
+            .zip(&surface_bindings)
+            .map(|(vertex, &particle)| from_array(vertex.position) - particles[particle].rest)
+            .collect();
+        let surface_triangles = surface
+            .primitives
+            .iter()
+            .flat_map(|primitive| {
+                primitive.indices.chunks_exact(3).filter_map(|triangle| {
+                    let triangle = [
+                        triangle[0] as usize,
+                        triangle[1] as usize,
+                        triangle[2] as usize,
+                    ];
+                    triangle
+                        .iter()
+                        .all(|index| *index < surface.vertices.len())
+                        .then_some(triangle)
+                })
+            })
+            .collect();
+        let snapshot = DeformationSnapshot {
+            positions: surface
+                .vertices
+                .iter()
+                .map(|vertex| vertex.position)
+                .collect(),
+            normals: surface
+                .vertices
+                .iter()
+                .map(|vertex| vertex.normal)
+                .collect(),
+            revision: 1,
+        };
+        Ok(Self {
+            particles,
+            edges,
+            volumes,
+            surface_bindings,
+            surface_offsets,
+            surface_triangles,
+            rest_surface_normals: snapshot.normals.clone(),
+            force_uvs,
+            anchor_height,
+            applied_mass: settings.particle_mass,
+            applied_anchor_bottom: settings.anchor_bottom,
+            snapshot,
+            settings,
+        })
+    }
+
+    pub fn force_uvs(&self) -> &[[f32; 2]] {
+        &self.force_uvs
+    }
+
+    pub fn particle_count(&self) -> usize {
+        self.particles.len()
+    }
+
+    pub fn tetrahedron_count(&self) -> usize {
+        self.volumes.len()
+    }
+
+    pub fn reset(&mut self) {
+        for particle in &mut self.particles {
+            particle.position = particle.rest;
+            particle.previous = particle.rest;
+        }
+        self.publish();
+    }
+
+    pub fn step(&mut self, dt: f32, forces: &[Vec3]) {
+        self.sync_particle_properties();
+        let dt = finite_or(dt, 1.0 / 60.0).clamp(1.0 / 240.0, 1.0 / 20.0);
+        let damping = finite_or(self.settings.damping, 0.0).clamp(0.0, 1.0);
+        let gravity = if self.settings.gravity {
+            Vec3::new(0.0, 0.0, -9.81)
+        } else {
+            Vec3::ZERO
+        };
+        for (index, particle) in self.particles.iter_mut().enumerate() {
+            if particle.inverse_mass <= 0.0 {
+                particle.position = particle.rest;
+                particle.previous = particle.rest;
+                continue;
+            }
+            let force = forces.get(index).copied().unwrap_or(Vec3::ZERO);
+            let acceleration = gravity + finite_vec3_or(force, Vec3::ZERO) * particle.inverse_mass;
+            let velocity = (particle.position - particle.previous) * (1.0 - damping);
+            particle.previous = particle.position;
+            particle.position = particle.position + velocity + acceleration * (dt * dt);
+        }
+        for edge in &mut self.edges {
+            edge.lambda = 0.0;
+        }
+        for volume in &mut self.volumes {
+            volume.lambda = 0.0;
+        }
+        for _ in 0..self.settings.iterations.max(1) {
+            solve_distance_constraints(
+                &mut self.particles,
+                &mut self.edges,
+                self.settings.edge_compliance,
+                dt,
+            );
+            solve_volume_constraints(
+                &mut self.particles,
+                &mut self.volumes,
+                self.settings.volume_compliance,
+                dt,
+            );
+            for particle in &mut self.particles {
+                if particle.inverse_mass <= 0.0 {
+                    particle.position = particle.rest;
+                }
+            }
+        }
+        self.publish();
+    }
+
+    fn sync_particle_properties(&mut self) {
+        if self.applied_mass.to_bits() == self.settings.particle_mass.to_bits()
+            && self.applied_anchor_bottom == self.settings.anchor_bottom
+        {
+            return;
+        }
+        let inverse_mass = 1.0 / finite_or(self.settings.particle_mass, 0.05).max(1.0e-6);
+        for particle in &mut self.particles {
+            particle.inverse_mass =
+                if self.settings.anchor_bottom && particle.rest.z <= self.anchor_height {
+                    particle.position = particle.rest;
+                    particle.previous = particle.rest;
+                    0.0
+                } else {
+                    inverse_mass
+                };
+        }
+        self.applied_mass = self.settings.particle_mass;
+        self.applied_anchor_bottom = self.settings.anchor_bottom;
+    }
+
+    fn publish(&mut self) {
+        self.snapshot.positions = self
+            .surface_bindings
+            .iter()
+            .zip(&self.surface_offsets)
+            .map(|(&index, &offset)| to_array(self.particles[index].position + offset))
+            .collect();
+        self.snapshot.normals.clone_from(&self.rest_surface_normals);
+        let mut touched = vec![false; self.snapshot.normals.len()];
+        for triangle in &self.surface_triangles {
+            let [a, b, c] = *triangle;
+            let normal = (from_array(self.snapshot.positions[b])
+                - from_array(self.snapshot.positions[a]))
+            .cross(from_array(self.snapshot.positions[c]) - from_array(self.snapshot.positions[a]));
+            for index in [a, b, c] {
+                if !touched[index] {
+                    self.snapshot.normals[index] = [0.0; 3];
+                    touched[index] = true;
+                }
+                self.snapshot.normals[index] =
+                    to_array(from_array(self.snapshot.normals[index]) + normal);
+            }
+        }
+        for (index, normal) in self.snapshot.normals.iter_mut().enumerate() {
+            if touched[index] {
+                let value = from_array(*normal);
+                *normal = if value.length() > 1.0e-7 {
+                    to_array(value.normalized())
+                } else {
+                    self.rest_surface_normals[index]
+                };
+            }
+        }
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+    }
 }
 
 pub struct ClothState {
@@ -645,6 +980,90 @@ impl ClothState {
     }
 }
 
+fn solve_distance_constraints(
+    particles: &mut [Particle],
+    constraints: &mut [DistanceConstraint],
+    compliance: f32,
+    dt: f32,
+) {
+    let alpha = finite_or(compliance, 0.0).max(0.0) / (dt * dt);
+    for constraint in constraints {
+        let a = constraint.a;
+        let b = constraint.b;
+        let delta = particles[b].position - particles[a].position;
+        let length = delta.length();
+        if length <= 1.0e-7 {
+            continue;
+        }
+        let wa = particles[a].inverse_mass;
+        let wb = particles[b].inverse_mass;
+        let denominator = wa + wb + alpha;
+        if denominator <= 1.0e-8 {
+            continue;
+        }
+        let value = length - constraint.rest_length;
+        let delta_lambda = (-value - alpha * constraint.lambda) / denominator;
+        constraint.lambda += delta_lambda;
+        let direction = delta / length;
+        particles[a].position = particles[a].position - direction * (wa * delta_lambda);
+        particles[b].position = particles[b].position + direction * (wb * delta_lambda);
+    }
+}
+
+fn solve_volume_constraints(
+    particles: &mut [Particle],
+    constraints: &mut [VolumeConstraint],
+    compliance: f32,
+    dt: f32,
+) {
+    let alpha = finite_or(compliance, 0.0).max(0.0) / (dt * dt);
+    for constraint in constraints {
+        let [a, b, c, d] = constraint.indices;
+        let positions = [
+            particles[a].position,
+            particles[b].position,
+            particles[c].position,
+            particles[d].position,
+        ];
+        let gradients = [
+            (positions[2] - positions[1]).cross(positions[3] - positions[1]) * (-1.0 / 6.0),
+            (positions[2] - positions[0]).cross(positions[3] - positions[0]) / 6.0,
+            (positions[3] - positions[0]).cross(positions[1] - positions[0]) / 6.0,
+            (positions[1] - positions[0]).cross(positions[2] - positions[0]) / 6.0,
+        ];
+        let weights = [
+            particles[a].inverse_mass,
+            particles[b].inverse_mass,
+            particles[c].inverse_mass,
+            particles[d].inverse_mass,
+        ];
+        let denominator = weights
+            .iter()
+            .zip(gradients)
+            .map(|(weight, gradient)| *weight * gradient.dot(gradient))
+            .sum::<f32>()
+            + alpha;
+        if denominator <= 1.0e-10 {
+            continue;
+        }
+        let value = signed_tetrahedron_volume(positions) - constraint.rest_volume;
+        let delta_lambda = (-value - alpha * constraint.lambda) / denominator;
+        constraint.lambda += delta_lambda;
+        for ((index, weight), gradient) in [a, b, c, d].into_iter().zip(weights).zip(gradients) {
+            particles[index].position =
+                particles[index].position + gradient * (weight * delta_lambda);
+        }
+    }
+}
+
+fn signed_tetrahedron_volume(points: [Vec3; 4]) -> f32 {
+    (points[1] - points[0]).dot((points[2] - points[0]).cross(points[3] - points[0])) / 6.0
+}
+
+fn squared_distance_array(left: [f32; 3], right: [f32; 3]) -> f32 {
+    (left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2)
+}
+
 pub fn heatmap(value: f32, minimum: f32, maximum: f32) -> [f32; 4] {
     if !value.is_finite() || !minimum.is_finite() || !maximum.is_finite() {
         return [1.0, 0.0, 1.0, 1.0];
@@ -712,6 +1131,106 @@ mod tests {
             }],
             ..MeshAsset::default()
         }
+    }
+
+    fn single_tetrahedron() -> (MeshAsset, TetrahedralMesh) {
+        let positions = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let mesh = MeshAsset {
+            vertices: positions
+                .into_iter()
+                .enumerate()
+                .map(|(index, position)| Vertex {
+                    position,
+                    uv: [index as f32 / 4.0, 0.5],
+                    normal: [0.0, 0.0, 1.0],
+                    ..Vertex::default()
+                })
+                .collect(),
+            primitives: vec![Primitive {
+                name: "tetra surface".into(),
+                indices: vec![1, 2, 3, 0, 3, 2, 0, 1, 3, 0, 2, 1],
+                ..Primitive::default()
+            }],
+            ..MeshAsset::default()
+        };
+        let tetrahedral = TetrahedralMesh {
+            positions: positions.to_vec(),
+            tetrahedra: vec![[0, 1, 2, 3]],
+        };
+        (mesh, tetrahedral)
+    }
+
+    #[test]
+    fn tetrahedral_soft_body_uses_spatial_forces_and_preserves_finite_volume() {
+        let (mesh, tetrahedral) = single_tetrahedron();
+        let settings = SoftBodySettings {
+            anchor_bottom: false,
+            gravity: false,
+            iterations: 8,
+            ..SoftBodySettings::default()
+        };
+        let mut soft_body = SoftBodyState::new(&mesh, &tetrahedral, settings).unwrap();
+        assert_eq!(soft_body.force_uvs().len(), tetrahedral.positions.len());
+        let rest_volume = signed_tetrahedron_volume(
+            soft_body.volumes[0]
+                .indices
+                .map(|index| soft_body.particles[index].position),
+        );
+        let mut forces = vec![Vec3::ZERO; tetrahedral.positions.len()];
+        forces[3] = Vec3::new(20.0, 0.0, 0.0);
+        for _ in 0..10 {
+            soft_body.step(1.0 / 60.0, &forces);
+        }
+        let deformed_volume = signed_tetrahedron_volume(
+            soft_body.volumes[0]
+                .indices
+                .map(|index| soft_body.particles[index].position),
+        );
+        assert!(deformed_volume.is_finite());
+        assert!((deformed_volume - rest_volume).abs() < 0.02);
+        assert_ne!(soft_body.snapshot.positions[3], mesh.vertices[3].position);
+        assert!(
+            soft_body
+                .snapshot
+                .positions
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        soft_body.reset();
+        assert_eq!(soft_body.snapshot.positions[3], mesh.vertices[3].position);
+    }
+
+    #[test]
+    fn tetrahedral_soft_body_anchor_can_be_changed_live() {
+        let (mesh, tetrahedral) = single_tetrahedron();
+        let mut soft_body = SoftBodyState::new(
+            &mesh,
+            &tetrahedral,
+            SoftBodySettings {
+                anchor_bottom: true,
+                gravity: false,
+                ..SoftBodySettings::default()
+            },
+        )
+        .unwrap();
+        let forces = vec![Vec3::new(0.0, 0.0, 20.0); tetrahedral.positions.len()];
+        soft_body.step(1.0 / 60.0, &forces);
+        for index in 0..3 {
+            assert_eq!(
+                soft_body.particles[index].position,
+                soft_body.particles[index].rest
+            );
+        }
+        soft_body.settings.anchor_bottom = false;
+        soft_body.step(1.0 / 60.0, &forces);
+        assert!(soft_body.particles[0].inverse_mass > 0.0);
+        assert_ne!(soft_body.particles[0].position, soft_body.particles[0].rest);
     }
 
     #[test]
